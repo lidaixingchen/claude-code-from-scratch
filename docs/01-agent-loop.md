@@ -1,4 +1,4 @@
-# Lesson 01：最小 Agent Loop
+# 第 01 课：最小 Agent Loop
 
 ## 🎯 本节目标
 
@@ -46,12 +46,14 @@ Agent 自动调用了 `list_files` 工具，拿到结果后组织语言回复你
 创建：
 - `python/mini_claude/agent.py`
 - `python/mini_claude/tools.py`
+- `python/mini_claude/__main__.py`
+- `python/mini_claude/__init__.py`
 
 ---
 
 ## 🚀 开始实现
 
-### Step 1：消息数组——Agent 的记忆
+### 步骤 1：消息数组——Agent 的记忆
 
 #### 为什么做
 
@@ -61,7 +63,7 @@ LLM API 是无状态的——每次调用不会记住上一次说了什么。要
 
 #### 做什么
 
-创建 `agent.py`，定义 `Agent` 类的骨架：
+创建 `agent.py`，定义 `Agent` 类的骨架，并从 `tools.py` 导入工具定义与执行函数：
 
 ```python
 # agent.py
@@ -69,6 +71,7 @@ LLM API 是无状态的——每次调用不会记住上一次说了什么。要
 from __future__ import annotations
 
 import anthropic
+from .tools import execute_tool, get_tool_definitions
 
 
 class Agent:
@@ -109,7 +112,7 @@ LLM 认为任务完成后：
 
 ---
 
-### Step 2：核心循环——while + tool_use 检查
+### 步骤 2：核心循环——while + tool_use 检查
 
 #### 为什么做
 
@@ -192,7 +195,7 @@ Agent：用户问 → LLM 决定调用工具 → 执行工具 → 结果喂回 L
 
 ---
 
-### Step 3：第一个工具——list_files
+### 步骤 3：第一个工具——list_files
 
 #### 为什么做
 
@@ -278,7 +281,7 @@ def _list_files(inp: dict) -> str:
 
 ---
 
-### Step 4：组装入口
+### 步骤 4：组装入口
 
 #### 为什么做
 
@@ -286,18 +289,23 @@ Agent 和工具就绪后，需要一个入口把它们串起来。
 
 #### 做什么
 
-在 `__main__.py` 中添加最简入口：
+首先，在 `python/mini_claude` 目录下新建一个空白的 `__init__.py` 文件（若未创建）使其被识别为 Python 包。
+
+然后在 `__main__.py` 中添加入口，支持从命令行参数读取查询：
 
 ```python
 # __main__.py
 
+import sys
 import asyncio
 from .agent import Agent
 
 
 async def main():
+    # 读取命令行参数作为用户查询，默认为列出 .py 文件
+    query = sys.argv[1] if len(sys.argv) > 1 else "列出当前目录下所有 .py 文件"
     agent = Agent()
-    await agent._chat("列出当前目录下所有 .py 文件")
+    await agent._chat(query)
 
 
 if __name__ == "__main__":
@@ -388,19 +396,27 @@ if not tool_uses:
 
 ### 输入
 
+在终端中设置环境变量并运行我们刚才实现的模块入口（根据你的操作系统选择相应的环境变量设置命令）：
+
+**macOS / Linux**:
 ```bash
 cd python
 export ANTHROPIC_API_KEY=sk-ant-xxx  # 替换成你的 key
-python -c "
-import asyncio
-from mini_claude.agent import Agent
+python -m mini_claude "列出当前目录下所有 .py 文件"
+```
 
-async def main():
-    agent = Agent()
-    await agent._chat('列出当前目录下所有 .py 文件')
+**Windows (PowerShell)**:
+```powershell
+cd python
+$env:ANTHROPIC_API_KEY="sk-ant-xxx"  # 替换成你的 key
+python -m mini_claude "列出当前目录下所有 .py 文件"
+```
 
-asyncio.run(main())
-"
+**Windows (CMD)**:
+```cmd
+cd python
+set ANTHROPIC_API_KEY=sk-ant-xxx  # 替换成你的 key
+python -m mini_claude "列出当前目录下所有 .py 文件"
 ```
 
 ### 预期结果
@@ -442,11 +458,4 @@ asyncio.run(main())
 4. **一个最简 Agent 只需要 ~60 行代码**：消息数组 + while 循环 + 工具执行 + 结果回填——复杂性来自后续的工程优化，不是核心逻辑。
 
 ---
-
-<!-- TODO: 补充 Step 5 — 重试与指数退避
-  源码: agent.py 的 _with_retry() + _is_retryable()
-  覆盖: 429/503/529 错误自动重试、指数退避、抖动
-  不实现重试的循环在真实 API 环境下跑不起来
--->
-
 > **下一章**：当前 Agent 只支持 Anthropic 后端。如果想接 OpenAI 兼容的 API（如 GPT-4o）怎么办？我们来看双后端架构的实现。
