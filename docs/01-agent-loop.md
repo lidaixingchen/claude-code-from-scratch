@@ -443,4 +443,10 @@ asyncio.run(main())
 
 ---
 
-> **下一章**：当前只有一个 `list_files` 工具，Agent 能力很有限。我们来构建完整的工具系统——读文件、写文件、编辑文件、搜索、执行 Shell 命令——让 Agent 真正具备"编程"能力。
+<!-- TODO: 补充 Step 5 — 重试与指数退避
+  源码: agent.py 的 _with_retry() + _is_retryable()
+  覆盖: 429/503/529 错误自动重试、指数退避、抖动
+  不实现重试的循环在真实 API 环境下跑不起来
+-->
+
+> **下一章**：当前 Agent 只支持 Anthropic 后端。如果想接 OpenAI 兼容的 API（如 GPT-4o）怎么办？我们来看双后端架构的实现。
