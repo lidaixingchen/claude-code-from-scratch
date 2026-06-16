@@ -6,7 +6,7 @@
 
 ```mermaid
 graph LR
-    Setup["bash test/setup.sh"] --> Build["npm run build（TS 版）"]
+    Setup["bash test/setup.sh"] --> Build["python -m mini_claude --help（验证 Python 版）"]
     Build --> Test["逐项测试"]
     Test --> Cleanup["bash test/cleanup.sh"]
 
@@ -33,8 +33,7 @@ cd claude-code-from-scratch
 # 一键配置测试环境（MCP、Skills、CLAUDE.md、大文件、引号测试文件、自定义 Agent）
 bash test/setup.sh
 
-# 构建 TS 版（Python 版无需构建）
-npm run build
+# Python 版无需构建，直接运行即可
 ```
 
 确保 `.env` 已配置好 API Key：
@@ -114,7 +113,7 @@ Fetch https://example.com and tell me what the page is about.
 **测试目标**：验证并发安全的工具可以同时执行（不是串行）。
 
 ```
-Read the files src/frontmatter.ts, src/session.ts, and src/skills.ts at the same time, then tell me each file's line count.
+Read the files python/mini_claude/frontmatter.py, python/mini_claude/session.py, and python/mini_claude/skills.py at the same time, then tell me each file's line count.
 ```
 
 Python 版可改为读取 Python 文件：
@@ -407,10 +406,10 @@ Use grep_search to find all lines containing "import.*chalk" in the src/ directo
 ✅ 预期：返回 `src/agent.ts` 和/或 `src/ui.ts` 中的匹配行，格式为 `文件路径:行号:匹配内容`
 
 ```
-Use grep_search to find the pattern "export function" in all .ts files under src/
+Use grep_search to find the pattern "def " in all .py files under python/mini_claude/
 ```
 
-✅ 预期：使用 `include: "*.ts"` 过滤，返回所有导出函数的位置
+✅ 预期：使用 `include: "*.py"` 过滤，返回所有函数定义的位置
 
 ```
 Use grep_search to find "DANGEROUS_PATTERNS" in the project
@@ -509,10 +508,10 @@ python -m mini_claude --yolo "Read the file package.json and tell me the project
 - 程序**自动退出**（返回 shell prompt）
 
 ```bash
-node dist/cli.js --yolo "List all TypeScript files in the src/ directory"
+python -m mini_claude --yolo "List all Python files in the python/mini_claude/ directory"
 ```
 
-✅ 预期：输出 .ts 文件列表，然后自动退出
+✅ 预期：输出 .py 文件列表，然后自动退出
 
 错误场景：
 ```bash
@@ -555,7 +554,7 @@ What agent types are available? List them all.
 ✅ 预期：列表中包含 explore、plan、general 和 **reviewer**
 
 ```
-Use the agent tool with type "reviewer" to review the file src/frontmatter.ts
+Use the agent tool with type "reviewer" to review the file python/mini_claude/frontmatter.py
 ```
 
 ✅ 预期：

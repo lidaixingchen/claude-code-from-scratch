@@ -1,6 +1,6 @@
 # Mini Claude 功能测试指南
 
-手动测试 19 项功能。全部使用 `--yolo` 模式。TS 和 Python 各测一遍。
+手动测试 19 项功能。全部使用 `--yolo` 模式。
 
 ## 准备
 
@@ -9,9 +9,6 @@ cd claude-code-from-scratch
 
 # 一键配置测试环境（MCP、Skills、CLAUDE.md、大文件）
 bash test/setup.sh
-
-# 构建 TS 版
-npm run build # 如果使用ts版则需构建，python版不用
 ```
 
 确保 `.env` 已配置好 API Key：
@@ -27,20 +24,11 @@ ANTHROPIC_BASE_URL=https://aihubmix.com   # 可选
 
 ## 启动方式
 
-**TS 版（二选一）**：
 ```bash
 # 交互式 REPL（推荐，能测 skill 和 REPL 命令）
-node dist/cli.js --yolo
-
-# one-shot 模式
-node dist/cli.js --yolo "你的提示词"
-```
-
-**Python 版**：
-```bash
 python -m mini_claude --yolo
 
-# 或 one-shot
+# one-shot 模式
 python -m mini_claude --yolo "你的提示词"
 ```
 
@@ -84,15 +72,10 @@ Fetch https://example.com and tell me what the page is about.
 ### 3. 并行工具执行
 
 ```
-Read the files src/frontmatter.ts, src/session.ts, and src/skills.ts at the same time, then tell me each file's line count.
-```
-
-✅ 预期：三个 `read_file` 调用同时出现（不是一个一个来的）
-
-Python 版：
-```
 Read the files python/mini_claude/frontmatter.py and python/mini_claude/session.py at the same time, then tell me each file's line count.
 ```
+
+✅ 预期：两个 `read_file` 调用同时出现（不是一个一个来的）
 
 ---
 
@@ -116,17 +99,17 @@ Save these memories for me:
 > 给 prefetch 足够时间在第二轮 iteration 被注入。
 
 ```
-Read the file tsconfig.json, then tell me: where can I deploy to test my changes?
+Read the file python/pyproject.toml, then tell me: where can I deploy to test my changes?
 ```
-✅ 预期：模型先读取 tsconfig.json（给 prefetch 时间 settle），然后召回 staging server 记忆，回答 `https://staging.example.com`
+✅ 预期：模型先读取 pyproject.toml（给 prefetch 时间 settle），然后召回 staging server 记忆，回答 `https://staging.example.com`
 
 ```
-List the files in the src/ directory, then tell me: what's the deadline for the backend rewrite?
+List the files in the python/mini_claude/ directory, then tell me: what's the deadline for the backend rewrite?
 ```
 ✅ 预期：模型先列出文件，然后召回 API migration 记忆，回答 `end of Q2 2025`
 
 ```
-Read package.json, then tell me: how should I write code for this project? What patterns does our team prefer?
+Read python/pyproject.toml, then tell me: how should I write code for this project? What patterns does our team prefer?
 ```
 ✅ 预期：模型先读取文件，然后召回 code style 记忆，提到 functional programming
 
@@ -149,7 +132,7 @@ Hello! Who are you?
 ### 6. Read-before-edit 保护
 
 ```
-Edit the file package.json and change the version to "9.9.9". Do NOT read it first.
+Edit the file python/pyproject.toml and change the version to "9.9.9". Do NOT read it first.
 ```
 
 ✅ 预期（两种可能都算通过）：
@@ -158,7 +141,7 @@ Edit the file package.json and change the version to "9.9.9". Do NOT read it fir
 
 测完记得恢复：
 ```
-Now change it back to "1.0.0".
+Now change it back to "0.1.0".
 ```
 
 ---
@@ -248,12 +231,12 @@ Use tool_search to find the "plan mode" tool.
 
 **explore agent**：
 ```
-Use the agent tool with type "explore" to find all files that import from "./memory.js" in the src/ directory.
+Use the agent tool with type "explore" to find all files that import from "memory" in the python/mini_claude/ directory.
 ```
 
 ✅ 预期：
 - 输出显示 `[sub-agent:explore]` 标记
-- 返回引用 `memory.js` 的文件列表
+- 返回引用 `memory` 的文件列表
 - 只使用 read_file / list_files / grep_search（不会修改文件）
 
 **plan agent**：
@@ -288,13 +271,13 @@ Use the agent tool with type "general" to create a file called /tmp/mini-claude-
 
 **第二步：测试只读限制**
 ```
-Read package.json, then create a plan for changing the project name. Write your plan to the plan file.
+Read python/pyproject.toml, then create a plan for changing the project name. Write your plan to the plan file.
 ```
 
 ✅ 预期：
-- 模型能读取 package.json（read 工具允许）
+- 模型能读取 pyproject.toml（read 工具允许）
 - 模型写入 plan file（唯一允许编辑的文件）
-- 如果尝试直接编辑 package.json，会被拒绝：`Blocked in plan mode`
+- 如果尝试直接编辑 pyproject.toml，会被拒绝：`Blocked in plan mode`
 
 **第三步：审批流程**
 
@@ -343,16 +326,16 @@ Edit test/quote-test.js, replace "Hi Universe" with "Hello World"
 
 **第一次会话**：
 ```bash
-node dist/cli.js --yolo
+python -m mini_claude --yolo
 ```
 ```
-Remember this: The secret code is BANANA-42. Read package.json and tell me the version.
+Remember this: The secret code is BANANA-42. Read python/pyproject.toml and tell me the version.
 ```
 记下回答，然后输入 `exit` 退出。
 
 **第二次会话（恢复）**：
 ```bash
-node dist/cli.js --yolo --resume
+python -m mini_claude --yolo --resume
 ```
 
 ✅ 预期：启动时显示 session restored 信息
@@ -365,7 +348,7 @@ What was the secret code I told you earlier?
 
 **对比（不 resume 的新会话）**：
 ```bash
-node dist/cli.js --yolo
+python -m mini_claude --yolo
 ```
 ```
 What was the secret code I told you earlier?
@@ -379,7 +362,7 @@ What was the secret code I told you earlier?
 直接传入 prompt 参数，执行完毕后自动退出（不进入 REPL）。
 
 ```bash
-node dist/cli.js --yolo "Read the file package.json and tell me the project name. Only output the name."
+python -m mini_claude --yolo "Read the file python/pyproject.toml and tell me the project name. Only output the name."
 ```
 
 ✅ 预期：
@@ -387,14 +370,14 @@ node dist/cli.js --yolo "Read the file package.json and tell me the project name
 - 程序执行完毕后**自动退出**（返回 shell prompt），不进入交互模式
 
 ```bash
-node dist/cli.js --yolo "List all TypeScript files in the src/ directory"
+python -m mini_claude --yolo "List all Python files in the python/mini_claude/ directory"
 ```
 
-✅ 预期：调用 list_files，输出 .ts 文件列表，然后自动退出
+✅ 预期：调用 list_files，输出 .py 文件列表，然后自动退出
 
 测试错误场景：
 ```bash
-node dist/cli.js --yolo "Read the file /nonexistent/path/file.txt"
+python -m mini_claude --yolo "Read the file /nonexistent/path/file.txt"
 ```
 ✅ 预期：即使工具返回错误，程序仍正常退出（不 crash）
 
@@ -405,7 +388,7 @@ node dist/cli.js --yolo "Read the file /nonexistent/path/file.txt"
 测试 `--max-turns` 限制 agent 循环次数。
 
 ```bash
-node dist/cli.js --yolo --max-turns 2 "Read these files one by one: package.json, tsconfig.json, src/cli.ts, src/agent.ts, src/tools.ts. Tell me the line count of each."
+python -m mini_claude --yolo --max-turns 2 "Read these files one by one: python/pyproject.toml, python/mini_claude/agent.py, python/mini_claude/tools.py, python/mini_claude/cli.py, python/mini_claude/memory.py. Tell me the line count of each."
 ```
 
 ✅ 预期：
@@ -421,22 +404,22 @@ node dist/cli.js --yolo --max-turns 2 "Read these files one by one: package.json
 测试 grep_search 的正则搜索 + include 过滤。
 
 ```
-Use grep_search to find all lines containing "import.*chalk" in the src/ directory
+Use grep_search to find all lines containing "import.*rich" in the python/mini_claude/ directory
 ```
 
-✅ 预期：返回 `src/agent.ts` 和/或 `src/ui.ts` 中的匹配行，格式为 `文件路径:行号:匹配内容`
+✅ 预期：返回匹配行，格式为 `文件路径:行号:匹配内容`
 
 ```
-Use grep_search to find the pattern "export function" in all .ts files under src/
+Use grep_search to find the pattern "def " in all .py files under python/mini_claude/
 ```
 
-✅ 预期：使用 `include: "*.ts"` 过滤，返回所有导出函数的位置
+✅ 预期：使用 `include: "*.py"` 过滤，返回所有函数定义的位置
 
 ```
 Use grep_search to find "DANGEROUS_PATTERNS" in the project
 ```
 
-✅ 预期：返回 `src/tools.ts` 中的定义位置
+✅ 预期：返回 `python/mini_claude/tools.py` 中的定义位置
 
 ---
 
@@ -485,7 +468,7 @@ What agent types are available? List them all.
 
 使用自定义 agent：
 ```
-Use the agent tool with type "reviewer" to review the file src/frontmatter.ts
+Use the agent tool with type "reviewer" to review the file python/mini_claude/frontmatter.py
 ```
 
 ✅ 预期：
@@ -507,24 +490,24 @@ bash test/cleanup.sh
 
 ## 快速对照表
 
-| # | 功能 | TS 通过 | PY 通过 | 备注 |
-|---|------|:---:|:---:|------|
-| 1 | MCP 工具调用 | ☐ | ☐ | 3 个工具 |
-| 2 | WebFetch | ☐ | ☐ | httpbin.org |
-| 3 | 并行工具执行 | ☐ | ☐ | 多文件同时读 |
-| 4 | 语义记忆召回 | ☐ | ☐ | 保存→新对话→语义查询 |
-| 5 | @include + Rules | ☐ | ☐ | 中文回复 |
-| 6 | Read-before-edit | ☐ | ☐ | 代码层或 prompt 层 |
-| 7 | 大结果持久化 | ☐ | ☐ | 75KB 文件 |
-| 8 | Skill 调用 | ☐ | ☐ | /greet /commit |
-| 9 | ToolSearch | ☐ | ☐ | plan mode 工具 |
-| 10 | REPL 命令 | ☐ | ☐ | /cost /memory /compact /plan |
-| 11 | Sub-agent 系统 | ☐ | ☐ | explore/plan/general 三类型 |
-| 12 | Plan Mode | ☐ | ☐ | /plan 手动进入 + 审批流程 |
-| 13 | 引号规范化 | ☐ | ☐ | curly → straight quotes |
-| 14 | Session Resume | ☐ | ☐ | --resume 恢复会话 |
-| 15 | One-shot 模式 | ☐ | ☐ | 传 prompt 自动退出 |
-| 16 | 预算控制 | ☐ | ☐ | --max-turns 限制 |
-| 17 | Grep Search | ☐ | ☐ | 正则搜索 + include |
-| 18 | Write File | ☐ | ☐ | 新文件 + 自动建目录 |
-| 19 | 自定义 Agent | ☐ | ☐ | .claude/agents/ 定义 |
+| # | 功能 | 通过 | 备注 |
+|---|------|:---:|------|
+| 1 | MCP 工具调用 | ☐ | 3 个工具 |
+| 2 | WebFetch | ☐ | httpbin.org |
+| 3 | 并行工具执行 | ☐ | 多文件同时读 |
+| 4 | 语义记忆召回 | ☐ | 保存→新对话→语义查询 |
+| 5 | @include + Rules | ☐ | 中文回复 |
+| 6 | Read-before-edit | ☐ | 代码层或 prompt 层 |
+| 7 | 大结果持久化 | ☐ | 75KB 文件 |
+| 8 | Skill 调用 | ☐ | /greet /commit |
+| 9 | ToolSearch | ☐ | plan mode 工具 |
+| 10 | REPL 命令 | ☐ | /cost /memory /compact /plan |
+| 11 | Sub-agent 系统 | ☐ | explore/plan/general 三类型 |
+| 12 | Plan Mode | ☐ | /plan 手动进入 + 审批流程 |
+| 13 | 引号规范化 | ☐ | curly → straight quotes |
+| 14 | Session Resume | ☐ | --resume 恢复会话 |
+| 15 | One-shot 模式 | ☐ | 传 prompt 自动退出 |
+| 16 | 预算控制 | ☐ | --max-turns 限制 |
+| 17 | Grep Search | ☐ | 正则搜索 + include |
+| 18 | Write File | ☐ | 新文件 + 自动建目录 |
+| 19 | 自定义 Agent | ☐ | .claude/agents/ 定义 |

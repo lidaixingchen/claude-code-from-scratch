@@ -14,14 +14,14 @@
 | **记忆系统** | 4 类型 + 语义召回 + MEMORY.md 索引 | 4 类型 + 语义召回 + MEMORY.md + 异步预取 | 架构对齐 |
 | **技能系统** | 6 源 + 懒加载 + inline/fork | 2 源 + 预加载 + inline/fork | 去掉高级加载 |
 | **多 Agent** | Sub-Agent + 自定义 + Coordinator + Swarm | Sub-Agent（3 内置 + 自定义） | 去掉 Coordinator/Swarm |
-| **MCP 集成** | mcpClient.ts + 动态工具发现 | McpManager + JSON-RPC over stdio | 架构对齐 |
+| **MCP 集成** | mcp_client.py + 动态工具发现 | McpManager + JSON-RPC over stdio | 架构对齐 |
 | **预算控制** | USD/轮次/abort 三维预算 | USD + 轮次限制 | 去掉 abort signal |
 | **编辑验证** | 14 步流水线 | 引号容错 + 唯一性 + diff 输出 | 保留核心步骤 |
 
 ## 文件映射表
 
-| mini-claude (TypeScript) | mini-claude (Python) | Claude Code 源码 | 说明 |
-|------------|------------|-------------------|------|
+| mini-claude (Python) | mini-claude (Python) | Claude Code 源码 | 说明 |
+|------------|------------|------------|-------------------|------|
 | `src/agent.ts` | `python/mini_claude/agent.py` | `src/query.ts` + `src/QueryEngine.ts` | Agent 循环 + 会话管理 |
 | `src/tools.ts` | `python/mini_claude/tools.py` | `src/Tool.ts` + `src/tools/` (66 个目录) | 工具定义与执行 |
 | `src/prompt.ts` | `python/mini_claude/prompt.py` | `src/constants/prompts.ts` + `src/utils/claudemd.ts` | Prompt 构造 |
@@ -123,15 +123,6 @@ Claude Code 的 `query.ts` 有 1728 行，大部分是边缘情况处理：Promp
 ### 2. 错误自修复
 
 把工具执行错误作为工具结果反馈给模型，而不是中断循环。模型经常能自己修复：路径拼错换路径、命令参数错了改参数。
-
-```typescript
-try {
-  result = await executeToolImpl(name, input);
-} catch (e) {
-  result = `Error: ${e.message}\n\nPlease try a different approach.`;
-}
-// 把 result 作为 tool_result 返回给模型
-```
 
 约 50-80 行，但能显著提升 agent 实际可用性——这是 Claude Code 最聪明的设计之一。
 

@@ -81,7 +81,6 @@ fi
 echo ""
 echo "=== 配置完成！==="
 echo ""
-echo "启动 TS 版:  npm run build && node dist/cli.js --yolo"
-echo "启动 PY 版:  python -m mini_claude --yolo"
+echo "启动:  python -m mini_claude --yolo"
 echo ""
 echo "测试完成后运行: bash test/cleanup.sh"

@@ -116,44 +116,17 @@ graph TB
 
 ## 技术栈
 
-TypeScript 和 Python 两个版本分别实现，选你熟悉的看就行。
-
-<!-- tabs:start -->
-#### **TypeScript**
-
-```
-TypeScript           — 类型安全，与 Claude Code 同语言
-@anthropic-ai/sdk    — Anthropic 官方 SDK
-openai               — OpenAI 兼容后端支持
-chalk                — 终端颜色输出
-glob                 — 文件模式匹配
-```
-
-#### **Python**
+使用 Python 实现。
 
 ```
 Python 3.11+         — 简洁易读
 anthropic            — Anthropic 官方 SDK
 openai               — OpenAI 兼容后端支持
 ```
-<!-- tabs:end -->
 
 没有框架、没有构建工具链，只有最基础的依赖。
 
 ## 快速开始
-
-<!-- tabs:start -->
-#### **TypeScript**
-
-```bash
-git clone https://github.com/Windy3f3f3f3f/claude-code-from-scratch.git
-cd claude-code-from-scratch
-npm install
-export ANTHROPIC_API_KEY=sk-ant-xxx
-npm run dev
-```
-
-#### **Python**
 
 ```bash
 git clone https://github.com/Windy3f3f3f3f/claude-code-from-scratch.git
@@ -162,7 +135,6 @@ pip install -e .
 export ANTHROPIC_API_KEY=sk-ant-xxx
 mini-claude-py "hello"
 ```
-<!-- tabs:end -->
 
 启动后：
 
@@ -175,7 +147,7 @@ mini-claude-py "hello"
 >
 ```
 
-试试 `read src/agent.ts and explain the main loop`。
+试试 `read python/mini_claude/agent.py and explain the main loop`。
 
 ### 其他选项
 

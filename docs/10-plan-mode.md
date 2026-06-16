@@ -42,34 +42,6 @@ Claude Code 的 Plan Mode 是完整的 EnterPlanMode / ExitPlanMode 工具对：
 
 Plan Mode 需要两个工具，标记为 `deferred`（延迟加载，详见[第 2 章](docs/02-tools.md)）：
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-// tools.ts — Plan Mode 工具定义
-
-// ─── Plan mode tools ────────────────────────────────────────
-{
-  name: "enter_plan_mode",
-  description:
-    "Enter plan mode to switch to a read-only planning phase. In plan mode, you can only read files and write to the plan file. Use this when you need to explore the codebase and design an implementation plan before making changes.",
-  input_schema: {
-    type: "object" as const,
-    properties: {},
-  },
-  deferred: true,
-},
-{
-  name: "exit_plan_mode",
-  description:
-    "Exit plan mode after you have finished writing your plan to the plan file. The user will review and approve the plan before you proceed with implementation.",
-  input_schema: {
-    type: "object" as const,
-    properties: {},
-  },
-  deferred: true,
-},
-```
-#### **Python**
 ```python
 # tools.py — Plan Mode 工具定义
 
@@ -86,7 +58,6 @@ Plan Mode 需要两个工具，标记为 `deferred`（延迟加载，详见[第 
     "deferred": True,
 },
 ```
-<!-- tabs:end -->
 
 两个工具都没有参数——进入和退出是纯状态切换，所有数据（plan 文件路径、审批结果）都在 Agent 内部管理。标记为 `deferred` 是因为大多数会话不需要 Plan Mode，延迟加载避免占用提示词空间。
 
@@ -94,18 +65,6 @@ Plan Mode 需要两个工具，标记为 `deferred`（延迟加载，详见[第 
 
 Plan Mode 涉及 4 个状态变量：
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-// agent.ts — Plan Mode 状态
-
-// Plan mode state
-private prePlanMode: PermissionMode | null = null;    // 进入前的模式（用于恢复）
-private planFilePath: string | null = null;            // plan 文件路径
-private baseSystemPrompt: string = "";                 // 不含 plan 注入的基础提示词
-private contextCleared: boolean = false;               // 审批时是否清空了上下文
-```
-#### **Python**
 ```python
 # agent.py — Plan Mode 状态
 
@@ -114,44 +73,11 @@ self._plan_file_path: str | None = None     # plan 文件路径
 self._base_system_prompt: str = ""           # 基础提示词
 self._context_cleared: bool = False          # 是否清空了上下文
 ```
-<!-- tabs:end -->
 
 `prePlanMode` 是关键——它记住进入 Plan Mode 之前的权限模式，这样退出时可以精确恢复。如果用户之前是 `acceptEdits` 模式，退出 Plan Mode 后应该回到 `acceptEdits`，而不是变成 `default`。
 
 切换逻辑是对称的进入/退出：
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-// agent.ts — togglePlanMode()
-
-togglePlanMode(): string {
-  if (this.permissionMode === "plan") {
-    // 退出：恢复原模式，清理状态，移除 plan 提示
-    this.permissionMode = this.prePlanMode || "default";
-    this.prePlanMode = null;
-    this.planFilePath = null;
-    this.systemPrompt = this.baseSystemPrompt;
-    if (this.useOpenAI && this.openaiMessages.length > 0) {
-      (this.openaiMessages[0] as any).content = this.systemPrompt;
-    }
-    printInfo(`Exited plan mode → ${this.permissionMode} mode`);
-    return this.permissionMode;
-  } else {
-    // 进入：保存当前模式，切换权限，生成 plan 文件，注入提示
-    this.prePlanMode = this.permissionMode;
-    this.permissionMode = "plan";
-    this.planFilePath = this.generatePlanFilePath();
-    this.systemPrompt = this.baseSystemPrompt + this.buildPlanModePrompt();
-    if (this.useOpenAI && this.openaiMessages.length > 0) {
-      (this.openaiMessages[0] as any).content = this.systemPrompt;
-    }
-    printInfo(`Entered plan mode. Plan file: ${this.planFilePath}`);
-    return "plan";
-  }
-}
-```
-#### **Python**
 ```python
 # agent.py — toggle_plan_mode()
 
@@ -175,7 +101,6 @@ def toggle_plan_mode(self) -> str:
         print_info(f"Entered plan mode. Plan file: {self._plan_file_path}")
         return "plan"
 ```
-<!-- tabs:end -->
 
 注意系统提示词的更新方式：进入时在 `baseSystemPrompt` 后追加 plan 提示，退出时恢复为 `baseSystemPrompt`。对于 OpenAI 格式，需要直接修改消息数组的第一条（系统消息）。
 
@@ -183,18 +108,6 @@ def toggle_plan_mode(self) -> str:
 
 Plan 文件路径按会话 ID 生成，确保每个会话有独立的 plan 文件：
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-// agent.ts — Plan 文件生成
-
-private generatePlanFilePath(): string {
-  const dir = join(homedir(), ".claude", "plans");
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  return join(dir, `plan-${this.sessionId}.md`);
-}
-```
-#### **Python**
 ```python
 # agent.py — Plan 文件生成
 
@@ -203,41 +116,9 @@ def _generate_plan_file_path(self) -> str:
     d.mkdir(parents=True, exist_ok=True)
     return str(d / f"plan-{self.session_id}.md")
 ```
-<!-- tabs:end -->
 
 Plan 系统提示注入了严格的 read-only 约束和工作流指引：
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-// agent.ts — buildPlanModePrompt()
-
-private buildPlanModePrompt(): string {
-  return `
-
-# Plan Mode Active
-
-Plan mode is active. You MUST NOT make any edits (except the plan file below),
-run non-readonly tools, or make any changes to the system.
-
-## Plan File: ${this.planFilePath}
-Write your plan incrementally to this file using write_file or edit_file.
-This is the ONLY file you are allowed to edit.
-
-## Workflow
-1. **Explore**: Read code to understand the task. Use read_file, list_files, grep_search.
-2. **Design**: Design your implementation approach.
-3. **Write Plan**: Write a structured plan to the plan file including:
-   - **Context**: Why this change is needed
-   - **Steps**: Implementation steps with critical file paths
-   - **Verification**: How to test the changes
-4. **Exit**: Call exit_plan_mode when your plan is ready for user review.
-
-IMPORTANT: When your plan is complete, you MUST call exit_plan_mode.
-Do NOT ask the user to approve — exit_plan_mode handles that.`;
-}
-```
-#### **Python**
 ```python
 # agent.py — _build_plan_mode_prompt()
 
@@ -265,9 +146,9 @@ This is the ONLY file you are allowed to edit.
 IMPORTANT: When your plan is complete, you MUST call exit_plan_mode.
 Do NOT ask the user to approve — exit_plan_mode handles that."""
 ```
-<!-- tabs:end -->
 
 这个提示词做了三件事：
+
 1. **约束行为**：明确禁止编辑和 shell（配合权限检查双重保障）
 2. **声明 plan 文件**：告诉模型唯一可写的文件路径
 3. **规定工作流**：Explore → Design → Write → Exit，确保模型不会跳步
@@ -278,31 +159,6 @@ Do NOT ask the user to approve — exit_plan_mode handles that."""
 
 Plan Mode 的 read-only 约束通过 `checkPermission()` 强制执行（详见[第 6 章](docs/06-permissions.md)）：
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-// tools.ts — checkPermission() 中的 Plan Mode 处理
-
-// plan mode: block all write/edit tools (except plan file) and shell
-if (mode === "plan") {
-  if (EDIT_TOOLS.has(toolName)) {
-    const filePath = input.file_path || input.path;
-    if (planFilePath && filePath === planFilePath) {
-      return { action: "allow" };  // 唯一例外：plan 文件本身
-    }
-    return { action: "deny", message: `Blocked in plan mode: ${toolName}` };
-  }
-  if (toolName === "run_shell") {
-    return { action: "deny", message: "Shell commands blocked in plan mode" };
-  }
-}
-
-// plan mode tools: always allow (handled in agent.ts)
-if (toolName === "enter_plan_mode" || toolName === "exit_plan_mode") {
-  return { action: "allow" };
-}
-```
-#### **Python**
 ```python
 # tools.py — check_permission() 中的 Plan Mode 处理
 
@@ -318,11 +174,11 @@ if mode == "plan":
 if tool_name in ("enter_plan_mode", "exit_plan_mode"):
     return {"action": "allow"}
 ```
-<!-- tabs:end -->
 
 这里有一个精巧的设计：**plan 文件路径作为参数传入 `checkPermission()`**。当 Agent 试图写文件时，权限检查会比对目标路径和 plan 文件路径——只有完全匹配才放行。这意味着系统提示词说"只能写 plan 文件"不只是建议，而是代码强制执行的约束。
 
 双重保障：
+
 - **系统提示词**：引导模型不要尝试写其他文件（减少无效 API 调用）
 - **权限检查**：即使模型无视提示词，写操作也会被拦截并返回错误
 
@@ -330,95 +186,6 @@ if tool_name in ("enter_plan_mode", "exit_plan_mode"):
 
 `executePlanModeTool()` 处理 `enter_plan_mode` 和 `exit_plan_mode` 的执行：
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-// agent.ts — executePlanModeTool()
-
-private async executePlanModeTool(name: string): Promise<string> {
-  if (name === "enter_plan_mode") {
-    if (this.permissionMode === "plan") {
-      return "Already in plan mode.";
-    }
-    this.prePlanMode = this.permissionMode;
-    this.permissionMode = "plan";
-    this.planFilePath = this.generatePlanFilePath();
-    this.systemPrompt = this.baseSystemPrompt + this.buildPlanModePrompt();
-    if (this.useOpenAI && this.openaiMessages.length > 0) {
-      (this.openaiMessages[0] as any).content = this.systemPrompt;
-    }
-    printInfo("Entered plan mode (read-only). Plan file: " + this.planFilePath);
-    return `Entered plan mode. You are now in read-only mode.\n\n` +
-      `Your plan file: ${this.planFilePath}\n` +
-      `Write your plan to this file. This is the only file you can edit.\n\n` +
-      `When your plan is complete, call exit_plan_mode.`;
-  }
-
-  if (name === "exit_plan_mode") {
-    if (this.permissionMode !== "plan") {
-      return "Not in plan mode.";
-    }
-    // 读取 plan 文件内容
-    let planContent = "(No plan file found)";
-    if (this.planFilePath && existsSync(this.planFilePath)) {
-      planContent = readFileSync(this.planFilePath, "utf-8");
-    }
-
-    // 交互式审批流程
-    if (this.planApprovalFn) {
-      const result = await this.planApprovalFn(planContent);
-
-      if (result.choice === "keep-planning") {
-        // 用户拒绝 — 留在 plan 模式，返回反馈给模型
-        const feedback = result.feedback || "Please revise the plan.";
-        return `User rejected the plan and wants to keep planning.\n\n` +
-          `User feedback: ${feedback}\n\n` +
-          `Please revise your plan based on this feedback. When done, call exit_plan_mode again.`;
-      }
-
-      // 用户批准 — 确定目标权限模式
-      let targetMode: PermissionMode;
-      if (result.choice === "clear-and-execute" || result.choice === "execute") {
-        targetMode = "acceptEdits";
-      } else {
-        targetMode = this.prePlanMode || "default";  // manual-execute: 恢复原模式
-      }
-
-      // 退出 plan 模式
-      this.permissionMode = targetMode;
-      this.prePlanMode = null;
-      const savedPlanPath = this.planFilePath;
-      this.planFilePath = null;
-      this.systemPrompt = this.baseSystemPrompt;
-
-      // 清空上下文（如果选择了 clear-and-execute）
-      if (result.choice === "clear-and-execute") {
-        this.clearHistoryKeepSystem();
-        this.contextCleared = true;
-        printInfo(`Plan approved. Context cleared, executing in ${targetMode} mode.`);
-        return `User approved the plan. Context was cleared. Permission mode: ${targetMode}\n\n` +
-          `Plan file: ${savedPlanPath}\n\n## Approved Plan:\n${planContent}\n\nProceed with implementation.`;
-      }
-
-      printInfo(`Plan approved. Executing in ${targetMode} mode.`);
-      return `User approved the plan. Permission mode: ${targetMode}\n\n` +
-        `## Approved Plan:\n${planContent}\n\nProceed with implementation.`;
-    }
-
-    // Fallback: 没有审批函数时直接退出（如子 Agent）
-    this.permissionMode = this.prePlanMode || "default";
-    this.prePlanMode = null;
-    this.planFilePath = null;
-    this.systemPrompt = this.baseSystemPrompt;
-    printInfo("Exited plan mode. Restored to " + this.permissionMode + " mode.");
-    return `Exited plan mode. Permission mode restored to: ${this.permissionMode}\n\n` +
-      `## Your Plan:\n${planContent}`;
-  }
-
-  return `Unknown plan mode tool: ${name}`;
-}
-```
-#### **Python**
 ```python
 # agent.py — _execute_plan_mode_tool()
 
@@ -503,7 +270,6 @@ async def _execute_plan_mode_tool(self, name: str) -> str:
 
     return f"Unknown plan mode tool: {name}"
 ```
-<!-- tabs:end -->
 
 核心逻辑分三层：
 
@@ -521,40 +287,6 @@ async def _execute_plan_mode_tool(self, name: str) -> str:
 
 审批通过回调函数注入，解耦了 Agent 和 UI 层：
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-// cli.ts — 设置审批回调
-
-agent.setPlanApprovalFn((planContent: string) => {
-  return new Promise((resolve) => {
-    printPlanForApproval(planContent);   // 显示计划内容
-    printPlanApprovalOptions();          // 显示 4 个选项
-
-    const askChoice = () => {
-      rl.question("  Enter choice (1-4): ", (answer) => {
-        const choice = answer.trim();
-        if (choice === "1") {
-          resolve({ choice: "clear-and-execute" });
-        } else if (choice === "2") {
-          resolve({ choice: "execute" });
-        } else if (choice === "3") {
-          resolve({ choice: "manual-execute" });
-        } else if (choice === "4") {
-          rl.question("  Feedback (what to change): ", (feedback) => {
-            resolve({ choice: "keep-planning", feedback: feedback.trim() || undefined });
-          });
-        } else {
-          console.log("  Invalid choice. Enter 1, 2, 3, or 4.");
-          askChoice();  // 无效输入重试
-        }
-      });
-    };
-    askChoice();
-  });
-});
-```
-#### **Python**
 ```python
 # __main__.py — 设置审批回调
 
@@ -577,35 +309,6 @@ async def plan_approval(plan_content: str) -> dict:
 
 agent.set_plan_approval_fn(plan_approval)
 ```
-<!-- tabs:end -->
-
-UI 部分显示计划内容和 4 个选项：
-
-```typescript
-// ui.ts — Plan 审批 UI
-
-export function printPlanForApproval(planContent: string) {
-  console.log(chalk.cyan("\n  ━━━ Plan for Approval ━━━"));
-  const lines = planContent.split("\n");
-  const maxLines = 60;
-  const display = lines.slice(0, maxLines);
-  for (const line of display) {
-    console.log(chalk.white("  " + line));
-  }
-  if (lines.length > maxLines) {
-    console.log(chalk.gray(`  ... (${lines.length - maxLines} more lines)`));
-  }
-  console.log(chalk.cyan("  ━━━━━━━━━━━━━━━━━━━━━━━━\n"));
-}
-
-export function printPlanApprovalOptions() {
-  console.log(chalk.yellow("  Choose an option:"));
-  console.log("    1) Yes, clear context and execute — fresh start with auto-accept edits");
-  console.log("    2) Yes, and execute — keep context, auto-accept edits");
-  console.log("    3) Yes, manually approve edits — keep context, confirm each edit");
-  console.log("    4) No, keep planning — provide feedback to revise");
-}
-```
 
 四个选项的设计背后是不同的使用场景：
 
@@ -620,25 +323,6 @@ export function printPlanApprovalOptions() {
 
 Plan Mode 有三个入口：
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-// cli.ts — CLI 参数
-
-// 1. 命令行参数 --plan
-} else if (args[i] === "--plan") {
-  permissionMode = "plan";
-
-// 2. REPL 命令 /plan
-if (input === "/plan") {
-  const newMode = agent.togglePlanMode();
-  askQuestion();
-  return;
-}
-
-// 3. Agent 自主调用 enter_plan_mode 工具（通过 ToolSearch 延迟加载）
-```
-#### **Python**
 ```python
 # __main__.py — CLI 参数
 
@@ -653,9 +337,9 @@ if user_input == "/plan":
 
 # 3. Agent 自主调用 enter_plan_mode 工具
 ```
-<!-- tabs:end -->
 
 三个入口的区别：
+
 - `--plan`：启动时就进入 Plan Mode，整个会话从规划开始
 - `/plan`：会话中途切换，适合"先聊后规划"的工作流
 - `enter_plan_mode` 工具：Agent 自己判断需要先规划再执行（需要通过 ToolSearch 激活）

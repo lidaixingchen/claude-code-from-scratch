@@ -78,35 +78,6 @@ type: feedback
 
 记忆和技能都要解析 YAML frontmatter，抽出 `frontmatter.ts`：
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-// frontmatter.ts
-
-export function parseFrontmatter(content: string): FrontmatterResult {
-  const lines = content.split("\n");
-  if (lines[0]?.trim() !== "---") return { meta: {}, body: content };
-
-  let endIdx = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i].trim() === "---") { endIdx = i; break; }
-  }
-  if (endIdx === -1) return { meta: {}, body: content };
-
-  const meta: Record<string, string> = {};
-  for (let i = 1; i < endIdx; i++) {
-    const colonIdx = lines[i].indexOf(":");
-    if (colonIdx === -1) continue;
-    const key = lines[i].slice(0, colonIdx).trim();
-    const value = lines[i].slice(colonIdx + 1).trim();
-    if (key) meta[key] = value;
-  }
-
-  const body = lines.slice(endIdx + 1).join("\n").trim();
-  return { meta, body };
-}
-```
-#### **Python**
 ```python
 # frontmatter.py
 
@@ -142,39 +113,11 @@ def parse_frontmatter(content: str) -> FrontmatterResult:
     body = "\n".join(lines[end_idx + 1:]).strip()
     return FrontmatterResult(meta=meta, body=body)
 ```
-<!-- tabs:end -->
 
 没有用 `js-yaml` 之类的库——我们的 frontmatter 只是简单的 `key: value`，20 行手写解析器够用且零依赖。
 
 ### 保存与索引
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-// memory.ts — saveMemory
-
-export function saveMemory(entry: Omit<MemoryEntry, "filename">): string {
-  const dir = getMemoryDir();
-  const filename = `${entry.type}_${slugify(entry.name)}.md`;
-  const content = formatFrontmatter(
-    { name: entry.name, description: entry.description, type: entry.type },
-    entry.content
-  );
-  writeFileSync(join(dir, filename), content);
-  updateMemoryIndex();
-  return filename;
-}
-
-function updateMemoryIndex(): void {
-  const memories = listMemories();
-  const lines = ["# Memory Index", ""];
-  for (const m of memories) {
-    lines.push(`- **[${m.name}](${m.filename})** (${m.type}) — ${m.description}`);
-  }
-  writeFileSync(getIndexPath(), lines.join("\n"));
-}
-```
-#### **Python**
 ```python
 # memory.py — save_memory
 
@@ -195,35 +138,11 @@ def _update_memory_index() -> None:
         lines.append(f"- **[{m.name}]({m.filename})** ({m.type}) — {m.description}")
     _get_index_path().write_text("\n".join(lines))
 ```
-<!-- tabs:end -->
 
 文件名格式 `{type}_{slugified_name}.md` 让文件系统排序时自动按类型分组，人眼扫描也一目了然。每次写入后立即重建索引，保持 MEMORY.md 与文件系统同步。
 
 ### 索引截断
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-// memory.ts — loadMemoryIndex
-
-const MAX_INDEX_LINES = 200;
-const MAX_INDEX_BYTES = 25000;
-
-export function loadMemoryIndex(): string {
-  // ...
-  const lines = content.split("\n");
-  if (lines.length > MAX_INDEX_LINES) {
-    content = lines.slice(0, MAX_INDEX_LINES).join("\n") +
-      "\n\n[... truncated, too many memory entries ...]";
-  }
-  if (Buffer.byteLength(content) > MAX_INDEX_BYTES) {
-    content = content.slice(0, MAX_INDEX_BYTES) +
-      "\n\n[... truncated, index too large ...]";
-  }
-  return content;
-}
-```
-#### **Python**
 ```python
 # memory.py — load_memory_index
 
@@ -242,7 +161,6 @@ def load_memory_index() -> str:
         content = content[:MAX_INDEX_BYTES] + "\n\n[... truncated, index too large ...]"
     return content
 ```
-<!-- tabs:end -->
 
 两层截断各有用途：行截断（200 行）是正常防护，按完整条目截断；字节截断（25KB）是异常防御，捕捉行数不多但单行极长的情况——Claude Code 团队在生产中见过 197KB 塞在 200 行内的案例。
 
@@ -250,41 +168,6 @@ def load_memory_index() -> str:
 
 `buildMemoryPromptSection()` 生成注入到 system prompt 的文本，告诉模型记忆系统的存在和用法：
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-// memory.ts — buildMemoryPromptSection（简化展示）
-
-export function buildMemoryPromptSection(): string {
-  const index = loadMemoryIndex();
-  const memoryDir = getMemoryDir();
-
-  return `# Memory System
-
-You have a persistent, file-based memory system at \`${memoryDir}\`.
-
-## Memory Types
-- **user**: User's role, preferences, knowledge level
-- **feedback**: Corrections and guidance from the user
-- **project**: Ongoing work, goals, deadlines, decisions
-- **reference**: Pointers to external resources
-
-## How to Save Memories
-Use the write_file tool to create a memory file with YAML frontmatter:
-...
-Save to: \`${memoryDir}/\`
-Filename format: \`{type}_{slugified_name}.md\`
-
-## What NOT to Save
-- Code patterns or architecture (read the code instead)
-- Git history (use git log)
-- Anything already in CLAUDE.md
-- Ephemeral task details
-
-${index ? `## Current Memory Index\n${index}` : "(No memories saved yet.)"}`;
-}
-```
-#### **Python**
 ```python
 # memory.py — build_memory_prompt_section（简化展示）
 
@@ -316,43 +199,19 @@ Filename format: `{{type}}_{{slugified_name}}.md`
 
 {"## Current Memory Index" + chr(10) + index if index else "(No memories saved yet.)"}"""
 ```
-<!-- tabs:end -->
 
 这段 prompt 做了三件事：教模型分类（四种类型）、教模型操作（用 `write_file`、存到哪里、什么格式）、教模型克制（"What NOT to Save"）。"让模型使用记忆"不只是给它一个工具，还要在 prompt 中描述完整的类型体系和边界，模型才能做出好的决策。
 
 最后在 `prompt.ts` 中通过占位符注入：
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-systemPrompt = systemPrompt.replace("{{memory}}", buildMemoryPromptSection());
-```
-#### **Python**
 ```python
 result = result.replace("{{memory}}", build_memory_prompt_section())
 ```
-<!-- tabs:end -->
 
 ### CLI 交互
 
 用户在 REPL 中输入 `/memory` 可以列出所有记忆：
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-if (input === "/memory") {
-  const memories = listMemories();
-  if (memories.length === 0) {
-    printInfo("No memories saved yet.");
-  } else {
-    printInfo(`${memories.length} memories:`);
-    for (const m of memories) {
-      console.log(`    [${m.type}] ${m.name} — ${m.description}`);
-    }
-  }
-}
-```
-#### **Python**
 ```python
 if inp == "/memory":
     memories = list_memories()
@@ -364,7 +223,6 @@ if inp == "/memory":
             print(f"    [{m.type}] {m.name} — {m.description}")
     continue
 ```
-<!-- tabs:end -->
 
 ---
 
@@ -373,71 +231,6 @@ if inp == "/memory":
 早期版本用关键词匹配做记忆召回——把查询拆成词，统计每条记忆的命中数排序。这很简单但能力有限：用户问"部署流程"时，标题为"CI/CD 注意事项"的记忆完全匹配不上，因为没有共同关键词。
 
 新版本用 `sideQuery` 做语义召回：把所有记忆的文件名和描述发给模型，让模型判断哪些与当前查询相关。
-
-```typescript
-// memory.ts — selectRelevantMemories
-
-const SELECT_MEMORIES_PROMPT = `You are selecting memories that will be useful to an AI coding assistant as it processes a user's query. You will be given the user's query and a list of available memory files with their filenames and descriptions.
-
-Return a JSON object with a "selected_memories" array of filenames for the memories that will clearly be useful (up to 5). Only include memories that you are certain will be helpful based on their name and description.
-- If you are unsure if a memory will be useful, do not include it.
-- If no memories would clearly be useful, return an empty array.`;
-
-export async function selectRelevantMemories(
-  query: string,
-  sideQuery: SideQueryFn,
-  alreadySurfaced: Set<string>,
-  signal?: AbortSignal,
-): Promise<RelevantMemory[]> {
-  const headers = scanMemoryHeaders();
-  if (headers.length === 0) return [];
-
-  // 过滤已经在本会话中展示过的记忆
-  const candidates = headers.filter((h) => !alreadySurfaced.has(h.filePath));
-  if (candidates.length === 0) return [];
-
-  const manifest = formatMemoryManifest(candidates);
-
-  try {
-    const text = await sideQuery(
-      SELECT_MEMORIES_PROMPT,
-      `Query: ${query}\n\nAvailable memories:\n${manifest}`,
-      signal,
-    );
-
-    // 从响应中提取 JSON（模型可能用 markdown 代码块包裹）
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return [];
-
-    const parsed = JSON.parse(jsonMatch[0]);
-    const selectedFilenames: string[] = parsed.selected_memories || [];
-
-    // 文件名映射回 header，读取完整内容
-    const filenameSet = new Set(selectedFilenames);
-    const selected = candidates.filter((h) => filenameSet.has(h.filename));
-
-    return selected.slice(0, 5).map((h) => {
-      let content = readFileSync(h.filePath, "utf-8");
-      // 单文件截断（4KB）
-      if (Buffer.byteLength(content) > MAX_MEMORY_BYTES_PER_FILE) {
-        content = content.slice(0, MAX_MEMORY_BYTES_PER_FILE) +
-          "\n\n[... truncated, memory file too large ...]";
-      }
-      const freshness = memoryFreshnessWarning(h.mtimeMs);
-      const headerText = freshness
-        ? `${freshness}\n\nMemory: ${h.filePath}:`
-        : `Memory (saved ${memoryAge(h.mtimeMs)}): ${h.filePath}:`;
-
-      return { path: h.filePath, content, mtimeMs: h.mtimeMs, header: headerText };
-    });
-  } catch (err: any) {
-    // 静默失败——记忆召回永远不应阻塞主循环
-    if (signal?.aborted) return [];
-    console.error(`[memory] semantic recall failed: ${err.message}`);
-    return [];
-  }
-}
-```
 
 几个关键设计点：
 
@@ -455,74 +248,6 @@ export async function selectRelevantMemories(
 
 语义召回需要一次 API 调用，如果同步执行会增加用户等待时间。解决方案：**在用户提交输入的瞬间就启动召回，与第一次模型 API 调用并行执行。**
 
-```typescript
-// memory.ts — startMemoryPrefetch
-
-export function startMemoryPrefetch(
-  query: string,
-  sideQuery: SideQueryFn,
-  alreadySurfaced: Set<string>,
-  sessionMemoryBytes: number,
-  signal?: AbortSignal,
-): MemoryPrefetch | null {
-  // 门控 1: 单词查询跳过（太短，无法语义匹配）
-  if (!/\s/.test(query.trim())) return null;
-
-  // 门控 2: 会话预算已满
-  if (sessionMemoryBytes >= MAX_SESSION_MEMORY_BYTES) return null;
-
-  // 门控 3: 没有记忆文件
-  const dir = getMemoryDir();
-  const hasMemories = readdirSync(dir).some(
-    (f) => f.endsWith(".md") && f !== "MEMORY.md"
-  );
-  if (!hasMemories) return null;
-
-  const handle: MemoryPrefetch = {
-    promise: selectRelevantMemories(query, sideQuery, alreadySurfaced, signal),
-    settled: false,
-    consumed: false,
-  };
-  handle.promise.then(() => { handle.settled = true; }).catch(() => { handle.settled = true; });
-  return handle;
-}
-```
-
-在 `agent.ts` 中的使用：
-
-```typescript
-// agent.ts — 预取启动与消费
-
-// 用户消息进入后立即启动预取
-this.anthropicMessages.push({ role: "user", content: userMessage });
-let memoryPrefetch: MemoryPrefetch | null = null;
-if (!this.isSubAgent) {
-  const sq = this.buildSideQuery();
-  if (sq) {
-    memoryPrefetch = startMemoryPrefetch(
-      userMessage, sq,
-      this.alreadySurfacedMemories, this.sessionMemoryBytes,
-      this.abortController?.signal,
-    );
-  }
-}
-
-// while 循环中，每次 API 调用前做非阻塞轮询
-if (memoryPrefetch && memoryPrefetch.settled && !memoryPrefetch.consumed) {
-  memoryPrefetch.consumed = true;
-  const memories = await memoryPrefetch.promise;
-  if (memories.length > 0) {
-    const injectionText = formatMemoriesForInjection(memories);
-    this.anthropicMessages.push({ role: "user", content: injectionText });
-    // 跟踪已展示的记忆和会话预算
-    for (const m of memories) {
-      this.alreadySurfacedMemories.add(m.path);
-      this.sessionMemoryBytes += Buffer.byteLength(m.content);
-    }
-  }
-}
-```
-
 这个设计的关键在于**非阻塞轮询**：
 
 1. **预取在用户输入时启动**——与第一次模型 API 调用并行，用户感知不到额外延迟
@@ -537,27 +262,9 @@ if (memoryPrefetch && memoryPrefetch.settled && !memoryPrefetch.consumed) {
 
 `formatMemoriesForInjection` 把每条记忆包裹在 `<system-reminder>` 标签中注入为 user message：
 
-```typescript
-export function formatMemoriesForInjection(memories: RelevantMemory[]): string {
-  return memories
-    .map((m) => `<system-reminder>\n${m.header}\n\n${m.content}\n</system-reminder>`)
-    .join("\n\n");
-}
-```
-
 ### Freshness Warning
 
 记忆是时间切片，不是实时状态。一条"项目下周截止"的记忆在两周后读到时已经过时，模型如果不知道这一点就会给出错误建议。
-
-```typescript
-// memory.ts — memoryFreshnessWarning
-
-export function memoryFreshnessWarning(mtimeMs: number): string {
-  const days = Math.max(0, Math.floor((Date.now() - mtimeMs) / 86_400_000));
-  if (days <= 1) return "";
-  return `This memory is ${days} days old. Memories are point-in-time observations, not live state — claims about code behavior may be outdated. Verify against current code before asserting as fact.`;
-}
-```
 
 规则很简单：1 天以内不提示（信息基本新鲜），超过 1 天就附带警告。警告文本明确告诉模型两件事："这是过去某个时刻的观察"和"需要对照当前代码验证"。这比简单标注"X 天前"更有效——它给出了行动指引，而非只是信息。
 

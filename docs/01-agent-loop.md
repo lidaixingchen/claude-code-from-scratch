@@ -79,78 +79,8 @@ Claude Code 用 `StreamingToolExecutor` 在 API 流式响应期间并行执行�
 
 把双层架构合并成一个 `Agent` 类，核心是 `chatAnthropic()` 方法：
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-// agent.ts — chatAnthropic 方法（核心 Agent Loop）
-
-private async chatAnthropic(userMessage: string): Promise<void> {
-  this.anthropicMessages.push({ role: "user", content: userMessage });
-  // 在 turn boundary 触发 auto-compact：此时最后一条消息是纯文本 user，
-  // compactAnthropic 内部的 slice(0, -1) 不会切断 tool_use ↔ tool_result 配对（详见第 7 章）
-  await this.checkAndCompact();
-
-  while (true) {
-    if (this.abortController?.signal.aborted) break;
-
-    const response = await this.callAnthropicStream();
-
-    // 累计 token 用量
-    this.totalInputTokens += response.usage.input_tokens;
-    this.totalOutputTokens += response.usage.output_tokens;
-    this.lastInputTokenCount = response.usage.input_tokens;
-
-    // 提取 tool_use block
-    const toolUses: Anthropic.ToolUseBlock[] = [];
-    for (const block of response.content) {
-      if (block.type === "tool_use") toolUses.push(block);
-    }
-
-    // assistant 响应推入历史
-    this.anthropicMessages.push({ role: "assistant", content: response.content });
-
-    // 没有工具调用 → 任务完成
-    if (toolUses.length === 0) {
-      printCost(this.totalInputTokens, this.totalOutputTokens);
-      break;
-    }
-
-    // 串行执行每个工具
-    const toolResults: Anthropic.ToolResultBlockParam[] = [];
-    for (const toolUse of toolUses) {
-      if (this.abortController?.signal.aborted) break;
-
-      const input = toolUse.input as Record<string, any>;
-      printToolCall(toolUse.name, input);
-
-      // 权限检查（详见第 6 章）
-      const perm = checkPermission(toolUse.name, input, this.permissionMode, this.planFilePath);
-      if (perm.action === "deny") {
-        toolResults.push({ type: "tool_result", tool_use_id: toolUse.id,
-          content: `Action denied: ${perm.message}` });
-        continue;
-      }
-      if (perm.action === "confirm" && perm.message && !this.confirmedPaths.has(perm.message)) {
-        const confirmed = await this.confirmDangerous(perm.message);
-        if (!confirmed) {
-          toolResults.push({ type: "tool_result", tool_use_id: toolUse.id,
-            content: "User denied this action." });
-          continue;
-        }
-        this.confirmedPaths.add(perm.message);
-      }
-
-      const result = await executeTool(toolUse.name, input);
-      printToolResult(toolUse.name, result);
-      toolResults.push({ type: "tool_result", tool_use_id: toolUse.id, content: result });
-    }
-
-    // 工具结果以 user 消息推入（Anthropic API 要求）
-    this.anthropicMessages.push({ role: "user", content: toolResults });
-  }
-}
-```
-#### **Python**
+```python
+# agent.py — _chat_anthropic 方法（核心 Agent Loop）
 ```python
 # agent.py — _chat_anthropic 方法（核心 Agent Loop）
 
@@ -211,7 +141,6 @@ async def _chat_anthropic(self, user_message: str) -> None:
 
         self._anthropic_messages.append({"role": "user", "content": tool_results})
 ```
-<!-- tabs:end -->
 
 ### 消息数组的增长方式
 
@@ -243,25 +172,6 @@ async def _chat_anthropic(self, user_message: str) -> None:
 
 ### AbortController：优雅中断
 
-<!-- tabs:start -->
-#### **TypeScript**
-```typescript
-async chat(userMessage: string): Promise<void> {
-  this.abortController = new AbortController();
-  try {
-    await this.chatAnthropic(userMessage);
-  } finally {
-    this.abortController = null;
-  }
-  printDivider();
-  this.autoSave();
-}
-
-abort() {
-  this.abortController?.abort();
-}
-```
-#### **Python**
 ```python
 async def chat(self, user_message: str) -> None:
     self._aborted = False
@@ -279,7 +189,6 @@ async def chat(self, user_message: str) -> None:
 def abort(self) -> None:
     self._aborted = True
 ```
-<!-- tabs:end -->
 
 `AbortController` 是标准的中断机制：`abort()` 被调用后 signal 变为 `aborted`，循环在下一个检查点退出。signal 同时传给 API 调用，确保网络请求也能被取消。
 
