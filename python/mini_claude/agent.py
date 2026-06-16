@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
@@ -49,32 +51,20 @@ from .prompt import build_system_prompt
 from .subagent import get_sub_agent_config
 from .mcp_client import McpManager
 
-# ─── Retry with exponential backoff ──────────────────────────
+# ─── Logger ─────────────────────────────────────────────────
 
+logger = logging.getLogger(__name__)
 
-def _is_retryable(error: Exception) -> bool:
-    status = getattr(error, "status_code", None) or getattr(error, "status", None)
-    if status in (429, 503, 529):
-        return True
-    msg = str(error)
-    if "overloaded" in msg or "ECONNRESET" in msg or "ETIMEDOUT" in msg:
-        return True
-    return False
+# ─── Constants ──────────────────────────────────────────────
 
-
-async def _with_retry(fn, max_retries: int = 3):
-    for attempt in range(max_retries + 1):
-        try:
-            return await fn()
-        except Exception as error:
-            if attempt >= max_retries or not _is_retryable(error):
-                raise
-            delay = min(1000 * (2 ** attempt), 30000) / 1000 + (hash(str(time.time())) % 1000) / 1000
-            status = getattr(error, "status_code", None) or getattr(error, "status", None)
-            reason = f"HTTP {status}" if status else (getattr(error, "code", None) or "network error")
-            print_retry(attempt + 1, max_retries, reason)
-            await asyncio.sleep(delay)
-
+CONTEXT_WINDOW_SAFETY_MARGIN = 20000
+AUTOCOMPACT_THRESHOLD = 0.85
+COST_PER_INPUT_TOKEN = 3 / 1_000_000   # $3 per 1M tokens
+COST_PER_OUTPUT_TOKEN = 15 / 1_000_000  # $15 per 1M tokens
+LARGE_RESULT_THRESHOLD = 30 * 1024      # 30 KB
+LARGE_RESULT_PREVIEW_LINES = 200
+MAX_RETRIES = 3
+MAX_RETRY_DELAY_MS = 30000
 
 # ─── Model context windows ──────────────────────────────────
 
@@ -146,6 +136,178 @@ SNIP_THRESHOLD = 0.60
 MICROCOMPACT_IDLE_S = 5 * 60  # 5 minutes
 KEEP_RECENT_RESULTS = 3
 
+# ─── Retry with exponential backoff ──────────────────────────
+
+
+def _is_retryable(error: Exception) -> bool:
+    status = getattr(error, "status_code", None) or getattr(error, "status", None)
+    if status in (429, 503, 529):
+        return True
+    msg = str(error)
+    if "overloaded" in msg or "ECONNRESET" in msg or "ETIMEDOUT" in msg:
+        return True
+    return False
+
+
+async def _with_retry(fn, max_retries: int = MAX_RETRIES):
+    for attempt in range(max_retries + 1):
+        try:
+            return await fn()
+        except Exception as error:
+            if attempt >= max_retries or not _is_retryable(error):
+                raise
+            # Exponential backoff with jitter to avoid thundering herd
+            base_delay = min(1000 * (2 ** attempt), MAX_RETRY_DELAY_MS) / 1000
+            jitter = (hash(str(time.time())) % 1000) / 1000  # 0-1s random jitter
+            delay = base_delay + jitter
+            status = getattr(error, "status_code", None) or getattr(error, "status", None)
+            reason = f"HTTP {status}" if status else (getattr(error, "code", None) or "network error")
+            print_retry(attempt + 1, max_retries, reason)
+            await asyncio.sleep(delay)
+
+
+# ─── Configuration and state dataclasses ────────────────────
+
+
+@dataclass
+class AgentConfig:
+    """Agent configuration. permission_mode is mutable (toggle_plan_mode)."""
+    permission_mode: str = "default"
+    model: str = "claude-opus-4-6"
+    api_base: str | None = None
+    anthropic_base_url: str | None = None
+    api_key: str | None = None
+    thinking: bool = False
+    max_cost_usd: float | None = None
+    max_turns: int | None = None
+    custom_system_prompt: str | None = None
+    custom_tools: list[ToolDef] | None = None
+    is_sub_agent: bool = False
+
+
+@dataclass
+class AgentState:
+    """Mutable runtime state for an Agent instance."""
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    last_input_token_count: int = 0
+    current_turns: int = 0
+    last_api_call_time: float = 0.0
+    aborted: bool = False
+    current_task: asyncio.Task | None = None
+    confirmed_paths: set[str] = field(default_factory=set)
+    pre_plan_mode: str | None = None
+    plan_file_path: str | None = None
+    context_cleared: bool = False
+    thinking_mode: str = "disabled"
+    output_buffer: list[str] | None = None
+    read_file_state: dict[str, float] = field(default_factory=dict)
+    already_surfaced_memories: set[str] = field(default_factory=set)
+    session_memory_bytes: int = 0
+
+
+# ─── Message history abstraction ────────────────────────────
+
+
+class MessageHistory:
+    """Abstraction over Anthropic/OpenAI message formats.
+
+    Provides a unified interface for managing conversation history,
+    eliminating code duplication between the two backends.
+    """
+
+    def __init__(self, use_openai: bool, system_prompt: str):
+        self.use_openai = use_openai
+        self.system_prompt = system_prompt
+        self._anthropic_messages: list[dict] = []
+        self._openai_messages: list[dict] = []
+        if use_openai:
+            self._openai_messages.append({"role": "system", "content": system_prompt})
+
+    @property
+    def messages(self) -> list[dict]:
+        """Return the active message list."""
+        return self._openai_messages if self.use_openai else self._anthropic_messages
+
+    @property
+    def anthropic_messages(self) -> list[dict]:
+        return self._anthropic_messages
+
+    @property
+    def openai_messages(self) -> list[dict]:
+        return self._openai_messages
+
+    def append_user_message(self, content: str | list) -> None:
+        self.messages.append({"role": "user", "content": content})
+
+    def append_assistant_message(self, content: Any) -> None:
+        self.messages.append({"role": "assistant", "content": content})
+
+    def append_tool_results(self, results: list[dict]) -> None:
+        if self.use_openai:
+            for r in results:
+                self.messages.append(r)
+        else:
+            self.messages.append({"role": "user", "content": results})
+
+    def append_openai_tool_message(self, tool_call_id: str, content: str) -> None:
+        """Append an OpenAI-format tool result message."""
+        self._openai_messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": content})
+
+    def get_last_user_message(self) -> dict | None:
+        for msg in reversed(self.messages):
+            if msg.get("role") == "user":
+                return msg
+        return None
+
+    def update_last_user_content(self, suffix: str) -> None:
+        """Append text to the last user message (for memory injection)."""
+        last = self.get_last_user_message()
+        if last:
+            content = last.get("content", "")
+            if isinstance(content, str):
+                last["content"] = content + "\n\n" + suffix
+            elif isinstance(content, list):
+                content.append({"type": "text", "text": suffix})
+
+    def clear(self, keep_system: bool = True) -> None:
+        """Clear history. If keep_system, preserve the system prompt for OpenAI."""
+        self._anthropic_messages = []
+        self._openai_messages = []
+        if self.use_openai and keep_system:
+            self._openai_messages.append({"role": "system", "content": self.system_prompt})
+
+    def update_system_prompt(self, prompt: str) -> None:
+        """Update the system prompt (for plan mode toggle)."""
+        self.system_prompt = prompt
+        if self.use_openai and self._openai_messages:
+            self._openai_messages[0]["content"] = prompt
+
+    def message_count(self) -> int:
+        return len(self.messages)
+
+    def to_dict(self) -> dict:
+        """Serialize for session persistence."""
+        return {
+            "anthropicMessages": self._anthropic_messages if not self.use_openai else None,
+            "openaiMessages": self._openai_messages if self.use_openai else None,
+        }
+
+    def restore(self, data: dict) -> None:
+        """Restore from serialized session data."""
+        if data.get("anthropicMessages"):
+            self._anthropic_messages = data["anthropicMessages"]
+        if data.get("openaiMessages"):
+            self._openai_messages = data["openaiMessages"]
+
+    def replace_anthropic_messages(self, messages: list[dict]) -> None:
+        """Replace all Anthropic messages (used during compaction)."""
+        self._anthropic_messages = messages
+
+    def replace_openai_messages(self, messages: list[dict]) -> None:
+        """Replace all OpenAI messages (used during compaction)."""
+        self._openai_messages = messages
+
 
 # ─── Agent ───────────────────────────────────────────────────
 
@@ -154,7 +316,7 @@ class Agent:
     def __init__(
         self,
         *,
-        permission_mode: str = "default",
+        permission_mode: PermissionMode = "default",
         model: str = "claude-opus-4-6",
         api_base: str | None = None,
         anthropic_base_url: str | None = None,
@@ -167,72 +329,57 @@ class Agent:
         custom_tools: list[ToolDef] | None = None,
         is_sub_agent: bool = False,
     ):
-        self.permission_mode = permission_mode
-        self.thinking = thinking
-        self.model = model
-        self.use_openai = bool(api_base)
-        self.is_sub_agent = is_sub_agent
-        self.tools = custom_tools or tool_definitions
-        self.max_cost_usd = max_cost_usd
-        self.max_turns = max_turns
+        # Configuration
+        self.config = AgentConfig(
+            permission_mode=permission_mode,
+            model=model,
+            api_base=api_base,
+            anthropic_base_url=anthropic_base_url,
+            api_key=api_key,
+            thinking=thinking,
+            max_cost_usd=max_cost_usd,
+            max_turns=max_turns,
+            custom_system_prompt=custom_system_prompt,
+            custom_tools=custom_tools,
+            is_sub_agent=is_sub_agent,
+        )
+
+        # Mutable runtime state
+        self.state = AgentState()
+
+        # Callbacks
         self.confirm_fn = confirm_fn
-        self.effective_window = _get_context_window(model) - 20000
+        self._plan_approval_fn: Callable[[str], Awaitable[dict]] | None = None
+
+        # Derived properties
+        self.use_openai = bool(api_base)
+        self.tools = custom_tools or tool_definitions
+        self.effective_window = _get_context_window(model) - CONTEXT_WINDOW_SAFETY_MARGIN
         self.session_id = uuid.uuid4().hex[:8]
         self.session_start_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-        self.total_input_tokens = 0
-        self.total_output_tokens = 0
-        self.last_input_token_count = 0
-        self.current_turns = 0
-        self.last_api_call_time = 0.0
-
-        # Abort support
-        self._aborted = False
-        self._current_task: asyncio.Task | None = None
-
-        # Permission whitelist
-        self._confirmed_paths: set[str] = set()
-
-        # Plan mode state
-        self._pre_plan_mode: str | None = None
-        self._plan_file_path: str | None = None
-        self._plan_approval_fn: Callable[[str], Awaitable[dict]] | None = None
-        self._context_cleared: bool = False  # Set when plan approval clears context
-
-        # Thinking mode
-        self._thinking_mode = self._resolve_thinking_mode()
-
-        # Output buffer (sub-agents capture output)
-        self._output_buffer: list[str] | None = None
-
-        # Read-before-edit: track file read timestamps (absolutePath → mtime)
-        self._read_file_state: dict[str, float] = {}
+        # Resolve thinking mode
+        self.state.thinking_mode = self._resolve_thinking_mode()
 
         # MCP integration
         self._mcp_manager = McpManager()
         self._mcp_initialized = False
 
-        # Memory recall state — semantic prefetch per user turn
-        self._already_surfaced_memories: set[str] = set()
-        self._session_memory_bytes = 0
-
-        # Separate message histories
-        self._anthropic_messages: list[dict] = []
-        self._openai_messages: list[dict] = []
-
         # Build system prompt
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
-        if self.permission_mode == "plan":
-            self._plan_file_path = self._generate_plan_file_path()
+        if self.config.permission_mode == "plan":
+            self.state.plan_file_path = self._generate_plan_file_path()
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
         else:
             self._system_prompt = self._base_system_prompt
 
-        # Initialize clients
+        # Unified message history
+        self.history = MessageHistory(self.use_openai, self._system_prompt)
+
+        # Initialize API clients
         if self.use_openai:
             self._openai_client = openai.AsyncOpenAI(base_url=api_base, api_key=api_key)
             self._anthropic_client = None
-            self._openai_messages.append({"role": "system", "content": self._system_prompt})
         else:
             kwargs: dict[str, Any] = {}
             if api_key:
@@ -242,24 +389,79 @@ class Agent:
             self._anthropic_client = anthropic.AsyncAnthropic(**kwargs)
             self._openai_client = None
 
-    def _resolve_thinking_mode(self) -> str:
-        if not self.thinking:
-            return "disabled"
-        if not _model_supports_thinking(self.model):
-            return "disabled"
-        if _model_supports_adaptive_thinking(self.model):
-            return "adaptive"
-        return "enabled"
+    # ─── Properties for backward compatibility ────────────────
+
+    @property
+    def permission_mode(self) -> str:
+        return self.config.permission_mode
+
+    @property
+    def model(self) -> str:
+        return self.config.model
+
+    @property
+    def is_sub_agent(self) -> bool:
+        return self.config.is_sub_agent
+
+    @property
+    def _aborted(self) -> bool:
+        return self.state.aborted
+
+    @_aborted.setter
+    def _aborted(self, value: bool) -> None:
+        self.state.aborted = value
+
+    @property
+    def _output_buffer(self) -> list[str] | None:
+        return self.state.output_buffer
+
+    @_output_buffer.setter
+    def _output_buffer(self, value: list[str] | None) -> None:
+        self.state.output_buffer = value
+
+    @property
+    def _read_file_state(self) -> dict[str, float]:
+        return self.state.read_file_state
+
+    @property
+    def _context_cleared(self) -> bool:
+        return self.state.context_cleared
+
+    @_context_cleared.setter
+    def _context_cleared(self, value: bool) -> None:
+        self.state.context_cleared = value
+
+    @property
+    def _thinking_mode(self) -> str:
+        return self.state.thinking_mode
+
+    @property
+    def _plan_file_path(self) -> str | None:
+        return self.state.plan_file_path
 
     @property
     def is_processing(self) -> bool:
-        return self._current_task is not None and not self._current_task.done()
+        return self.state.current_task is not None and not self.state.current_task.done()
 
-    def _build_side_query(self):
+    # ─── Thinking mode resolution ────────────────────────────
+
+    def _resolve_thinking_mode(self) -> str:
+        if not self.config.thinking:
+            return "disabled"
+        if not _model_supports_thinking(self.config.model):
+            return "disabled"
+        if _model_supports_adaptive_thinking(self.config.model):
+            return "adaptive"
+        return "enabled"
+
+    # ─── Side query for memory recall ─────────────────────────
+
+    def _build_side_query(self) -> Callable[[str, str], Awaitable[str]] | None:
         """Build a sideQuery callable for memory recall, works with both backends."""
         if self._anthropic_client:
             client = self._anthropic_client
-            model = self.model
+            model = self.config.model
+
             async def _sq(system: str, user_message: str) -> str:
                 resp = await client.messages.create(
                     model=model, max_tokens=256, system=system,
@@ -269,7 +471,8 @@ class Agent:
             return _sq
         if self._openai_client:
             client = self._openai_client
-            model = self.model
+            model = self.config.model
+
             async def _sq_oai(system: str, user_message: str) -> str:
                 resp = await client.chat.completions.create(
                     model=model,
@@ -282,10 +485,12 @@ class Agent:
             return _sq_oai
         return None
 
+    # ─── Abort and callbacks ─────────────────────────────────
+
     def abort(self) -> None:
-        self._aborted = True
-        if self._current_task and not self._current_task.done():
-            self._current_task.cancel()
+        self.state.aborted = True
+        if self.state.current_task and not self.state.current_task.done():
+            self.state.current_task.cancel()
 
     def set_confirm_fn(self, fn: Callable[[str], Awaitable[bool]]) -> None:
         self.confirm_fn = fn
@@ -296,33 +501,31 @@ class Agent:
     # ─── Plan mode toggle ────────────────────────────────────
 
     def toggle_plan_mode(self) -> str:
-        if self.permission_mode == "plan":
-            self.permission_mode = self._pre_plan_mode or "default"
-            self._pre_plan_mode = None
-            self._plan_file_path = None
+        if self.config.permission_mode == "plan":
+            self.config.permission_mode = self.state.pre_plan_mode or "default"
+            self.state.pre_plan_mode = None
+            self.state.plan_file_path = None
             self._system_prompt = self._base_system_prompt
-            if self.use_openai and self._openai_messages:
-                self._openai_messages[0]["content"] = self._system_prompt
-            print_info(f"Exited plan mode → {self.permission_mode} mode")
-            return self.permission_mode
+            self.history.update_system_prompt(self._system_prompt)
+            print_info(f"Exited plan mode → {self.config.permission_mode} mode")
+            return self.config.permission_mode
         else:
-            self._pre_plan_mode = self.permission_mode
-            self.permission_mode = "plan"
-            self._plan_file_path = self._generate_plan_file_path()
+            self.state.pre_plan_mode = self.config.permission_mode
+            self.config.permission_mode = "plan"
+            self.state.plan_file_path = self._generate_plan_file_path()
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
-            if self.use_openai and self._openai_messages:
-                self._openai_messages[0]["content"] = self._system_prompt
-            print_info(f"Entered plan mode. Plan file: {self._plan_file_path}")
+            self.history.update_system_prompt(self._system_prompt)
+            print_info(f"Entered plan mode. Plan file: {self.state.plan_file_path}")
             return "plan"
 
     def get_token_usage(self) -> dict:
-        return {"input": self.total_input_tokens, "output": self.total_output_tokens}
+        return {"input": self.state.total_input_tokens, "output": self.state.total_output_tokens}
 
     # ─── Main entry point ────────────────────────────────────
 
     async def chat(self, user_message: str) -> None:
         # Lazily connect to MCP servers on first chat (main agent only)
-        if not self._mcp_initialized and not self.is_sub_agent:
+        if not self._mcp_initialized and not self.config.is_sub_agent:
             self._mcp_initialized = True
             try:
                 await self._mcp_manager.load_and_connect()
@@ -330,72 +533,75 @@ class Agent:
                 if mcp_defs:
                     self.tools = self.tools + mcp_defs
             except Exception as e:
-                print(f"[mcp] Init failed: {e}", flush=True)
+                logger.warning(f"MCP init failed: {e}")
 
-        self._aborted = False
+        self.state.aborted = False
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
-        self._current_task = asyncio.current_task()
+        self.state.current_task = asyncio.current_task()
         try:
             await coro
         except asyncio.CancelledError:
-            self._aborted = True
+            self.state.aborted = True
         finally:
-            self._current_task = None
-        if not self.is_sub_agent:
+            self.state.current_task = None
+        if not self.config.is_sub_agent:
             print_divider()
             self._auto_save()
 
     # ─── Sub-agent entry point ────────────────────────────────
 
     async def run_once(self, prompt: str) -> dict:
-        self._output_buffer = []
-        prev_in = self.total_input_tokens
-        prev_out = self.total_output_tokens
+        self.state.output_buffer = []
+        prev_in = self.state.total_input_tokens
+        prev_out = self.state.total_output_tokens
         await self.chat(prompt)
-        text = "".join(self._output_buffer)
-        self._output_buffer = None
+        text = "".join(self.state.output_buffer)
+        self.state.output_buffer = None
         return {
             "text": text,
             "tokens": {
-                "input": self.total_input_tokens - prev_in,
-                "output": self.total_output_tokens - prev_out,
+                "input": self.state.total_input_tokens - prev_in,
+                "output": self.state.total_output_tokens - prev_out,
             },
         }
 
     # ─── Output helper ────────────────────────────────────────
 
     def _emit_text(self, text: str) -> None:
-        if self._output_buffer is not None:
-            self._output_buffer.append(text)
+        if self.state.output_buffer is not None:
+            self.state.output_buffer.append(text)
         else:
             print_assistant_text(text)
 
     # ─── REPL commands ────────────────────────────────────────
 
     def clear_history(self) -> None:
-        self._anthropic_messages = []
-        self._openai_messages = []
-        if self.use_openai:
-            self._openai_messages.append({"role": "system", "content": self._system_prompt})
-        self.total_input_tokens = 0
-        self.total_output_tokens = 0
-        self.last_input_token_count = 0
+        self.history.clear(keep_system=True)
+        self.state.total_input_tokens = 0
+        self.state.total_output_tokens = 0
+        self.state.last_input_token_count = 0
         print_info("Conversation cleared.")
 
     def show_cost(self) -> None:
         total = self._get_current_cost_usd()
-        budget_info = f" / ${self.max_cost_usd} budget" if self.max_cost_usd else ""
-        turn_info = f" | Turns: {self.current_turns}/{self.max_turns}" if self.max_turns else ""
-        print_info(f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}")
+        budget_info = f" / ${self.config.max_cost_usd} budget" if self.config.max_cost_usd else ""
+        turn_info = f" | Turns: {self.state.current_turns}/{self.config.max_turns}" if self.config.max_turns else ""
+        print_info(
+            f"Tokens: {self.state.total_input_tokens} in / {self.state.total_output_tokens} out\n"
+            f"  Estimated cost: ${total:.4f}{budget_info}{turn_info}"
+        )
 
     def _get_current_cost_usd(self) -> float:
-        return (self.total_input_tokens / 1_000_000) * 3 + (self.total_output_tokens / 1_000_000) * 15
+        return (
+            self.state.total_input_tokens * COST_PER_INPUT_TOKEN
+            + self.state.total_output_tokens * COST_PER_OUTPUT_TOKEN
+        )
 
     def _check_budget(self) -> dict:
-        if self.max_cost_usd is not None and self._get_current_cost_usd() >= self.max_cost_usd:
-            return {"exceeded": True, "reason": f"Cost limit reached (${self._get_current_cost_usd():.4f} >= ${self.max_cost_usd})"}
-        if self.max_turns is not None and self.current_turns >= self.max_turns:
-            return {"exceeded": True, "reason": f"Turn limit reached ({self.current_turns} >= {self.max_turns})"}
+        if self.config.max_cost_usd is not None and self._get_current_cost_usd() >= self.config.max_cost_usd:
+            return {"exceeded": True, "reason": f"Cost limit reached (${self._get_current_cost_usd():.4f} >= ${self.config.max_cost_usd})"}
+        if self.config.max_turns is not None and self.state.current_turns >= self.config.max_turns:
+            return {"exceeded": True, "reason": f"Turn limit reached ({self.state.current_turns} >= {self.config.max_turns})"}
         return {"exceeded": False}
 
     async def compact(self) -> None:
@@ -404,35 +610,28 @@ class Agent:
     # ─── Session ──────────────────────────────────────────────
 
     def restore_session(self, data: dict) -> None:
-        if data.get("anthropicMessages"):
-            self._anthropic_messages = data["anthropicMessages"]
-        if data.get("openaiMessages"):
-            self._openai_messages = data["openaiMessages"]
-        print_info(f"Session restored ({self._get_message_count()} messages).")
-
-    def _get_message_count(self) -> int:
-        return len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
+        self.history.restore(data)
+        print_info(f"Session restored ({self.history.message_count()} messages).")
 
     def _auto_save(self) -> None:
         try:
             save_session(self.session_id, {
                 "metadata": {
                     "id": self.session_id,
-                    "model": self.model,
+                    "model": self.config.model,
                     "cwd": str(Path.cwd()),
                     "startTime": self.session_start_time,
-                    "messageCount": self._get_message_count(),
+                    "messageCount": self.history.message_count(),
                 },
-                "anthropicMessages": self._anthropic_messages if not self.use_openai else None,
-                "openaiMessages": self._openai_messages if self.use_openai else None,
+                **self.history.to_dict(),
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Session auto-save failed: {e}")
 
     # ─── Autocompact ──────────────────────────────────────────
 
     async def _check_and_compact(self) -> None:
-        if self.last_input_token_count > self.effective_window * 0.85:
+        if self.state.last_input_token_count > self.effective_window * AUTOCOMPACT_THRESHOLD:
             print_info("Context window filling up, compacting conversation...")
             await self._compact_conversation()
 
@@ -444,57 +643,53 @@ class Agent:
         print_info("Conversation compacted.")
 
     async def _compact_anthropic(self) -> None:
-        # Invariant: caller must ensure the last message is a plain user-text
-        # message (not a tool_result). We slice it off below; if it were a
-        # tool_result, the preceding assistant's tool_use would be orphaned
-        # and the API would reject the summarize call.
-        if len(self._anthropic_messages) < 4:
+        messages = self.history.anthropic_messages
+        if len(messages) < 4:
             return
-        last_user_msg = self._anthropic_messages[-1]
+        last_user_msg = messages[-1]
         summary_resp = await self._anthropic_client.messages.create(
-            model=self.model,
+            model=self.config.model,
             max_tokens=2048,
             system="You are a conversation summarizer. Be concise but preserve important details.",
             messages=[
-                *self._anthropic_messages[:-1],
+                *messages[:-1],
                 {"role": "user", "content": "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work."},
             ],
         )
         summary_text = summary_resp.content[0].text if summary_resp.content and summary_resp.content[0].type == "text" else "No summary available."
-        self._anthropic_messages = [
+        new_messages = [
             {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
             {"role": "assistant", "content": "Understood. I have the context from our previous conversation. How can I continue helping?"},
         ]
         if last_user_msg.get("role") == "user":
-            self._anthropic_messages.append(last_user_msg)
-        self.last_input_token_count = 0
+            new_messages.append(last_user_msg)
+        self.history.replace_anthropic_messages(new_messages)
+        self.state.last_input_token_count = 0
 
     async def _compact_openai(self) -> None:
-        # Invariant: caller must ensure the last message is a plain user-text
-        # message (not a `tool` role result). Same reasoning as
-        # _compact_anthropic — slicing off a tool result would orphan the
-        # preceding assistant's tool_calls.
-        if len(self._openai_messages) < 5:
+        messages = self.history.openai_messages
+        if len(messages) < 5:
             return
-        system_msg = self._openai_messages[0]
-        last_user_msg = self._openai_messages[-1]
+        system_msg = messages[0]
+        last_user_msg = messages[-1]
         summary_resp = await self._openai_client.chat.completions.create(
-            model=self.model,
-            messages=[
+            model=self.config.model,
+            messages=[  # type: ignore[arg-type]
                 {"role": "system", "content": "You are a conversation summarizer. Be concise but preserve important details."},
-                *self._openai_messages[1:-1],
+                *messages[1:-1],
                 {"role": "user", "content": "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work."},
             ],
         )
         summary_text = summary_resp.choices[0].message.content or "No summary available."
-        self._openai_messages = [
+        new_messages = [
             system_msg,
             {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
             {"role": "assistant", "content": "Understood. I have the context from our previous conversation. How can I continue helping?"},
         ]
         if last_user_msg.get("role") == "user":
-            self._openai_messages.append(last_user_msg)
-        self.last_input_token_count = 0
+            new_messages.append(last_user_msg)
+        self.history.replace_openai_messages(new_messages)
+        self.state.last_input_token_count = 0
 
     # ─── Multi-tier compression pipeline ──────────────────────
 
@@ -510,11 +705,11 @@ class Agent:
 
     # Tier 1: Budget tool results
     def _budget_tool_results_anthropic(self) -> None:
-        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
+        utilization = self.state.last_input_token_count / self.effective_window if self.effective_window else 0
         if utilization < 0.5:
             return
         budget = 15000 if utilization > 0.7 else 30000
-        for msg in self._anthropic_messages:
+        for msg in self.history.anthropic_messages:
             if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
                 continue
             for block in msg["content"]:
@@ -523,23 +718,23 @@ class Agent:
                     block["content"] = block["content"][:keep] + f"\n\n[... budgeted: {len(block['content']) - keep * 2} chars truncated ...]\n\n" + block["content"][-keep:]
 
     def _budget_tool_results_openai(self) -> None:
-        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
+        utilization = self.state.last_input_token_count / self.effective_window if self.effective_window else 0
         if utilization < 0.5:
             return
         budget = 15000 if utilization > 0.7 else 30000
-        for msg in self._openai_messages:
+        for msg in self.history.openai_messages:
             if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and len(msg["content"]) > budget:
                 keep = (budget - 80) // 2
                 msg["content"] = msg["content"][:keep] + f"\n\n[... budgeted: {len(msg['content']) - keep * 2} chars truncated ...]\n\n" + msg["content"][-keep:]
 
     # Tier 2: Snip stale results
     def _snip_stale_results_anthropic(self) -> None:
-        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
+        utilization = self.state.last_input_token_count / self.effective_window if self.effective_window else 0
         if utilization < SNIP_THRESHOLD:
             return
 
         results = []
-        for mi, msg in enumerate(self._anthropic_messages):
+        for mi, msg in enumerate(self.history.anthropic_messages):
             if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
                 continue
             for bi, block in enumerate(msg["content"]):
@@ -569,28 +764,28 @@ class Agent:
 
         for idx in to_snip:
             r = results[idx]
-            self._anthropic_messages[r["mi"]]["content"][r["bi"]]["content"] = SNIP_PLACEHOLDER
+            self.history.anthropic_messages[r["mi"]]["content"][r["bi"]]["content"] = SNIP_PLACEHOLDER
 
     def _snip_stale_results_openai(self) -> None:
-        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
+        utilization = self.state.last_input_token_count / self.effective_window if self.effective_window else 0
         if utilization < SNIP_THRESHOLD:
             return
         tool_msgs = []
-        for i, msg in enumerate(self._openai_messages):
+        for i, msg in enumerate(self.history.openai_messages):
             if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and msg["content"] != SNIP_PLACEHOLDER:
                 tool_msgs.append(i)
         if len(tool_msgs) <= KEEP_RECENT_RESULTS:
             return
         snip_count = len(tool_msgs) - KEEP_RECENT_RESULTS
         for i in range(snip_count):
-            self._openai_messages[tool_msgs[i]]["content"] = SNIP_PLACEHOLDER
+            self.history.openai_messages[tool_msgs[i]]["content"] = SNIP_PLACEHOLDER
 
     # Tier 3: Microcompact
     def _microcompact_anthropic(self) -> None:
-        if not self.last_api_call_time or (time.time() - self.last_api_call_time) < MICROCOMPACT_IDLE_S:
+        if not self.state.last_api_call_time or (time.time() - self.state.last_api_call_time) < MICROCOMPACT_IDLE_S:
             return
         all_results = []
-        for mi, msg in enumerate(self._anthropic_messages):
+        for mi, msg in enumerate(self.history.anthropic_messages):
             if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
                 continue
             for bi, block in enumerate(msg["content"]):
@@ -599,21 +794,21 @@ class Agent:
         clear_count = len(all_results) - KEEP_RECENT_RESULTS
         for i in range(max(0, clear_count)):
             mi, bi = all_results[i]
-            self._anthropic_messages[mi]["content"][bi]["content"] = "[Old result cleared]"
+            self.history.anthropic_messages[mi]["content"][bi]["content"] = "[Old result cleared]"
 
     def _microcompact_openai(self) -> None:
-        if not self.last_api_call_time or (time.time() - self.last_api_call_time) < MICROCOMPACT_IDLE_S:
+        if not self.state.last_api_call_time or (time.time() - self.state.last_api_call_time) < MICROCOMPACT_IDLE_S:
             return
         tool_msgs = []
-        for i, msg in enumerate(self._openai_messages):
+        for i, msg in enumerate(self.history.openai_messages):
             if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and msg["content"] not in (SNIP_PLACEHOLDER, "[Old result cleared]"):
                 tool_msgs.append(i)
         clear_count = len(tool_msgs) - KEEP_RECENT_RESULTS
         for i in range(max(0, clear_count)):
-            self._openai_messages[tool_msgs[i]]["content"] = "[Old result cleared]"
+            self.history.openai_messages[tool_msgs[i]]["content"] = "[Old result cleared]"
 
     def _find_tool_use_by_id(self, tool_use_id: str) -> dict | None:
-        for msg in self._anthropic_messages:
+        for msg in self.history.anthropic_messages:
             if msg.get("role") != "assistant" or not isinstance(msg.get("content"), list):
                 continue
             for block in msg["content"]:
@@ -622,13 +817,9 @@ class Agent:
         return None
 
     # ─── Large result persistence ─────────────────────────────────
-    # When a tool result exceeds 30 KB, write it to disk and replace the
-    # context entry with a short preview + file path.  The model can use
-    # read_file to retrieve the full output later — no information is lost.
 
     def _persist_large_result(self, tool_name: str, result: str) -> str:
-        THRESHOLD = 30 * 1024  # 30 KB
-        if len(result.encode()) <= THRESHOLD:
+        if len(result.encode()) <= LARGE_RESULT_THRESHOLD:
             return result
         d = Path.home() / ".mini-claude" / "tool-results"
         d.mkdir(parents=True, exist_ok=True)
@@ -637,14 +828,14 @@ class Agent:
         filepath.write_text(result, encoding="utf-8")
 
         lines = result.split("\n")
-        preview = "\n".join(lines[:200])
+        preview = "\n".join(lines[:LARGE_RESULT_PREVIEW_LINES])
         size_kb = len(result.encode()) / 1024
 
         return (
             f"[Result too large ({size_kb:.1f} KB, {len(lines)} lines). "
             f"Full output saved to {filepath}. "
             f"You can use read_file to see the full result.]\n\n"
-            f"Preview (first 200 lines):\n{preview}"
+            f"Preview (first {LARGE_RESULT_PREVIEW_LINES} lines):\n{preview}"
         )
 
     # ─── Execute tool (handles agent/skill/plan mode internally) ─────
@@ -659,7 +850,7 @@ class Agent:
         # Route MCP tool calls to the MCP manager
         if self._mcp_manager.is_mcp_tool(name):
             return await self._mcp_manager.call_tool(name, inp)
-        return await execute_tool(name, inp, self._read_file_state)
+        return await execute_tool(name, inp, self.state.read_file_state)
 
     # ─── Skill fork mode ─────────────────────────────────────
 
@@ -677,20 +868,21 @@ class Agent:
             )
             print_sub_agent_start("skill-fork", inp.get("skill_name", ""))
             sub_agent = Agent(
-                model=self.model,
+                model=self.config.model,
                 api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
                 custom_system_prompt=result["prompt"],
                 custom_tools=tools,
                 is_sub_agent=True,
-                permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+                permission_mode="plan" if self.config.permission_mode == "plan" else "bypassPermissions",
             )
             try:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
-                self.total_input_tokens += sub_result["tokens"]["input"]
-                self.total_output_tokens += sub_result["tokens"]["output"]
+                self.state.total_input_tokens += sub_result["tokens"]["input"]
+                self.state.total_output_tokens += sub_result["tokens"]["output"]
                 print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
                 return sub_result["text"] or "(Skill produced no output)"
             except Exception as e:
+                logger.error(f"Skill fork error: {e}")
                 print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
                 return f"Skill fork error: {e}"
 
@@ -710,7 +902,7 @@ class Agent:
 
 Plan mode is active. You MUST NOT make any edits (except the plan file below), run non-readonly tools, or make any changes to the system.
 
-## Plan File: {self._plan_file_path}
+## Plan File: {self.state.plan_file_path}
 Write your plan incrementally to this file using write_file or edit_file. This is the ONLY file you are allowed to edit.
 
 ## Workflow
@@ -726,23 +918,27 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
     async def _execute_plan_mode_tool(self, name: str) -> str:
         if name == "enter_plan_mode":
-            if self.permission_mode == "plan":
+            if self.config.permission_mode == "plan":
                 return "Already in plan mode."
-            self._pre_plan_mode = self.permission_mode
-            self.permission_mode = "plan"
-            self._plan_file_path = self._generate_plan_file_path()
+            self.state.pre_plan_mode = self.config.permission_mode
+            self.config.permission_mode = "plan"
+            self.state.plan_file_path = self._generate_plan_file_path()
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
-            if self.use_openai and self._openai_messages:
-                self._openai_messages[0]["content"] = self._system_prompt
-            print_info("Entered plan mode (read-only). Plan file: " + self._plan_file_path)
-            return f"Entered plan mode. You are now in read-only mode.\n\nYour plan file: {self._plan_file_path}\nWrite your plan to this file. This is the only file you can edit.\n\nWhen your plan is complete, call exit_plan_mode."
+            self.history.update_system_prompt(self._system_prompt)
+            print_info("Entered plan mode (read-only). Plan file: " + self.state.plan_file_path)
+            return (
+                f"Entered plan mode. You are now in read-only mode.\n\n"
+                f"Your plan file: {self.state.plan_file_path}\n"
+                f"Write your plan to this file. This is the only file you can edit.\n\n"
+                f"When your plan is complete, call exit_plan_mode."
+            )
 
         if name == "exit_plan_mode":
-            if self.permission_mode != "plan":
+            if self.config.permission_mode != "plan":
                 return "Not in plan mode."
             plan_content = "(No plan file found)"
-            if self._plan_file_path and Path(self._plan_file_path).exists():
-                plan_content = Path(self._plan_file_path).read_text()
+            if self.state.plan_file_path and Path(self.state.plan_file_path).exists():
+                plan_content = Path(self.state.plan_file_path).read_text()
 
             # Interactive approval flow
             if self._plan_approval_fn:
@@ -763,20 +959,19 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 elif choice == "execute":
                     target_mode = "acceptEdits"
                 else:  # manual-execute
-                    target_mode = self._pre_plan_mode or "default"
+                    target_mode = self.state.pre_plan_mode or "default"
 
                 # Exit plan mode
-                self.permission_mode = target_mode
-                self._pre_plan_mode = None
-                saved_plan_path = self._plan_file_path
-                self._plan_file_path = None
+                self.config.permission_mode = target_mode
+                self.state.pre_plan_mode = None
+                saved_plan_path = self.state.plan_file_path
+                self.state.plan_file_path = None
                 self._system_prompt = self._base_system_prompt
-                if self.use_openai and self._openai_messages:
-                    self._openai_messages[0]["content"] = self._system_prompt
+                self.history.update_system_prompt(self._system_prompt)
 
                 if choice == "clear-and-execute":
-                    self._clear_history_keep_system()
-                    self._context_cleared = True
+                    self.history.clear(keep_system=True)
+                    self.state.context_cleared = True
                     print_info(f"Plan approved. Context cleared, executing in {target_mode} mode.")
                     return (
                         f"User approved the plan. Context was cleared. Permission mode: {target_mode}\n\n"
@@ -793,24 +988,15 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 )
 
             # Fallback: no approval function (e.g. sub-agents)
-            self.permission_mode = self._pre_plan_mode or "default"
-            self._pre_plan_mode = None
-            self._plan_file_path = None
+            self.config.permission_mode = self.state.pre_plan_mode or "default"
+            self.state.pre_plan_mode = None
+            self.state.plan_file_path = None
             self._system_prompt = self._base_system_prompt
-            if self.use_openai and self._openai_messages:
-                self._openai_messages[0]["content"] = self._system_prompt
-            print_info("Exited plan mode. Restored to " + self.permission_mode + " mode.")
-            return f"Exited plan mode. Permission mode restored to: {self.permission_mode}\n\n## Your Plan:\n{plan_content}"
+            self.history.update_system_prompt(self._system_prompt)
+            print_info("Exited plan mode. Restored to " + self.config.permission_mode + " mode.")
+            return f"Exited plan mode. Permission mode restored to: {self.config.permission_mode}\n\n## Your Plan:\n{plan_content}"
 
         return f"Unknown plan mode tool: {name}"
-
-    def _clear_history_keep_system(self) -> None:
-        """Clear history but keep system prompt (used for clear-context plan approval)."""
-        self._anthropic_messages = []
-        self._openai_messages = []
-        if self.use_openai:
-            self._openai_messages.append({"role": "system", "content": self._system_prompt})
-        self.last_input_token_count = 0
 
     async def _execute_agent_tool(self, inp: dict) -> str:
         agent_type = inp.get("type", "general")
@@ -821,162 +1007,134 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
         config = get_sub_agent_config(agent_type)
         sub_agent = Agent(
-            model=self.model,
+            model=self.config.model,
             api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
             custom_system_prompt=config["system_prompt"],
             custom_tools=config["tools"],
             is_sub_agent=True,
-            permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+            permission_mode="plan" if self.config.permission_mode == "plan" else "bypassPermissions",
         )
 
         try:
             result = await sub_agent.run_once(prompt)
-            self.total_input_tokens += result["tokens"]["input"]
-            self.total_output_tokens += result["tokens"]["output"]
+            self.state.total_input_tokens += result["tokens"]["input"]
+            self.state.total_output_tokens += result["tokens"]["output"]
             print_sub_agent_end(agent_type, description)
             return result["text"] or "(Sub-agent produced no output)"
         except Exception as e:
+            logger.error(f"Sub-agent error: {e}")
             print_sub_agent_end(agent_type, description)
             return f"Sub-agent error: {e}"
 
     # ─── Anthropic backend ───────────────────────────────────────
 
     async def _chat_anthropic(self, user_message: str) -> None:
-        self._anthropic_messages.append({"role": "user", "content": user_message})
-        # Auto-compact at turn boundary only — the last message is now plain
-        # user text, so the slice in _compact_anthropic won't sever a
-        # tool_use ↔ tool_result pair from the previous turn's tool execution.
+        self.history.append_user_message(user_message)
         await self._check_and_compact()
 
-        # Start async memory prefetch (non-blocking, fires once per user turn)
-        memory_prefetch: MemoryPrefetch | None = None
-        if not self.is_sub_agent:
-            sq = self._build_side_query()
-            if sq:
-                memory_prefetch = start_memory_prefetch(
-                    user_message, sq,
-                    self._already_surfaced_memories, self._session_memory_bytes,
-                )
+        # Start async memory prefetch
+        memory_prefetch = self._start_memory_prefetch(user_message)
 
         while True:
-            if self._aborted:
+            if self.state.aborted:
                 break
 
             self._run_compression_pipeline()
+            self._consume_memory_prefetch(memory_prefetch)
 
-            # Consume memory prefetch if settled (non-blocking poll, zero-wait).
-            # Append to last user message to maintain user/assistant alternation.
-            if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
-                memory_prefetch.consumed = True
-                try:
-                    memories = memory_prefetch.task.result()
-                    if memories:
-                        injection_text = format_memories_for_injection(memories)
-                        last = self._anthropic_messages[-1] if self._anthropic_messages else None
-                        if last and last.get("role") == "user":
-                            content = last.get("content", "")
-                            if isinstance(content, str):
-                                last["content"] = content + "\n\n" + injection_text
-                            elif isinstance(content, list):
-                                content.append({"type": "text", "text": injection_text})
-                        else:
-                            self._anthropic_messages.append({"role": "user", "content": injection_text})
-                        for m in memories:
-                            self._already_surfaced_memories.add(m.path)
-                            self._session_memory_bytes += len(m.content.encode())
-                except Exception:
-                    pass  # prefetch errors already logged
-
-            if not self.is_sub_agent:
+            if not self.config.is_sub_agent:
                 start_spinner()
 
-            # ── Streaming tool execution ──────────────────────────────
-            # As each tool_use content block completes during streaming, check
-            # if it's concurrency-safe and auto-allowed. If so, start execution
-            # immediately — the tool runs while the model still generates.
+            # Streaming tool execution
             early_executions: dict[str, asyncio.Task] = {}
 
             def _on_tool_block(block: dict):
                 if block["name"] in CONCURRENCY_SAFE_TOOLS:
-                    perm = check_permission(block["name"], block["input"], self.permission_mode, self._plan_file_path)
+                    perm = check_permission(block["name"], block["input"], self.config.permission_mode, self.state.plan_file_path)
                     if perm["action"] == "allow":
                         task = asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
                         early_executions[block["id"]] = task
 
             response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
 
-            if not self.is_sub_agent:
+            if not self.config.is_sub_agent:
                 stop_spinner()
 
-            self.last_api_call_time = time.time()
-            self.total_input_tokens += response.usage.input_tokens
-            self.total_output_tokens += response.usage.output_tokens
-            self.last_input_token_count = response.usage.input_tokens
+            self.state.last_api_call_time = time.time()
+            self.state.total_input_tokens += response.usage.input_tokens
+            self.state.total_output_tokens += response.usage.output_tokens
+            self.state.last_input_token_count = response.usage.input_tokens
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
 
-            self._anthropic_messages.append({
-                "role": "assistant",
-                "content": [self._block_to_dict(b) for b in response.content],
-            })
+            self.history.append_assistant_message(
+                [self._block_to_dict(b) for b in response.content]
+            )
 
             if not tool_uses:
-                if not self.is_sub_agent:
-                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                if not self.config.is_sub_agent:
+                    print_cost(self.state.total_input_tokens, self.state.total_output_tokens)
                 break
 
-            self.current_turns += 1
+            self.state.current_turns += 1
             budget = self._check_budget()
             if budget["exceeded"]:
                 print_info(f"Budget exceeded: {budget['reason']}")
                 break
 
-            # Process tools: early-started ones (from streaming) just await
-            # their result; others go through permission check + execution.
-            tool_results: list[dict] = []
-            context_break = False
-            for tu in tool_uses:
-                if context_break or self._aborted:
-                    break
-                inp = dict(tu.input) if hasattr(tu.input, 'items') else tu.input
-                print_tool_call(tu.name, inp)
-
-                # Was this tool already started during streaming?
-                early_task = early_executions.get(tu.id)
-                if early_task:
-                    raw = await early_task
-                    res = self._persist_large_result(tu.name, raw)
-                    print_tool_result(tu.name, res)
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
-                    continue
-
-                # Permission check for tools not started early
-                perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
-                if perm["action"] == "deny":
-                    print_info(f"Denied: {perm.get('message', '')}")
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": f"Action denied: {perm.get('message', '')}"})
-                    continue
-                if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
-                    confirmed = await self._confirm_dangerous(perm["message"])
-                    if not confirmed:
-                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": "User denied this action."})
-                        continue
-                    self._confirmed_paths.add(perm["message"])
-
-                raw = await self._execute_tool_call(tu.name, inp)
-                res = self._persist_large_result(tu.name, raw)
-                print_tool_result(tu.name, res)
-
-                if self._context_cleared:
-                    self._context_cleared = False
-                    self._anthropic_messages.append({"role": "user", "content": res})
-                    context_break = True
-                    break
-                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
+            # Process tools
+            tool_results, context_break = await self._process_anthropic_tools(
+                tool_uses, early_executions
+            )
 
             if not context_break and tool_results:
-                self._anthropic_messages.append({"role": "user", "content": tool_results})
-            self._context_cleared = False
+                self.history.append_tool_results(tool_results)
+            self.state.context_cleared = False
+
+    async def _process_anthropic_tools(
+        self, tool_uses: list, early_executions: dict[str, asyncio.Task]
+    ) -> tuple[list[dict], bool]:
+        """Process Anthropic tool calls, returning (results, context_break)."""
+        tool_results: list[dict] = []
+        for tu in tool_uses:
+            if self.state.context_cleared or self.state.aborted:
+                break
+            inp = dict(tu.input) if hasattr(tu.input, 'items') else tu.input
+            print_tool_call(tu.name, inp)
+
+            # Was this tool already started during streaming?
+            early_task = early_executions.get(tu.id)
+            if early_task:
+                raw = await early_task
+                res = self._persist_large_result(tu.name, raw)
+                print_tool_result(tu.name, res)
+                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
+                continue
+
+            # Permission check
+            perm = check_permission(tu.name, inp, self.config.permission_mode, self.state.plan_file_path)
+            if perm["action"] == "deny":
+                print_info(f"Denied: {perm.get('message', '')}")
+                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": f"Action denied: {perm.get('message', '')}"})
+                continue
+            if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self.state.confirmed_paths:
+                confirmed = await self._confirm_dangerous(perm["message"])
+                if not confirmed:
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": "User denied this action."})
+                    continue
+                self.state.confirmed_paths.add(perm["message"])
+
+            raw = await self._execute_tool_call(tu.name, inp)
+            res = self._persist_large_result(tu.name, raw)
+            print_tool_result(tu.name, res)
+
+            if self.state.context_cleared:
+                self.state.context_cleared = False
+                self.history.append_user_message(res)
+                return tool_results, True
+            tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
+
+        return tool_results, False
 
     @staticmethod
     def _block_to_dict(block) -> dict:
@@ -985,29 +1143,24 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             return {"type": "text", "text": block.text}
         if block.type == "tool_use":
             return {"type": "tool_use", "id": block.id, "name": block.name, "input": dict(block.input) if hasattr(block.input, 'items') else block.input}
-        # Fallback
         return {"type": block.type}
 
-    async def _call_anthropic_stream(self, on_tool_block_complete=None):
-        """Stream an Anthropic API call. When a tool_use content block finishes
-        during streaming, on_tool_block_complete fires immediately so the caller
-        can start execution before the full response arrives (streaming tool
-        execution -- mirrors Claude Code's content_block_stop approach)."""
+    async def _call_anthropic_stream(self, on_tool_block_complete=None) -> Any:
+        """Stream an Anthropic API call with streaming tool execution support."""
         async def _do():
-            max_output = _get_max_output_tokens(self.model)
+            max_output = _get_max_output_tokens(self.config.model)
             create_params: dict[str, Any] = {
-                "model": self.model,
-                "max_tokens": max_output if self._thinking_mode != "disabled" else 16384,
+                "model": self.config.model,
+                "max_tokens": max_output if self.state.thinking_mode != "disabled" else 16384,
                 "system": self._system_prompt,
                 "tools": get_active_tool_definitions(self.tools),
-                "messages": self._anthropic_messages,
+                "messages": self.history.anthropic_messages,
             }
 
-            if self._thinking_mode in ("adaptive", "enabled"):
+            if self.state.thinking_mode in ("adaptive", "enabled"):
                 create_params["thinking"] = {"type": "enabled", "budget_tokens": max_output - 1}
 
             first_text = True
-            # Track in-flight tool_use blocks by index for streaming execution
             tool_blocks_by_index: dict[int, dict] = {}
 
             async with self._anthropic_client.messages.stream(**create_params) as stream:
@@ -1044,9 +1197,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     elif event.type == "content_block_stop":
                         tb = tool_blocks_by_index.pop(event.index, None)
                         if tb and on_tool_block_complete:
-                            import json as _json
                             try:
-                                parsed = _json.loads(tb["input_json"] or "{}")
+                                parsed = json.loads(tb["input_json"] or "{}")
                             except Exception:
                                 parsed = {}
                             on_tool_block_complete({
@@ -1065,154 +1217,133 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     # ─── OpenAI-compatible backend ───────────────────────────────
 
     async def _chat_openai(self, user_message: str) -> None:
-        self._openai_messages.append({"role": "user", "content": user_message})
-        # Auto-compact at turn boundary only — see _chat_anthropic for rationale.
-        # The last message is now plain user text, so the slice in
-        # _compact_openai won't orphan a tool_calls / tool message pair.
+        self.history.append_user_message(user_message)
         await self._check_and_compact()
 
-        # Start async memory prefetch (non-blocking, fires once per user turn)
-        memory_prefetch: MemoryPrefetch | None = None
-        if not self.is_sub_agent:
-            sq = self._build_side_query()
-            if sq:
-                memory_prefetch = start_memory_prefetch(
-                    user_message, sq,
-                    self._already_surfaced_memories, self._session_memory_bytes,
-                )
+        # Start async memory prefetch
+        memory_prefetch = self._start_memory_prefetch(user_message)
 
         while True:
-            if self._aborted:
+            if self.state.aborted:
                 break
 
             self._run_compression_pipeline()
+            self._consume_memory_prefetch(memory_prefetch)
 
-            # Consume memory prefetch if settled (non-blocking poll, zero-wait)
-            if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
-                memory_prefetch.consumed = True
-                try:
-                    memories = memory_prefetch.task.result()
-                    if memories:
-                        injection_text = format_memories_for_injection(memories)
-                        last = self._openai_messages[-1] if self._openai_messages else None
-                        if last and last.get("role") == "user":
-                            last["content"] = (last.get("content") or "") + "\n\n" + injection_text
-                        else:
-                            self._openai_messages.append({"role": "user", "content": injection_text})
-                        for m in memories:
-                            self._already_surfaced_memories.add(m.path)
-                            self._session_memory_bytes += len(m.content.encode())
-                except Exception:
-                    pass  # prefetch errors already logged
-
-            if not self.is_sub_agent:
+            if not self.config.is_sub_agent:
                 start_spinner()
 
             response = await self._call_openai_stream()
 
-            if not self.is_sub_agent:
+            if not self.config.is_sub_agent:
                 stop_spinner()
 
-            self.last_api_call_time = time.time()
+            self.state.last_api_call_time = time.time()
 
             if response.get("usage"):
-                self.total_input_tokens += response["usage"]["prompt_tokens"]
-                self.total_output_tokens += response["usage"]["completion_tokens"]
-                self.last_input_token_count = response["usage"]["prompt_tokens"]
+                self.state.total_input_tokens += response["usage"]["prompt_tokens"]
+                self.state.total_output_tokens += response["usage"]["completion_tokens"]
+                self.state.last_input_token_count = response["usage"]["prompt_tokens"]
 
             choice = response.get("choices", [{}])[0] if response.get("choices") else {}
             message = choice.get("message", {})
 
-            self._openai_messages.append(message)
+            self.history.append_assistant_message(message)
 
             tool_calls = message.get("tool_calls")
             if not tool_calls:
-                if not self.is_sub_agent:
-                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                if not self.config.is_sub_agent:
+                    print_cost(self.state.total_input_tokens, self.state.total_output_tokens)
                 break
 
-            self.current_turns += 1
+            self.state.current_turns += 1
             budget = self._check_budget()
             if budget["exceeded"]:
                 print_info(f"Budget exceeded: {budget['reason']}")
                 break
 
-            # Phase 1: Parse & permission-check (serial)
-            oai_checked: list[dict] = []
-            for tc in tool_calls:
-                if self._aborted:
-                    break
-                if tc.get("type") != "function":
-                    continue
-                fn_name = tc["function"]["name"]
-                try:
-                    inp = json.loads(tc["function"]["arguments"])
-                except Exception:
-                    inp = {}
+            # Process tools
+            context_break = await self._process_openai_tools(tool_calls)
+            if context_break:
+                break
 
-                print_tool_call(fn_name, inp)
+    async def _process_openai_tools(self, tool_calls: list[dict]) -> bool:
+        """Process OpenAI tool calls. Returns True if context was cleared."""
+        # Phase 1: Parse & permission-check (serial)
+        oai_checked: list[dict] = []
+        for tc in tool_calls:
+            if self.state.aborted:
+                break
+            if tc.get("type") != "function":
+                continue
+            fn_name = tc["function"]["name"]
+            try:
+                inp = json.loads(tc["function"]["arguments"])
+            except Exception:
+                inp = {}
 
-                perm = check_permission(fn_name, inp, self.permission_mode, self._plan_file_path)
-                if perm["action"] == "deny":
-                    print_info(f"Denied: {perm.get('message', '')}")
-                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": f"Action denied: {perm.get('message', '')}"})
+            print_tool_call(fn_name, inp)
+
+            perm = check_permission(fn_name, inp, self.config.permission_mode, self.state.plan_file_path)
+            if perm["action"] == "deny":
+                print_info(f"Denied: {perm.get('message', '')}")
+                oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": f"Action denied: {perm.get('message', '')}"})
+                continue
+            if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self.state.confirmed_paths:
+                confirmed = await self._confirm_dangerous(perm["message"])
+                if not confirmed:
+                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": "User denied this action."})
                     continue
-                if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
-                    confirmed = await self._confirm_dangerous(perm["message"])
-                    if not confirmed:
-                        oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": "User denied this action."})
+                self.state.confirmed_paths.add(perm["message"])
+            oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
+
+        # Phase 2: Group & execute (parallel for consecutive safe tools)
+        oai_batches: list[dict] = []
+        for ct in oai_checked:
+            safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
+            if safe and oai_batches and oai_batches[-1]["concurrent"]:
+                oai_batches[-1]["items"].append(ct)
+            else:
+                oai_batches.append({"concurrent": safe, "items": [ct]})
+
+        for batch in oai_batches:
+            if self.state.context_cleared or self.state.aborted:
+                break
+
+            if batch["concurrent"]:
+                async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
+                    raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
+                    res = self._persist_large_result(ct_item["fn"], raw)
+                    print_tool_result(ct_item["fn"], res)
+                    return ct_item, res
+
+                results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
+                for ct_item, res in results:
+                    self.history.append_openai_tool_message(ct_item["tc"]["id"], res)
+            else:
+                for ct in batch["items"]:
+                    if not ct["allowed"]:
+                        self.history.append_openai_tool_message(ct["tc"]["id"], ct["result"])
                         continue
-                    self._confirmed_paths.add(perm["message"])
-                oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
+                    raw = await self._execute_tool_call(ct["fn"], ct["inp"])
+                    res = self._persist_large_result(ct["fn"], raw)
+                    print_tool_result(ct["fn"], res)
 
-            # Phase 2: Group & execute (parallel for consecutive safe tools)
-            oai_batches: list[dict] = []
-            for ct in oai_checked:
-                safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
-                if safe and oai_batches and oai_batches[-1]["concurrent"]:
-                    oai_batches[-1]["items"].append(ct)
-                else:
-                    oai_batches.append({"concurrent": safe, "items": [ct]})
+                    if self.state.context_cleared:
+                        self.state.context_cleared = False
+                        self.history.append_user_message(res)
+                        return True
+                    self.history.append_openai_tool_message(ct["tc"]["id"], res)
 
-            oai_context_break = False
-            for batch in oai_batches:
-                if oai_context_break or self._aborted:
-                    break
+        self.state.context_cleared = False
+        return False
 
-                if batch["concurrent"]:
-                    async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
-                        raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
-                        res = self._persist_large_result(ct_item["fn"], raw)
-                        print_tool_result(ct_item["fn"], res)
-                        return ct_item, res
-
-                    results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
-                    for ct_item, res in results:
-                        self._openai_messages.append({"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
-                else:
-                    for ct in batch["items"]:
-                        if not ct["allowed"]:
-                            self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
-                            continue
-                        raw = await self._execute_tool_call(ct["fn"], ct["inp"])
-                        res = self._persist_large_result(ct["fn"], raw)
-                        print_tool_result(ct["fn"], res)
-
-                        if self._context_cleared:
-                            self._context_cleared = False
-                            self._openai_messages.append({"role": "user", "content": res})
-                            oai_context_break = True
-                            break
-                        self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
-
-            self._context_cleared = False
-
-    async def _call_openai_stream(self) -> dict:
+    async def _call_openai_stream(self) -> Any:
         async def _do():
             stream = await self._openai_client.chat.completions.create(
-                model=self.model,
-                tools=_to_openai_tools(get_active_tool_definitions(self.tools)),
-                messages=self._openai_messages,
+                model=self.config.model,
+                tools=_to_openai_tools(get_active_tool_definitions(self.tools)),  # type: ignore[arg-type]
+                messages=self.history.openai_messages,  # type: ignore[arg-type]
                 stream=True,
                 stream_options={"include_usage": True},
             )
@@ -1279,13 +1410,40 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
         return await _with_retry(_do)
 
-    # ─── Shared ──────────────────────────────────────────────────
+    # ─── Shared helpers ──────────────────────────────────────────
+
+    def _start_memory_prefetch(self, user_message: str) -> MemoryPrefetch | None:
+        """Start async memory prefetch if applicable."""
+        if self.config.is_sub_agent:
+            return None
+        sq = self._build_side_query()
+        if sq:
+            return start_memory_prefetch(
+                user_message, sq,
+                self.state.already_surfaced_memories, self.state.session_memory_bytes,
+            )
+        return None
+
+    def _consume_memory_prefetch(self, prefetch: MemoryPrefetch | None) -> None:
+        """Consume memory prefetch results if settled."""
+        if not prefetch or not prefetch.settled or prefetch.consumed:
+            return
+        prefetch.consumed = True
+        try:
+            memories = prefetch.task.result()
+            if memories:
+                injection_text = format_memories_for_injection(memories)
+                self.history.update_last_user_content(injection_text)
+                for m in memories:
+                    self.state.already_surfaced_memories.add(m.path)
+                    self.state.session_memory_bytes += len(m.content.encode())
+        except Exception as e:
+            logger.debug(f"Memory prefetch failed: {e}")
 
     async def _confirm_dangerous(self, command: str) -> bool:
         print_confirmation(command)
         if self.confirm_fn:
             return await self.confirm_fn(command)
-        # Fallback: blocking input
         try:
             answer = input("  Allow? (y/n): ")
             return answer.lower().startswith("y")

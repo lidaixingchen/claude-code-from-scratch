@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 SESSION_DIR = Path.home() / ".mini-claude" / "sessions"
 
@@ -24,7 +27,11 @@ def load_session(session_id: str) -> dict[str, Any] | None:
         return None
     try:
         return json.loads(path.read_text())
-    except Exception:
+    except json.JSONDecodeError as e:
+        logger.warning(f"Corrupted session file {path}: {e}")
+        return None
+    except OSError as e:
+        logger.warning(f"Failed to read session file {path}: {e}")
         return None
 
 
@@ -36,8 +43,10 @@ def list_sessions() -> list[dict[str, Any]]:
             data = json.loads(f.read_text())
             if "metadata" in data:
                 results.append(data["metadata"])
-        except Exception:
-            pass
+        except json.JSONDecodeError as e:
+            logger.debug(f"Skipping corrupted session file {f}: {e}")
+        except OSError as e:
+            logger.debug(f"Skipping unreadable session file {f}: {e}")
     return results
 
 

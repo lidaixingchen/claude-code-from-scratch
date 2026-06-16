@@ -6,24 +6,37 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Literal
 
 from .memory import get_memory_dir
 from .frontmatter import parse_frontmatter
 
+# ─── Logger ─────────────────────────────────────────────────
+
+logger = logging.getLogger(__name__)
+
 # ─── Permission modes ──────────────────────────────────────
 
-PermissionMode = str  # "default" | "plan" | "acceptEdits" | "bypassPermissions" | "dontAsk"
+PermissionMode = Literal["default", "plan", "acceptEdits", "bypassPermissions", "dontAsk"]
 
 READ_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
 EDIT_TOOLS = {"write_file", "edit_file"}
 
 # Concurrency-safe tools can run in parallel (read-only, no side effects)
 CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
+
+# ─── Result size limits ────────────────────────────────────
+
+MAX_RESULT_CHARS = 50000
+MAX_LIST_FILES = 200
+MAX_GREP_MATCHES = 100
+MAX_GREP_TOTAL = 200
 
 IS_WIN = sys.platform == "win32"
 
@@ -210,11 +223,15 @@ def _read_file(inp: dict) -> str:
 
 
 def _write_file(inp: dict) -> str:
+    """Write content to a file. Returns a preview of the written content.
+
+    Note: This function does NOT auto-update the memory index.
+    Callers must explicitly invoke `_auto_update_memory_index` if needed.
+    """
     try:
         path = Path(inp["file_path"])
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(inp["content"])
-        _auto_update_memory_index(str(path))
         lines = inp["content"].split("\n")
         line_count = len(lines)
         preview = "\n".join(f"{i+1:4d} | {l}" for i, l in enumerate(lines[:30]))
@@ -243,11 +260,11 @@ def _auto_update_memory_index(file_path: str) -> None:
                         t = type_match.group(1).strip()
                         d = desc_match.group(1).strip() if desc_match else ""
                         lines.append(f"- **[{n}]({f.name})** ({t}) — {d}")
-                except Exception:
-                    pass
+                except (OSError, ValueError) as e:
+                    logger.debug(f"Skipping memory file {f}: {e}")
             (mem_path / "MEMORY.md").write_text("\n".join(lines))
-    except Exception:
-        pass
+    except OSError as e:
+        logger.debug(f"Failed to update memory index: {e}")
 
 
 # ─── Edit helpers: quote normalization + diff ───────────────
@@ -319,13 +336,13 @@ def _list_files(inp: dict) -> str:
                 if "node_modules" in rel or ".git" in rel.split(os.sep):
                     continue
                 files.append(rel)
-                if len(files) >= 200:
+                if len(files) >= MAX_LIST_FILES:
                     break
         if not files:
             return "No files found matching the pattern."
-        result = "\n".join(files[:200])
-        if len(files) > 200:
-            result += f"\n... and {len(files) - 200} more"
+        result = "\n".join(files[:MAX_LIST_FILES])
+        if len(files) > MAX_LIST_FILES:
+            result += f"\n... and {len(files) - MAX_LIST_FILES} more"
         return result
     except Exception as e:
         return f"Error listing files: {e}"
@@ -350,9 +367,9 @@ def _grep_search(inp: dict) -> str:
                 return "No matches found."
             if result.returncode == 0:
                 lines = [l for l in result.stdout.split("\n") if l]
-                output = "\n".join(lines[:100])
-                if len(lines) > 100:
-                    output += f"\n... and {len(lines) - 100} more matches"
+                output = "\n".join(lines[:MAX_GREP_MATCHES])
+                if len(lines) > MAX_GREP_MATCHES:
+                    output += f"\n... and {len(lines) - MAX_GREP_MATCHES} more matches"
                 return output
             # Non-zero exit (not 1) — fall through to Python fallback
         except Exception:
@@ -368,7 +385,7 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
     matches: list[str] = []
 
     def walk(d: str) -> None:
-        if len(matches) >= 200:
+        if len(matches) >= MAX_GREP_TOTAL:
             return
         try:
             entries = os.listdir(d)
@@ -388,7 +405,7 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
                 for i, line in enumerate(text.split("\n")):
                     if regex.search(line):
                         matches.append(f"{full}:{i+1}:{line}")
-                        if len(matches) >= 200:
+                        if len(matches) >= MAX_GREP_TOTAL:
                             return
             except Exception:
                 pass
@@ -396,9 +413,9 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
     walk(directory)
     if not matches:
         return "No matches found."
-    output = "\n".join(matches[:100])
-    if len(matches) > 100:
-        output += f"\n... and {len(matches) - 100} more matches"
+    output = "\n".join(matches[:MAX_GREP_MATCHES])
+    if len(matches) > MAX_GREP_MATCHES:
+        output += f"\n... and {len(matches) - MAX_GREP_MATCHES} more matches"
     return output
 
 
@@ -619,8 +636,6 @@ def check_permission(
 
 # ─── Truncate long tool results ─────────────────────────────
 
-MAX_RESULT_CHARS = 50000
-
 
 def _truncate_result(result: str) -> str:
     if len(result) <= MAX_RESULT_CHARS:
@@ -698,6 +713,11 @@ async def execute_tool(
             read_file_state[abs_path] = os.path.getmtime(abs_path)
         except OSError:
             pass
+
+    # Explicitly update memory index when writing to memory directory
+    # This makes the side effect visible rather than hidden inside _write_file
+    if name == "write_file" and not result.startswith("Error"):
+        _auto_update_memory_index(inp["file_path"])
 
     return result
 

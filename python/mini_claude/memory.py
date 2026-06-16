@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import time
 from datetime import datetime, timezone
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from .frontmatter import parse_frontmatter, format_frontmatter
+
+logger = logging.getLogger(__name__)
 
 # A callable that sends a prompt and returns model text response.
 # Signature: async (system: str, user_message: str) -> str
@@ -85,8 +88,8 @@ def list_memories() -> list[MemoryEntry]:
                 filename=f.name,
                 content=result.body,
             ))
-        except Exception:
-            pass
+        except (OSError, ValueError) as e:
+            logger.debug(f"Skipping memory file {f}: {e}")
     # Sort by mtime desc
     entries.sort(key=lambda e: (d / e.filename).stat().st_mtime, reverse=True)
     return entries
@@ -174,8 +177,8 @@ def scan_memory_headers() -> list[MemoryHeader]:
                 description=meta.get("description"),
                 type=t if t in VALID_TYPES else None,
             ))
-        except Exception:
-            pass
+        except (OSError, ValueError) as e:
+            logger.debug(f"Skipping memory file {f}: {e}")
     headers.sort(key=lambda h: h.mtime_ms, reverse=True)
     return headers[:MAX_MEMORY_FILES]
 
@@ -266,7 +269,11 @@ async def select_relevant_memories(
 
         result: list[RelevantMemory] = []
         for h in selected:
-            content = Path(h.file_path).read_text()
+            try:
+                content = Path(h.file_path).read_text()
+            except OSError as e:
+                logger.debug(f"Failed to read memory file {h.file_path}: {e}")
+                continue
             if len(content.encode()) > MAX_MEMORY_BYTES_PER_FILE:
                 content = content[:MAX_MEMORY_BYTES_PER_FILE] + "\n\n[... truncated, memory file too large ...]"
             freshness = memory_freshness_warning(h.mtime_ms)
@@ -279,10 +286,10 @@ async def select_relevant_memories(
                 mtime_ms=h.mtime_ms, header=header_text,
             ))
         return result
-    except Exception as e:
-        if "cancel" in str(e).lower():
-            return []
-        print(f"[memory] semantic recall failed: {e}")
+    except asyncio.CancelledError:
+        return []
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Semantic recall failed: {e}")
         return []
 
 

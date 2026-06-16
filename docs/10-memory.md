@@ -1,182 +1,193 @@
-# 8. 记忆系统
+# 第 10 课：项目级记忆系统
 
-## 本章目标
+## 🎯 本节目标
 
-实现跨会话记忆：让 Agent 在多次对话间保持对用户和项目的认知，不依赖对话历史。
-
-```mermaid
-graph TB
-    Save[保存记忆<br/>write_file → .md] --> Index[MEMORY.md 索引]
-    Index --> Inject[注入 system prompt]
-    Query[用户提问] --> Prefetch[异步预取<br/>startMemoryPrefetch]
-    Prefetch --> SideQuery[sideQuery<br/>语义选择相关记忆]
-    SideQuery --> Recall[注入为 user message]
-
-    style SideQuery fill:#7c5cfc,color:#fff
-    style Inject fill:#e8e0ff
-```
+为 Agent 构建跨会话的记忆机制（Persistence Memory）。使用散列哈希对项目目录进行空间隔离，实现轻量级 Frontmatter 结构解析和 `MEMORY.md` 索引文件的自动重建，并通过 System Prompt 注入指引，使 Agent 能够自主读写记忆目录实现记忆的自我进化。
 
 ---
 
-## Claude Code 怎么做的
+## 🏆 最终效果
 
-Claude Code 记忆系统的核心约束只有一条：**只记忆不可从当前项目状态推导的信息**。代码模式、架构、文件路径、git 历史、正在进行的调试——这些读代码和 `git log` 就能获得，记忆中的版本只会制造漂移。连用户明确要求保存的信息也不例外——如果用户说"记住这个 PR 列表"，Agent 应该追问：列表中有什么是不可推导的？某个截止日期？某个意外发现？
-
-记忆分四种类型：
-
-| 类型 | 记什么 | 触发时机 |
-|------|--------|---------|
-| **user** | 用户身份、偏好、知识背景 | 了解到用户角色/偏好时 |
-| **feedback** | 对 Agent 行为的纠正**和肯定** | 用户纠正或肯定某个行为时 |
-| **project** | 项目进展、决策、截止日期 | 了解到项目动态时 |
-| **reference** | 外部系统的定位信息 | 了解到外部系统位置时 |
-
-封闭分类法而非自由标签——防止标签膨胀导致召回时的模糊匹配。
-
-`feedback` 类型有个细节：不只记录纠正，也记录用户的肯定。原因很实际：只记录"错误"会让模型避免重蹈覆辙，但也可能无意间放弃用户已经验证过的好做法。这两种类型还要求正文包含 `Why` 和 `How to apply`——因为知道"为什么"才能判断边界情况，盲目执行规则往往适得其反。
-
-`project` 类型有个具体要求：相对日期必须转为绝对日期。"周四之后合并冻结"→"2026-03-05 后合并冻结"。记忆可能在几周后被读取，"周四"到时已毫无意义。
-
-**MEMORY.md 是索引不是容器。** 它每次会话都完整加载到 system prompt，所以必须紧凑——每条一行链接，实际内容按需读取。设有 200 行/25KB 双重截断，超出时追加提示"keep index entries to one line under ~200 chars"。错误消息包含修复指引，这是贯穿整个系统的设计习惯。
-
-**召回机制**用 `sideQuery` 调模型做语义匹配，而非关键词搜索。用户问"部署流程"时，语义匹配能找到标题为"CI/CD 注意事项"的记忆，关键词匹配则不行。召回在模型开始生成响应的同时异步执行（`pendingMemoryPrefetch`），对用户而言延迟近乎为零。每次最多返回 5 条，上下文成本可控。
-
-每条记忆还附带 **freshness warning**——超过 1 天的记忆会标注过期天数，提醒模型记忆是时间切片而非实时状态。"下周截止"的记忆在两周后读到时，模型需要知道它可能已经过时。
+完成本节后，Agent 会“认得”你是谁，并且能够跨会话记住项目的一些核心信息：
+1. **记忆自我沉淀**：当你向 Agent 提到你的偏好（如：“不要在回复末尾做多余的总结”）时，Agent 会自主决定调用 `write_file`，在后台创建一个名为 `feedback_xxx.md` 的记忆文件。
+2. **跨会话感知**：你关闭 Agent 后再次启动，向其发起另一个新任务，Agent 的系统提示词中会自动带入更新后的 `MEMORY.md` 索引。模型读取到先前的记忆，便会在新的回复中自动遵守“不要总结”的习惯。
 
 ---
 
-## 我们的实现
+## 🛠️ 本节任务
 
-### 存储结构
+1. **实现项目哈希物理隔离**：在 `memory.py` 中编写 `_project_hash()` 和 `get_memory_dir()`，使每个项目目录都映射到独立的存储路径。
+2. **编写 YAML Frontmatter 解析器**：实现 `parse_frontmatter` 提取记忆文件中的元数据及正文。
+3. **实现索引文件自动重建**：实现 `_update_memory_index` 逻辑，在新增记忆时重新生成 `MEMORY.md` 索引。
+4. **编译记忆提示词段并织入 Prompt**：实现 `build_memory_prompt_section()`，并在 `prompt.py` 中连通替换 `{{memory}}` 占位符。
 
-```
-~/.mini-claude/projects/{sha256-hash}/memory/
-├── MEMORY.md                          # 索引文件
-├── user_prefers_concise_output.md
-├── feedback_no_summary_at_end.md
-├── project_auth_migration_q2.md
-└── reference_ci_dashboard_url.md
-```
-
-路径中的哈希是 `process.cwd()` 的 sha256 前 16 位——同一项目目录始终映射到同一记忆空间。
-
-### 记忆文件格式
-
-```markdown
 ---
-name: 不要在回复末尾总结
-description: 用户明确要求省略总结段落
-type: feedback
+
+## 📦 涉及文件
+
+修改：
+- `python/mini_claude/memory.py`
+- `python/mini_claude/prompt.py`
+
 ---
-用户说"不要在响应末尾总结"，因为他们能自己看 diff 和代码变更。
 
-**Why:** 用户觉得总结浪费时间，更喜欢直接给出结果。
-**How to apply:** 完成任务后直接结束，不要加 "总结" 或 "以上是..." 段落。
-```
+## 🚀 开始实现
 
-### Frontmatter 解析（共享模块）
+### 步骤 1：基于 CWD 路径进行记忆空间哈希隔离
 
-记忆和技能都要解析 YAML frontmatter，抽出 `frontmatter.ts`：
+#### 为什么做
+
+如果用户在本地开发多个不同的项目，我们决不能让 A 项目的上下文记忆混入 B 项目中。我们需要通过计算当前工作目录（CWD）的 SHA-256 散列值，将记忆文件夹物理隔离存放在全局主目录下的 `.mini-claude/projects/{hash}/memory` 中。
+
+#### 做什么
+
+创建（或覆写）`memory.py`，编写路径生成算法：
 
 ```python
-# frontmatter.py
+# memory.py
 
-@dataclass
-class FrontmatterResult:
-    meta: dict[str, str] = field(default_factory=dict)
-    body: str = ""
+from __future__ import annotations
+
+import hashlib
+import re
+from pathlib import Path
+
+VALID_TYPES = {"user", "feedback", "project", "reference"}
 
 
-def parse_frontmatter(content: str) -> FrontmatterResult:
+def _project_hash() -> str:
+    # 提取 cwd 路径并计算 SHA-256 哈希的前 16 位字符
+    return hashlib.sha256(str(Path.cwd()).encode()).hexdigest()[:16]
+
+
+def get_memory_dir() -> Path:
+    # 建立项目隔离的记忆归档夹
+    d = Path.home() / ".mini-claude" / "projects" / _project_hash() / "memory"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+```
+
+---
+
+### 步骤 2：编写 YAML Frontmatter 轻量解析器
+
+#### 为什么做
+
+为了教大模型以结构化的形式保存记忆（如记忆名字、描述及类型），记忆文件会采用类似 Markdown 博客的 Frontmatter 格式头（夹在 `---` 之间的元数据）。
+我们需要手写一个极其紧凑的解析器解析这些元数据，而不需要引入像 `PyYAML` 这样臃肿的第三方依赖。
+
+#### 做什么
+
+在 `memory.py` 中编写 YAML 头信息切片读取算法：
+
+```python
+# memory.py（续）
+
+
+def parse_frontmatter(content: str) -> dict:
     lines = content.split("\n")
+    # 如果第一行不是 --- 则证明没有 Frontmatter 元数据
     if not lines or lines[0].strip() != "---":
-        return FrontmatterResult(body=content)
+        return {"meta": {}, "body": content}
 
     end_idx = -1
     for i in range(1, len(lines)):
         if lines[i].strip() == "---":
             end_idx = i
             break
+
     if end_idx == -1:
-        return FrontmatterResult(body=content)
+        return {"meta": {}, "body": content}
 
-    meta: dict[str, str] = {}
+    meta = {}
     for i in range(1, end_idx):
-        colon_idx = lines[i].find(":")
-        if colon_idx == -1:
-            continue
-        key = lines[i][:colon_idx].strip()
-        value = lines[i][colon_idx + 1:].strip()
-        if key:
-            meta[key] = value
+        colon = lines[i].find(":")
+        if colon != -1:
+            key = lines[i][:colon].strip()
+            val = lines[i][colon + 1 :].strip()
+            meta[key] = val
 
-    body = "\n".join(lines[end_idx + 1:]).strip()
-    return FrontmatterResult(meta=meta, body=body)
+    # 裁剪元数据后，重组正文部分
+    body = "\n".join(lines[end_idx + 1 :]).strip()
+    return {"meta": meta, "body": body}
 ```
 
-没有用 `js-yaml` 之类的库——我们的 frontmatter 只是简单的 `key: value`，20 行手写解析器够用且零依赖。
+---
 
-### 保存与索引
+### 步骤 3：实现索引文件 `MEMORY.md` 自动重建
+
+#### 为什么做
+
+Agent 在提问时，如果一次性将所有的记忆文件全部发给 API 会极大耗费 Token。
+- 我们的设计策略是：在记忆目录下维护一个唯一的索引文件 `MEMORY.md`。
+- 每次写盘新记忆后，系统会自动扫描目录下所有的 `.md` 文件，读取元数据，并在 `MEMORY.md` 写入结构化目录。
+- 这样，系统启动时只需将 `MEMORY.md` 索引注入 System Prompt。Agent 可以通过索引知晓自己存了哪些记忆，当需要具体细节时，通过 `read_file` 主动读取对应文件。
+
+#### 做什么
+
+在 `memory.py` 中编写 `MEMORY.md` 自动重建与检索函数：
 
 ```python
-# memory.py — save_memory
+# memory.py（续）
 
-def save_memory(name: str, description: str, type: str, content: str) -> str:
+
+def list_memories() -> list[dict]:
     d = get_memory_dir()
-    filename = f"{type}_{_slugify(name)}.md"
-    text = format_frontmatter(
-        {"name": name, "description": description, "type": type}, content
-    )
-    (d / filename).write_text(text)
-    _update_memory_index()
-    return filename
+    entries = []
+    # 扫描所有 .md 文件并解析
+    for f in sorted(d.glob("*.md")):
+        if f.name == "MEMORY.md":
+            continue
+        try:
+            parsed = parse_frontmatter(f.read_text(encoding="utf-8"))
+            meta = parsed["meta"]
+            if meta.get("name") and meta.get("type") in VALID_TYPES:
+                entries.append({
+                    "name": meta["name"],
+                    "description": meta.get("description", ""),
+                    "type": meta["type"],
+                    "filename": f.name,
+                })
+        except Exception:
+            pass
+    return entries
+
 
 def _update_memory_index() -> None:
     memories = list_memories()
     lines = ["# Memory Index", ""]
     for m in memories:
-        lines.append(f"- **[{m.name}]({m.filename})** ({m.type}) — {m.description}")
-    _get_index_path().write_text("\n".join(lines))
+        lines.append(f"- **[{m['name']}]({m['filename']})** ({m['type']}) — {m['description']}")
+    
+    # 覆盖重写唯一的索引文件
+    index_path = get_memory_dir() / "MEMORY.md"
+    index_path.write_text("\n".join(lines), encoding="utf-8")
 ```
 
-文件名格式 `{type}_{slugified_name}.md` 让文件系统排序时自动按类型分组，人眼扫描也一目了然。每次写入后立即重建索引，保持 MEMORY.md 与文件系统同步。
+---
 
-### 索引截断
+### 步骤 4：编译记忆提示词段并织入 System Prompt
 
-```python
-# memory.py — load_memory_index
+#### 为什么做
 
-MAX_INDEX_LINES = 200
-MAX_INDEX_BYTES = 25000
+这是促成“记忆自我进化”的魔法：**我们不需要为记忆设计任何特有工具**。
+我们只需在 System Prompt 中告诉大模型：“你拥有一个位于 `{dir}` 的记忆系统，可以使用已有的 `write_file`/`edit_file` 工具往里面写文件来记住偏好；并向其展示当前的 `MEMORY.md` 索引”。模型就会自主决定什么时候需要写文件来“记住”某些规则！
 
-def load_memory_index() -> str:
-    index_path = _get_index_path()
-    if not index_path.exists():
-        return ""
-    content = index_path.read_text()
-    lines = content.split("\n")
-    if len(lines) > MAX_INDEX_LINES:
-        content = "\n".join(lines[:MAX_INDEX_LINES]) + "\n\n[... truncated, too many memory entries ...]"
-    if len(content.encode()) > MAX_INDEX_BYTES:
-        content = content[:MAX_INDEX_BYTES] + "\n\n[... truncated, index too large ...]"
-    return content
-```
+#### 做什么
 
-两层截断各有用途：行截断（200 行）是正常防护，按完整条目截断；字节截断（25KB）是异常防御，捕捉行数不多但单行极长的情况——Claude Code 团队在生产中见过 197KB 塞在 200 行内的案例。
-
-### System Prompt 注入
-
-`buildMemoryPromptSection()` 生成注入到 system prompt 的文本，告诉模型记忆系统的存在和用法：
+1. 在 `memory.py` 末尾编写 `build_memory_prompt_section`。
+2. 修改 `prompt.py`，引入该方法并在 `build_system_prompt` 中替换 `{{memory}}` 占位符。
 
 ```python
-# memory.py — build_memory_prompt_section（简化展示）
+# memory.py（续）
+
 
 def build_memory_prompt_section() -> str:
-    index = load_memory_index()
+    index_path = get_memory_dir() / "MEMORY.md"
+    index = index_path.read_text(encoding="utf-8") if index_path.exists() else ""
     memory_dir = str(get_memory_dir())
 
     return f"""# Memory System
-
 You have a persistent, file-based memory system at `{memory_dir}`.
 
 ## Memory Types
@@ -187,7 +198,13 @@ You have a persistent, file-based memory system at `{memory_dir}`.
 
 ## How to Save Memories
 Use the write_file tool to create a memory file with YAML frontmatter:
-...
+---
+name: Memory Title
+description: Quick description
+type: project
+---
+Memory details...
+
 Save to: `{memory_dir}/`
 Filename format: `{{type}}_{{slugified_name}}.md`
 
@@ -195,101 +212,111 @@ Filename format: `{{type}}_{{slugified_name}}.md`
 - Code patterns or architecture (read the code instead)
 - Git history (use git log)
 - Anything already in CLAUDE.md
-- Ephemeral task details
 
 {"## Current Memory Index" + chr(10) + index if index else "(No memories saved yet.)"}"""
 ```
 
-这段 prompt 做了三件事：教模型分类（四种类型）、教模型操作（用 `write_file`、存到哪里、什么格式）、教模型克制（"What NOT to Save"）。"让模型使用记忆"不只是给它一个工具，还要在 prompt 中描述完整的类型体系和边界，模型才能做出好的决策。
-
-最后在 `prompt.ts` 中通过占位符注入：
+在 `prompt.py` 中更新引入和替换：
 
 ```python
-result = result.replace("{{memory}}", build_memory_prompt_section())
+# prompt.py 中的修改
+
+# 1. 引入记忆编译函数
+from .memory import build_memory_prompt_section
+
+# ...
+
+def build_system_prompt() -> str:
+    replacements = {
+        "{{cwd}}": str(Path.cwd()),
+        "{{date}}": date.today().isoformat(),
+        "{{platform}}": f"{platform.system()} {platform.machine()}",
+        "{{shell}}": os.environ.get("SHELL") or os.environ.get("COMSPEC") or "unknown",
+        "{{git_context}}": get_git_context(),
+        "{{claude_md}}": load_claude_md(),
+        # 2. 替换记忆占位符
+        "{{memory}}": build_memory_prompt_section(), 
+    }
+    # ... 后续替换逻辑保持不变
 ```
 
-### CLI 交互
+---
 
-用户在 REPL 中输入 `/memory` 可以列出所有记忆：
+## ⚖️ 设计权衡
+
+### 零工具的“寄生”文件读写 vs 引入专门的 MemoryTool
+
+- **方案 A**：**“寄生”文件读写**（我们所用）
+  - 记忆就是普通的文件。大模型使用已有的 `write_file`/`edit_file` 和 `read_file` 读写记忆。
+  - **优点**：不需要编写任何新工具，降低了工具池的 Token 开销；且用户可以直接进入 `.mini-claude/projects/` 目录下用本地编辑器（VS Code/Vim）增删改记忆。
+  - **缺点**：大模型需要先理解文件写入格式，写入的规范性依赖 System Prompt 的指引强度。
+- **方案 B**：**引入定制的 MemoryTool 工具**
+  - 在 API 中暴露类似 `save_memory(key, val)` 的强约束工具。
+  - **优点**：格式强制统一。
+  - **缺点**：用户无法轻易查看或离线修改；增加了额外的工具参数开销。
+
+**结论**：方案 A 将记忆巧妙地“归一化”为文件读写，最完美地践行了“Unix 哲学：一切皆文件”的设计思想。
+
+---
+
+## ⚠️ 常见陷阱
+
+### 1. `MEMORY.md` 索引自身没有被屏蔽
 
 ```python
-if inp == "/memory":
-    memories = list_memories()
-    if not memories:
-        print_info("No memories saved yet.")
-    else:
-        print_info(f"{len(memories)} memories:")
-        for m in memories:
-            print(f"    [{m.type}] {m.name} — {m.description}")
-    continue
+# ❌ 错误：在 list_memories 中没有跳过 MEMORY.md 自身
+for f in d.glob("*.md"):
+    # 会把 MEMORY.md 的数据也读出来加入它自己，造成无限套娃
 ```
 
----
-
-### 语义召回（sideQuery）
-
-早期版本用关键词匹配做记忆召回——把查询拆成词，统计每条记忆的命中数排序。这很简单但能力有限：用户问"部署流程"时，标题为"CI/CD 注意事项"的记忆完全匹配不上，因为没有共同关键词。
-
-新版本用 `sideQuery` 做语义召回：把所有记忆的文件名和描述发给模型，让模型判断哪些与当前查询相关。
-
-几个关键设计点：
-
-**sideQuery 用的是同一个模型，不是单独的小模型。** Claude Code 用 Sonnet 做 sideQuery，我们简化为直接复用用户配置的模型。sideQuery 只发送记忆清单（文件名 + 描述），不发送完整内容，所以输入 token 很少。
-
-**模型做语义选择，比关键词匹配强得多。** "部署流程"能匹配到"CI/CD 注意事项"，"数据库性能"能匹配到"PostgreSQL 索引优化经验"——因为模型理解语义关联，不只是字面重叠。
-
-**`alreadySurfaced` Set 防止重复召回。** 同一会话中已经展示过的记忆不会再次出现，避免用户每次提问都看到相同的记忆。这个 Set 在整个会话生命周期内持续增长。
-
-**单文件 4KB 截断 + 会话总预算 60KB。** 防止单条巨大记忆或累积过多召回挤占上下文。预算是字节级控制，不是 token 级——字节计算更快，且对多语言文本更公平。
-
-> **对比旧版关键词匹配（已替换）：** 旧实现把查询拆词后逐条匹配，零 API 调用但准确度低。新版每次召回消耗 1 次 API 调用，但语义理解能力质的飞跃。对于教程项目记忆量少的场景，这个 API 成本完全可以接受。
-
-### 异步预取（startMemoryPrefetch）
-
-语义召回需要一次 API 调用，如果同步执行会增加用户等待时间。解决方案：**在用户提交输入的瞬间就启动召回，与第一次模型 API 调用并行执行。**
-
-这个设计的关键在于**非阻塞轮询**：
-
-1. **预取在用户输入时启动**——与第一次模型 API 调用并行，用户感知不到额外延迟
-2. **每次循环迭代都检查**——如果预取还没完成，不等待，直接跳过；下一次迭代再检查
-3. **`settled` 标志用 `.then()` 设置**——不用 `await`，只在确认完成后才读取结果
-4. **消费后标记 `consumed = true`**——确保同一次预取只注入一次
-
-三个门控条件避免浪费 API 调用：
-- **多词查询**：单个词（如 "hi"）太短，语义匹配无意义
-- **会话预算**：累积超过 60KB 后停止召回，防止上下文过载
-- **记忆存在性**：没有记忆文件时跳过，省一次 API 调用
-
-`formatMemoriesForInjection` 把每条记忆包裹在 `<system-reminder>` 标签中注入为 user message：
-
-### Freshness Warning
-
-记忆是时间切片，不是实时状态。一条"项目下周截止"的记忆在两周后读到时已经过时，模型如果不知道这一点就会给出错误建议。
-
-规则很简单：1 天以内不提示（信息基本新鲜），超过 1 天就附带警告。警告文本明确告诉模型两件事："这是过去某个时刻的观察"和"需要对照当前代码验证"。这比简单标注"X 天前"更有效——它给出了行动指引，而非只是信息。
+**修正**：在 glob 遍历时，必须写明 `if f.name == "MEMORY.md": continue` 予以过滤。
 
 ---
 
-## 关键设计决策
+### 2. 记忆没有按照项目做沙箱隔离
 
-**为什么记忆用文件系统而非数据库？** 三个好处：用户可以直接用编辑器读写记忆文件；模型用已有的 `write_file`/`read_file` 工具就能操作，不需要专门的记忆 API；如有需要可以纳入 git 版本控制。记忆系统"寄生"在工具系统上，减少了需要暴露的接口数量。
+如果简单把所有项目的记忆混着存在全局 `~/.mini-claude/memory/` 目录下，一旦大模型在前端项目 A 下检索到后端项目 B 的命名规范或文件规则，就会产生严重的牛头不对马嘴的逻辑干扰。
 
-**为什么用语义召回而非关键词匹配？** 关键词匹配只能找到字面重叠的记忆，语义召回能理解"部署流程"和"CI/CD 注意事项"的关联。代价是每次召回消耗 1 次 API 调用，但 sideQuery 只发送记忆清单（文件名 + 描述），输入 token 极少，成本很低。对于记忆量有限的场景，这个 trade-off 完全值得。
-
-**为什么异步预取而非同步召回？** 同步召回意味着用户每次提问都要多等一个 API 往返。预取与第一次模型调用并行，如果预取先完成，记忆在第一轮响应中就可见；如果没完成，第二轮也能赶上。最差情况下记忆晚到一轮，但用户永远不需要等。
-
-**为什么需要会话级预算？** 无限召回会让上下文充满记忆，挤掉真正的对话内容。60KB 预算大约相当于 20-30 条中等长度的记忆，足够覆盖一次会话的上下文需求。`alreadySurfaced` 集合配合预算上限，让越到会话后期记忆召回越精准——已经展示过的不重复，预算内只留真正需要的。
-
-### 对比总览
-
-| 维度 | Claude Code | mini-claude |
-|------|------------|-------------|
-| **召回方式** | Sonnet sideQuery 语义匹配 | sideQuery 语义匹配（同模型） |
-| **异步预取** | pendingMemoryPrefetch | startMemoryPrefetch |
-| **会话预算** | 60KB | 60KB |
-| **Freshness** | 过期警告 | 过期警告 |
-| **API 调用** | 每次召回 1 次 | 每次召回 1 次 |
+**修正**：必须在路径中引入当前工作目录的 hash 值进行强物理隔离。
 
 ---
 
-> **下一章**：可复用的 Prompt 模块——技能系统。
+## ✅ 验收点
+
+### 输入与验证
+
+1. 启动 Agent，向其告知一条你的角色和习惯偏好：
+   ```bash
+   python -m mini_claude "记住：我叫小明，负责前端 React 重构工作"
+   ```
+2. **观察工具调用**：大模型在返回时，应当自主产生了一次 `write_file` 的调用，在你的后台写入了一个以 `user_` 或 `project_` 开头的记忆 md 文件。
+3. **验证持久化**：退出程序。
+4. 在另一目录或者直接在当前目录下重新启动 Agent：
+   ```bash
+   python -m mini_claude "你是谁？当前项目负责人是谁？"
+   ```
+
+### 预期结果
+
+大模型能够准确复述出：“我是 Mini Claude Code。当前项目的负责人是小明，他负责前端 React 重构。”
+
+---
+
+## 🧠 思考题
+
+1. **既然我们在 `build_memory_prompt_section` 中只把索引文件 `MEMORY.md` 编译进了 System Prompt，大模型怎么知道每条记忆的具体详细内容呢？**
+   *(提示：索引中有类似 `-[不总结](feedback_no_summary.md)` 的格式。模型看到文件名后，当需要查阅“如何不总结”的详情时，会自主发起一次 `read_file` 读取该文件的命令获取内容，实现了“按需拉取”的懒加载模式。)*
+2. **为什么我们把 `What NOT to Save`（不要保存什么）加入到了记忆系统的 System Prompt 中？大模型会胡乱保存什么？**
+   *(提示：如果不加以限制，大模型倾向于将之前的整个代码结构、Git 记录、历史代码片全部当成记忆存盘，这会导致记忆目录短时间内发生文件大爆炸。)*
+
+---
+
+## 📦 本节收获
+
+1. **一切皆文件的记忆哲学**：理解了在 Agent 系统中通过 Prompt 引导，将记忆维护降维到已有文件工具上的巧妙设计。
+2. **多租户空间隔离**：掌握了利用 CWD 哈希实现本地多项目数据沙箱物理隔离的开发模式。
+3. **按需加载（Lazy Loading）索引**：掌握了“只曝露索引，按需加载内容”的 Token 减负与缓存友好型架构方案。
+
+---
+
+> **下一章**：现在 Agent 具备了跨会话记忆。下一步我们将实现技能系统——允许 Agent 发现并运行用户或团队定制的 Prompt 工作流。
