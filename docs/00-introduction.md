@@ -54,27 +54,27 @@ Claude Code 的开源快照有 50 万行 TypeScript：66+ 工具、React/Ink TUI
 
 ```mermaid
 graph TB
-    User[用户输入] --> CLI[cli.ts<br/>CLI 入口 / REPL]
-    CLI --> Agent[agent.ts<br/>Agent 主循环]
-    Agent --> Prompt[prompt.ts<br/>System Prompt]
+    User[用户输入] --> CLI[__main__.py<br/>CLI 入口 / REPL]
+    CLI --> Agent[agent.py<br/>Agent 主循环]
+    Agent --> Prompt[prompt.py<br/>System Prompt]
     Agent --> API{API 后端}
     API -->|Anthropic| AnthropicSDK[Anthropic SDK]
     API -->|OpenAI 兼容| OpenAISDK[OpenAI SDK]
-    Agent --> Tools[tools.ts<br/>工具系统]
+    Agent --> Tools[tools.py<br/>工具系统]
     Tools --> FS[文件读写]
     Tools --> Shell[Shell 命令]
     Tools --> Search[搜索工具]
     Tools --> SkillTool[skill 工具]
     Tools --> WebFetch[web_fetch]
-    Agent --> SubAgent[subagent.ts<br/>子 Agent]
+    Agent --> SubAgent[subagent.py<br/>子 Agent]
     SubAgent -.->|fork-return| Agent
-    Agent --> Memory[memory.ts<br/>记忆系统]
+    Agent --> Memory[memory.py<br/>记忆系统]
     Prompt --> Memory
-    Prompt --> Skills[skills.ts<br/>技能系统]
-    Agent --> MCP[mcp.ts<br/>MCP 集成]
+    Prompt --> Skills[skills.py<br/>技能系统]
+    Agent --> MCP[mcp_client.py<br/>MCP 集成]
     MCP --> ExtTools[外部工具服务器]
-    Agent --> Session[session.ts<br/>会话管理]
-    Agent --> UI[ui.ts<br/>终端 UI]
+    Agent --> Session[session.py<br/>会话管理]
+    Agent --> UI[ui.py<br/>终端 UI]
 
     style Agent fill:#7c5cfc,color:#fff
     style Tools fill:#e8e0ff
@@ -89,30 +89,29 @@ graph TB
 
 各组件职责：
 
-- **`cli.ts`**：解析命令行参数，提供交互式 REPL
-- **`agent.ts`**：核心引擎（~1263 行）。组装消息、调用 API、解析响应、执行工具、压缩上下文、控制预算
-- **`prompt.ts`**：把静态提示词模板和动态环境信息（OS、目录、Git 状态、记忆、技能）拼成 System Prompt
-- **`tools.ts`**：13 个工具的定义 + 执行逻辑 + 权限检查 + 延迟加载
-- **`memory.ts` / `skills.ts`**：记忆让 Agent 跨会话记住信息（支持语义召回），技能提供可复用的操作序列，两者都在启动时注入 System Prompt
-- **`subagent.ts`**：当任务超出单个上下文窗口时，fork 子 Agent 处理子任务，完成后返回结果
-- **`mcp.ts`**：MCP 协议客户端，通过 JSON-RPC over stdio 连接外部工具服务器
-- **`session.ts`**：把对话历史写到磁盘，支持 `--resume` 恢复
-- **`ui.ts`**：终端颜色和格式化输出
+- **`agent.py`**：核心引擎。组装消息、调用 API、解析响应、执行工具、压缩上下文、控制预算
+- **`tools.py`**：13 个工具的定义 + 执行逻辑 + 权限检查 + 延迟加载
+- **`__main__.py`**：解析命令行参数，提供交互式 REPL
+- **`prompt.py`**：把静态提示词模板和动态环境信息（OS、目录、Git 状态、记忆、技能）拼成 System Prompt
+- **`memory.py` / `skills.py`**：记忆让 Agent 跨会话记住信息（支持语义召回），技能提供可复用的操作序列，两者都在启动时注入 System Prompt
+- **`subagent.py`**：当任务超出单个上下文窗口时，fork 子 Agent 处理子任务，完成后返回结果
+- **`mcp_client.py`**：MCP 协议客户端，通过 JSON-RPC over stdio 连接外部工具服务器
+- **`session.py`**：把对话历史写到磁盘，支持 `--resume` 恢复
+- **`ui.py`**：终端颜色和格式化输出
 
-| 文件 | 行数 | 职责 |
-|------|------|------|
-| `agent.ts` | ~1263 | Agent 主循环：消息构造、API 调用、工具编排、流式执行、子 Agent、4 层压缩、预算控制、Plan Mode |
-| `tools.ts` | ~850 | 工具定义 + 执行：13 个工具 + 5 种权限模式 + mtime 防护 + 延迟加载 |
-| `cli.ts` | ~371 | CLI 入口、参数解析、REPL 交互 |
-| `memory.ts` | ~325 | 记忆系统：4 类型 + 文件存储 + 语义召回 + 异步预取 |
-| `mcp.ts` | ~266 | MCP 客户端：JSON-RPC over stdio、工具发现与调用转发 |
-| `ui.ts` | ~211 | 终端输出：颜色、格式化 |
-| `skills.ts` | ~175 | 技能系统：目录发现 + frontmatter 解析 + inline/fork 双模式 |
-| `subagent.ts` | ~199 | 子 Agent 配置（3 内置 + 自定义 Agent 发现） |
-| `prompt.ts` | ~154 | System Prompt 构造：模板 + @include + 变量替换 + 记忆/技能注入 |
-| `session.ts` | ~63 | 会话持久化：JSON 文件存储 |
-| `frontmatter.ts` | ~41 | YAML frontmatter 解析器 |
-| `python/` | — | Python 版完整实现（`mini_claude/` 包，~2920 行） |
+| 文件 | 职责 |
+|------|------|
+| `agent.py` | Agent 主循环：消息构造、API 调用、工具编排、流式执行、子 Agent、4 层压缩、预算控制、Plan Mode |
+| `tools.py` | 工具定义 + 执行：13 个工具 + 5 种权限模式 + mtime 防护 + 延迟加载 |
+| `__main__.py` | CLI 入口、参数解析、REPL 交互 |
+| `memory.py` | 记忆系统：4 类型 + 文件存储 + 语义召回 + 异步预取 |
+| `mcp_client.py` | MCP 客户端：JSON-RPC over stdio、工具发现与调用转发 |
+| `ui.py` | 终端输出：颜色、格式化 |
+| `skills.py` | 技能系统：目录发现 + frontmatter 解析 + inline/fork 双模式 |
+| `subagent.py` | 子 Agent 配置（3 内置 + 自定义 Agent 发现） |
+| `prompt.py` | System Prompt 构造：模板 + @include + 变量替换 + 记忆/技能注入 |
+| `session.py` | 会话持久化：JSON 文件存储 |
+| `frontmatter.py` | YAML frontmatter 解析器 |
 
 ## 技术栈
 
@@ -166,19 +165,19 @@ mini-claude --max-cost 0.50 --max-turns 20  # 预算控制
 | 章节 | mini-claude 文件 | Claude Code 对应源码 |
 |------|-----------------|---------------------|
 | **Phase 1: 构建一个可用的 Coding Agent** | | |
-| [1. Agent Loop](docs/01-agent-loop.md) | `agent.ts` 的 `chatAnthropic()` | `src/query.ts` 的 `queryLoop` |
-| [2. 工具系统](docs/02-tools.md) | `tools.ts` | `src/Tool.ts` + `src/tools/` (66+ 工具) |
-| [3. System Prompt](docs/03-system-prompt.md) | `prompt.ts` | `src/constants/prompts.ts` |
-| [4. CLI 与会话](docs/04-cli-session.md) | `cli.ts` + `session.ts` | `src/entrypoints/cli.tsx` |
-| [5. 流式输出](docs/05-streaming.md) | `agent.ts` 的两套 stream 方法 | `src/services/api/claude.ts` |
-| [6. 权限与安全](docs/06-permissions.md) | `tools.ts` 的 `checkPermission()` + 规则配置 | `src/utils/permissions/` (52KB) |
-| [7. 上下文管理](docs/07-context.md) | `agent.ts` 的 `checkAndCompact()` | `src/services/compact/` |
+| [1. Agent Loop](docs/01-agent-loop.md) | `agent.py` 的 `_chat_anthropic()` | `src/query.ts` 的 `queryLoop` |
+| [2. 工具系统](docs/02-tools.md) | `tools.py` | `src/Tool.ts` + `src/tools/` (66+ 工具) |
+| [3. System Prompt](docs/03-system-prompt.md) | `prompt.py` | `src/constants/prompts.ts` |
+| [4. CLI 与会话](docs/04-cli-session.md) | `__main__.py` + `session.py` | `src/entrypoints/cli.tsx` |
+| [5. 流式输出](docs/05-streaming.md) | `agent.py` 的两套 stream 方法 | `src/services/api/claude.ts` |
+| [6. 权限与安全](docs/06-permissions.md) | `tools.py` 的 `check_permission()` + 规则配置 | `src/utils/permissions/` (52KB) |
+| [7. 上下文管理](docs/07-context.md) | `agent.py` 的 `_check_and_compact()` | `src/services/compact/` |
 | **Phase 2: 进阶能力** | | |
-| [8. 记忆系统](docs/08-memory.md) | `memory.ts` | `src/utils/memory.ts` |
-| [9. 技能系统](docs/09-skills.md) | `skills.ts` | `src/utils/skills.ts` + `src/tools/SkillTool/` |
-| [10. Plan Mode](docs/10-plan-mode.md) | `agent.ts` + `tools.ts` + `cli.ts` | `EnterPlanMode` / `ExitPlanMode` |
-| [11. 多 Agent](docs/11-multi-agent.md) | `subagent.ts` + `agent.ts` | `src/tools/AgentTool/` |
-| [12. MCP 集成](docs/12-mcp.md) | `mcp.ts` | `src/services/mcpClient.ts` |
+| [8. 记忆系统](docs/08-memory.md) | `memory.py` | `src/utils/memory.ts` |
+| [9. 技能系统](docs/09-skills.md) | `skills.py` | `src/utils/skills.ts` + `src/tools/SkillTool/` |
+| [10. Plan Mode](docs/10-plan-mode.md) | `agent.py` + `tools.py` + `__main__.py` | `EnterPlanMode` / `ExitPlanMode` |
+| [11. 多 Agent](docs/11-multi-agent.md) | `subagent.py` + `agent.py` | `src/tools/AgentTool/` |
+| [12. MCP 集成](docs/12-mcp.md) | `mcp_client.py` | `src/services/mcpClient.ts` |
 | [13. 架构对比](docs/13-whats-next.md) | 全局对比 | 全局对比 |
 
 ---
