@@ -1,8 +1,8 @@
-# 11. 多 Agent 架构
+# 第 14 课：多 Agent 架构 (Multi-Agent)
 
-## 本章目标
+## 🎯 本节目标
 
-实现 Sub-Agent（子代理）系统：让主 Agent 能派生出独立的子 Agent 执行探索、规划、通用任务，完成后将结果返回主 Agent。这是 Claude Code 处理复杂任务时最重要的"分而治之"机制。
+为 Agent 实现 **Sub-Agent（子代理）系统**：引入“分而治之”的设计思路。允许主 Agent 通过调用 `agent` 工具派生出相互隔离的子 Agent，去独立且并行地执行代码探索（`explore`）、方案设计（`plan`）或通用任务（`general`），并在完成后将结果汇总并返回给主 Agent。这能有效突破单次请求上下文窗口的限制，大幅提高处理超复杂工程任务的成功率。
 
 ```mermaid
 graph TB
@@ -28,326 +28,385 @@ graph TB
     style Result fill:#e8e0ff
 ```
 
-## Claude Code 怎么做的
+---
 
-Claude Code 的多 Agent 体系在 `src/tools/AgentTool/` 中实现，支持三种协作模式：
+## 🏆 最终效果
 
-| 模式 | 特点 |
-|------|------|
-| **Sub-Agent**（fork-return） | 分叉独立执行，完成后返回结果 |
-| **Coordinator** | 一个协调者分配任务给多个 Worker |
-| **Swarm Team** | 多 Agent 对等协作，通过信箱通信 |
+当学员完成本节课的代码实现后，可以尝试以下场景：
 
-我们实现的是 Sub-Agent 模式，也是最常用的。
+在大模型面对包含几十个复杂逻辑文件的重构任务时，它会自动在后台派生出 Explore 子代理。
+在终端界面上，用户可以看到带有紫色专属边框的子代理运行标记：
+```
+  ┌─ Sub-agent [explore]: search config usages
+  └─ Sub-agent [explore] completed
+```
+子代理在不污染主 Agent 历史上下文的前提下，快速且并发地执行代码扫描，并最终向主 Agent 汇报：“在以下 3 个文件中找到了配置引用：[...内容...]”。主 Agent 接收到这部分高度精炼的文本汇总后，在零废话的前提下直接展开精准编码。
 
-### 内置 Agent 类型
+---
 
-- **Explore**：用 Haiku 模型（更便宜），只读工具集，专门用于代码搜索
-- **Plan**：只读 + 结构化输出，设计实现方案
-- **General**：完整工具集（除了不能递归创建子 Agent）
-- **Custom**：通过 `.claude/agents/*.md` 文件定义
+## 🛠️ 本节任务
 
-### Coordinator 模式的关键设计
+- **任务 1**：在 `subagent.py` 中定义内置子代理类型（`explore`、`plan`、`general`）的 System Prompt，并实现子代理配置加载函数 `get_sub_agent_config` 与项目级自定义代理扫描发现机制。
+- **任务 2**：在 `tools.py` 中定义 `agent` 工具，支持传入任务描述、任务指令和代理类型参数。
+- **任务 3**：在 `agent.py` 的构造函数中支持子代理相关的特殊参数（`custom_system_prompt`、`custom_tools`、`is_sub_agent`），并将其封装到 `AgentConfig`。
+- **任务 4**：在 `agent.py` 中改造输出处理逻辑（引入 `self.state.output_buffer` 来捕获流式文本）并编写一次性运行接口 `run_once`。
+- **任务 5**：在 `agent.py` 中编写子代理的执行方法 `_execute_agent_tool`，支持模型参数、`api_base` 参数继承、权限沙箱继承（`plan` 模式强制继承）以及 Token 消耗统计回传。
 
-Coordinator 将主 Agent 变为**纯编排者**——工具集被硬限制为只有 `Agent`（派生 Worker）和 `SendMessage`（续传 Worker），完全无法执行文件操作。这个硬约束防止协调器"懒得委托、自己动手"而退化成普通单 Agent。
+---
 
-标准工作流分四阶段：**研究（并行只读）→ 综合（协调器串行理解）→ 实施（按文件集串行）→ 验证**。
+## 📦 涉及文件
 
-其中综合阶段有个反直觉的约束：提示词里明确禁止写 "based on your findings"。这强制协调器真正理解并具体化研究结果（包含文件路径、行号），而不是把理解工作转包给下一个 Worker。
+修改或创建：
+- [python/mini_claude/subagent.py](file:///e:/project/claude-code-from-scratch/python/mini_claude/subagent.py)
+- [python/mini_claude/tools.py](file:///e:/project/claude-code-from-scratch/python/mini_claude/tools.py)
+- [python/mini_claude/agent.py](file:///e:/project/claude-code-from-scratch/python/mini_claude/agent.py)
 
-每个 Worker 都是从零开始的独立 Agent，看不到协调器与用户的对话，所以协调器写给 Worker 的 prompt 必须自包含——这是 Coordinator 模式中最容易踩坑的地方。
+---
 
-### 工具过滤：4 层管道
+## 🚀 开始实现
 
-子 Agent 的工具访问经过 4 层过滤，实现纵深防御：
+### 步骤 1：在 `subagent.py` 中实现代理配置与自定义类型扫描
 
-1. 移除元工具（`TaskOutput`、`EnterPlanMode`、`AskUserQuestion` 等）——子 Agent 不应控制 Agent 执行流程
-2. 对自定义 Agent 额外限制——用户定义的类型不与内建类型同级信任
-3. 异步 Agent 用白名单模式——后台运行无法展示交互 UI，必须严格限制
-4. Agent 类型级 `disallowedTools`——如 Explore 显式排除写入工具
+#### 为什么做
+不同的子代理有不同的职责和安全约束。例如：`explore`（代码探索）和 `plan`（方案设计）代理绝对不允许修改任何代码文件，必须被剥夺所有的写操作权限；而 `general` 代理则可以拥有完整的写权限。此外，为了保证扩展性，我们还需要支持用户通过在 `.claude/agents/` 目录下放置 Markdown 配置文件来定义特定的自定义代理。
 
-前三层是全局策略，第四层是类型策略。即使自定义 Agent 设置了 `disallowedTools: []`，前三层仍然有效。
+#### 做什么
+创建或修改 `python/mini_claude/subagent.py`，实现内置 Prompt 模板定义、YAML Frontmatter 自定义代理加载逻辑，以及子代理工具集分配：
 
-### 上下文隔离
-
-子 Agent 采用 deny-by-default：消息历史完全独立，`abortController` 单向传播（父中断→子中断，反之不行），子 Agent 的状态变更默认不传播到父级 UI。只有一个例外：Bash 启动的后台进程必须注册到根 store，否则成为僵尸进程。
-
-### Worktree 隔离
-
-多 Agent 并行写文件时，Claude Code 给每个写操作 Agent 分配独立的 Git Worktree——共享 `.git` 目录但有独立工作目录，完全无冲突，开销比 `git clone` 小得多。
-
-## 我们的实现
-
-用 **~199 行** 的 `subagent.ts` + Agent 类的少量改动，实现 Sub-Agent 模式的核心。
-
-| Claude Code | 我们的实现 | 简化原因 |
-|-------------|-----------|---------|
-| 5 阶段执行流程 | 直接 new Agent + runOnce | 不需要 fork 进程、缓存共享 |
-| 4 层工具过滤管道 | 1 个 Set + filter | 只有 3 种固定类型 |
-| Haiku 模型给 Explore | 统一用主模型 | 减少配置复杂度 |
-| deny-by-default 上下文隔离 | 天然隔离（独立 Agent 实例） | new Agent 自带独立消息历史 |
-
-## 关键代码
-
-### 1. Agent 类型配置 — `subagent.ts`
-
-#### **Python**
 ```python
+# python/mini_claude/subagent.py
+
+# 定义只读工具的白名单
 READ_ONLY_TOOLS = {"read_file", "list_files", "grep_search"}
 
-def _get_read_only_tools() -> list[ToolDef]:
-    return [t for t in tool_definitions if t["name"] in READ_ONLY_TOOLS]
-```
+EXPLORE_PROMPT = """You are a file search specialist for Mini Claude Code. You excel at thoroughly navigating and exploring codebases.
 
-为什么 `run_shell` 在"只读"工具集里？`git log`、`find`、`wc` 这类只读命令是代码探索的核心手段，完全禁止 shell 会大幅削弱 Explore 的能力。安全性通过 system prompt 约束保证：
+=== CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS ===
+This is a READ-ONLY exploration task. You are STRICTLY PROHIBITED from:
+- Creating new files (no write_file, touch, or file creation of any kind)
+- Modifying existing files (no edit_file operations)
+- Deleting files (no rm or deletion)
+- Running ANY commands that change system state
 
-#### **Python**
-```python
-EXPLORE_PROMPT = """You are an Explore agent — a fast, READ-ONLY sub-agent specialized for codebase exploration.
+Your role is EXCLUSIVELY to search and analyze existing code.
+... (详细搜索指导词) ..."""
+
+PLAN_PROMPT = """You are a Plan agent — a READ-ONLY sub-agent specialized for designing implementation plans.
 
 IMPORTANT CONSTRAINTS:
 - You are READ-ONLY. You only have access to read_file, list_files, and grep_search.
 - Do NOT attempt to modify any files.
+... (设计指导词) ..."""
 
-Be fast and thorough. Use multiple tool calls when possible. Return a concise summary of your findings."""
+GENERAL_PROMPT = """You are an agent for Mini Claude Code. Given the user's message, you should use the tools available to complete the task."""
+
+# 扫描并加载本地/项目级自定义代理
+def _discover_custom_agents() -> dict[str, dict]:
+    # 扫描 ~/.claude/agents/ 和 .cwd()/.claude/agents/ 目录下的 Markdown
+    # 复用 frontmatter 解析器并返回代理配置字典
+    # ...
 ```
 
-Plan Agent 同样只读，但 prompt 引导它输出结构化方案：
+随后，编写 `get_sub_agent_config` 函数，为不同的代理分配其对应的系统提示词和经过过滤的工具列表：
 
-#### **Python**
 ```python
-PLAN_PROMPT = """You are a Plan agent — a READ-ONLY sub-agent specialized for designing implementation plans.
-
-Return a structured plan with:
-1. Summary of current state
-2. Step-by-step implementation steps
-3. Critical files for implementation
-4. Potential risks or considerations"""
-```
-
-General Agent 拿到除 `agent` 外的全部工具：
-
-#### **Python**
-```python
-GENERAL_PROMPT = "You are a General sub-agent handling an independent task. Complete the assigned task and return a concise result. You have access to all tools."
+# python/mini_claude/subagent.py
 
 def get_sub_agent_config(agent_type: str) -> dict:
+    """为指定类型的子代理分配 {system_prompt, tools}。"""
     custom = _discover_custom_agents().get(agent_type)
     if custom:
         if custom["allowed_tools"]:
             tools = [t for t in tool_definitions if t["name"] in custom["allowed_tools"]]
         else:
-            tools = [t for t in tool_definitions if t["name"] != "agent"]
+            tools = [t for t in tool_definitions if t["name"] != "agent"]  # 排除递归派生
         return {"system_prompt": custom["system_prompt"], "tools": tools}
 
+    # 内置只读工具集（只允许读取与搜索，不允许写操作）
     read_only = [t for t in tool_definitions if t["name"] in READ_ONLY_TOOLS]
+
     if agent_type == "explore":
         return {"system_prompt": EXPLORE_PROMPT, "tools": read_only}
     elif agent_type == "plan":
         return {"system_prompt": PLAN_PROMPT, "tools": read_only}
-    else:
+    else:  # general
         return {"system_prompt": GENERAL_PROMPT, "tools": [t for t in tool_definitions if t["name"] != "agent"]}
 ```
 
-### 2. Agent 工具定义 — `tools.ts`
+#### 注意什么
+注意看 `GENERAL_PROMPT` 的工具分配：我们通过 `t["name"] != "agent"` 过滤掉了子代理创建自身的工具，这样能有效防止子代理无限制递归创建孙代理，从而避免 Token 的指数级消耗灾难。
 
-`agent` 作为一个普通工具注册，`type` 不是 required——LLM 不确定时可以省略，默认回退到 `general`：
+---
 
-#### **Python**
+### 步骤 2：在 `tools.py` 中定义 `agent` 工具
+
+#### 为什么做
+我们需要让主 Agent 知道它可以调用一个名为 `agent` 的工具。当大模型面对较繁重或需要独立探索的任务时，它会输出结构化的 `agent` 工具调用入参。
+
+#### 做什么
+打开 `python/mini_claude/tools.py`。在 `DEFINED_TOOLS` 列表中注册 `agent` 工具 Schema：
+
 ```python
-{
-    "name": "agent",
-    "description": "Launch a sub-agent to handle a task autonomously. Types: 'explore' (read-only), 'plan' (read-only, structured planning), 'general' (full tools).",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "description": {"type": "string", "description": "Short (3-5 word) description of the sub-agent's task"},
-            "prompt": {"type": "string", "description": "Detailed task instructions for the sub-agent"},
-            "type": {"type": "string", "enum": ["explore", "plan", "general"], "description": "Agent type. Default: general"},
+# python/mini_claude/tools.py
+
+    {
+        "name": "agent",
+        "description": "Launch a sub-agent to handle a task autonomously. Sub-agents have isolated context and return their result. Types: 'explore' (read-only), 'plan' (read-only, structured planning), 'general' (full tools).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string", "description": "Short (3-5 word) description of the sub-agent's task"},
+                "prompt": {"type": "string", "description": "Detailed task instructions for the sub-agent"},
+                "type": {"type": "string", "enum": ["explore", "plan", "general"], "description": "Agent type. Default: general"},
+            },
+            "required": ["description", "prompt"],
         },
-        "required": ["description", "prompt"],
     },
-}
 ```
 
-### 3. Agent 类改造 — `agent.ts`
+#### 注意什么
+子代理的 `type` 我们给出了 `explore` / `plan` / `general` 选项，让主大模型可以根据任务性质动态决策需要启动何种级别的沙箱。
 
-只需 4 处改动，让同一个 Agent 类同时服务于主 Agent 和子 Agent。
+---
 
-#### 3a. 构造函数：接受自定义配置
+### 步骤 3：改造 `Agent` 构造器以支持子代理参数
 
-#### **Python**
+#### 为什么做
+子代理本质上就是主 `Agent` 类的一个新实例，但它使用了定制的 System Prompt 和经过裁剪的工具集。我们需要让 `Agent` 的初始化构造函数能够无缝容纳这些外部覆盖变量。
+
+#### 做什么
+打开 `python/mini_claude/agent.py`。修改 `Agent` 类的 `__init__` 函数，添加并处理子代理所需变量：
+
 ```python
-class Agent:
+# python/mini_claude/agent.py
+
     def __init__(
         self,
         *,
-        # ...
+        permission_mode: PermissionMode = "default",
+        model: str = "claude-opus-4-6",
+        api_base: str | None = None,
+        anthropic_base_url: str | None = None,
+        api_key: str | None = None,
+        thinking: bool = False,
+        max_cost_usd: float | None = None,
+        max_turns: int | None = None,
+        confirm_fn: Callable[[str], Awaitable[bool]] | None = None,
         custom_system_prompt: str | None = None,
         custom_tools: list[ToolDef] | None = None,
-        is_sub_agent: bool = False,
+        is_sub_agent: bool = False, # 新增标志位
     ):
-        self.is_sub_agent = is_sub_agent
+        # 封装至统一的 AgentConfig 中
+        self.config = AgentConfig(
+            permission_mode=permission_mode,
+            model=model,
+            api_base=api_base,
+            anthropic_base_url=anthropic_base_url,
+            api_key=api_key,
+            thinking=thinking,
+            max_cost_usd=max_cost_usd,
+            max_turns=max_turns,
+            custom_system_prompt=custom_system_prompt,
+            custom_tools=custom_tools,
+            is_sub_agent=is_sub_agent,
+        )
+        
+        self.state = AgentState()
+        # ... 其它初始化 ...
+
+        # 覆写工具列表与基础系统提示词
         self.tools = custom_tools or tool_definitions
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
 ```
 
-`customTools` 为 `None` 时回退到全量工具列表，对主 Agent 零侵入。
+并在 `Agent` 类中声明 `is_sub_agent` 只读属性：
 
-#### 3b. 输出捕获：emitText + outputBuffer
-
-子 Agent 的文本输出不能直接打印，需要收集后返回给主 Agent：
-
-#### **Python**
 ```python
-self._output_buffer: list[str] | None = None
+# python/mini_claude/agent.py
 
-def _emit_text(self, text: str) -> None:
-    if self._output_buffer is not None:
-        self._output_buffer.append(text)
-    else:
-        print_assistant_text(text)
+    @property
+    def is_sub_agent(self) -> bool:
+        return self.config.is_sub_agent
 ```
 
-`outputBuffer` 的三态：`null` = 主 Agent 模式（直接打印），`[]` = 子 Agent 模式（开始收集），`[...]` = 正在积累。流式回调只需调 `emitText`，完全不感知自己在哪个模式下运行。
-
-#### 3c. runOnce：一次性执行入口
-
-#### **Python**
-```python
-async def run_once(self, prompt: str) -> dict:
-    self._output_buffer = []
-    prev_in = self.total_input_tokens
-    prev_out = self.total_output_tokens
-    await self.chat(prompt)
-    text = "".join(self._output_buffer)
-    self._output_buffer = None
-    return {
-        "text": text,
-        "tokens": {
-            "input": self.total_input_tokens - prev_in,
-            "output": self.total_output_tokens - prev_out,
-        },
-    }
-```
-
-Token 用增量计算（运行后 - 运行前），因为 Agent 实例的计数器是累积的。`chat()` 完全复用，它不关心自己在主 Agent 还是子 Agent 中——工具集和输出去向已经在构造函数里配置好了。
-
-#### 3d. executeAgentTool：执行子 Agent
-
-#### **Python**
-```python
-async def _execute_agent_tool(self, inp: dict) -> str:
-    agent_type = inp.get("type", "general")
-    description = inp.get("description", "sub-agent task")
-    prompt = inp.get("prompt", "")
-
-    print_sub_agent_start(agent_type, description)
-
-    config = get_sub_agent_config(agent_type)
-    sub_agent = Agent(
-        model=self.model,
-        custom_system_prompt=config["system_prompt"],
-        custom_tools=config["tools"],
-        is_sub_agent=True,
-        permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
-    )
-
-    try:
-        result = await sub_agent.run_once(prompt)
-        self.total_input_tokens += result["tokens"]["input"]
-        self.total_output_tokens += result["tokens"]["output"]
-        print_sub_agent_end(agent_type, description)
-        return result["text"] or "(Sub-agent produced no output)"
-    except Exception as e:
-        print_sub_agent_end(agent_type, description)
-        return f"Sub-agent error: {e}"
-```
-
-子 Agent 出错时返回错误字符串，不会让父 Agent 崩溃——父 Agent 的 LLM 看到错误信息后可以自行决定重试或换策略。
-
-权限继承：子 Agent 默认 `bypassPermissions`（主 Agent 已授权，子 Agent 不必再询问用户），但 Plan Mode 必须继承——否则子 Agent 可以绕过只读限制，是个安全漏洞。
-
-`agent` 工具需要特殊分发，因为它需要访问当前 Agent 实例状态（model、permissionMode、token 计数器），无法走无状态的通用分发函数：
-
-#### **Python**
-```python
-async def _execute_tool_call(self, name: str, inp: dict) -> str:
-    if name == "agent":
-        return await self._execute_agent_tool(inp)
-    if name == "skill":
-        return await self._execute_skill_tool(inp)
-    return await execute_tool(name, inp)
-```
-
-### 4. isSubAgent 标志
-
-子 Agent 跳过三个只对主 Agent 有意义的操作：
-
-#### **Python**
-```python
-if not self.is_sub_agent:
-    print_divider()
-    self._auto_save()
-
-if not self.is_sub_agent:
-    print_cost(self.total_input_tokens, self.total_output_tokens)
-```
-
-- 分隔线：子 Agent 输出已被 buffer 捕获，不会显示在终端
-- 会话保存：子 Agent 是一次性任务，保存其会话无意义，且可能覆盖主 Agent 的文件
-- 费用打印：token 已汇总到父 Agent，子 Agent 自己打印会造成重复计费的错觉
-
-### 5. 终端 UI — `ui.ts`
-
-#### **Python**
-```python
-def print_sub_agent_start(agent_type: str, description: str) -> None:
-    console.print(f"\n  [magenta]┌─ Sub-agent [{agent_type}]: {description}[/magenta]")
-
-def print_sub_agent_end(agent_type: str, _description: str) -> None:
-    console.print(f"  [magenta]└─ Sub-agent [{agent_type}] completed[/magenta]")
-```
-
-### 6. 自定义 Agent 类型：`.claude/agents/*.md`
-
-与 Claude Code 的 `.claude/agents/` 完全一致的扩展方式：
-
-```markdown
-<!-- .claude/agents/reviewer.md -->
----
-name: reviewer
-description: Reviews code for bugs and style issues
-allowed-tools: read_file, list_files, grep_search, run_shell
----
-You are a code reviewer. Analyze the code thoroughly and report:
-1. Bugs and potential issues
-2. Style inconsistencies
-3. Performance concerns
-```
-
-发现机制：项目级（`.claude/agents/`）优先级高于用户级（`~/.claude/agents/`），同名覆盖。frontmatter 复用 `parseFrontmatter()`，与 Memory 和 Skills 共享同一套解析器。
-
-## 关键设计决策
-
-### Fork-return 为什么比 Coordinator 更适合作为起点？
-
-Fork-return 的优势很简单：无共享状态（不可能污染主 Agent 上下文）、控制流确定（发请求等结果）、容错简单（子 Agent 出错主 Agent 继续工作）。Coordinator 在任务并行化上更强，但需要处理 Worker 之间的信息共享、冲突，复杂度高一个数量级。
-
-### 为什么子 Agent 不能创建子 Agent？
-
-General Agent 工具列表里过滤掉了 `agent`。不限制的话，A 创建 B、B 创建 C 的递归嵌套会指数级消耗 token——每层都有自己的系统提示词和消息历史。Claude Code 做了同样的限制，实践中 1 层已覆盖绝大多数场景。
-
-### 为什么 explore/plan 保留 run_shell？
-
-`git log --oneline -20`、`find . -name "*.py" | wc -l` 这类只读 shell 命令是代码探索的核心手段，完全禁止会大幅削弱能力。这个设计与 Claude Code 的 Explore Agent 一致——用 system prompt 约束而非彻底禁用工具。
-
-### 为什么用 buffer 收集输出而不是回调？
-
-回调方案需要把 `onText` 传入构造函数，然后在 agent loop 里到处判断。Buffer 方案只改 `emitText` 一处，`runOnce` 开启、`chat` 写入、`runOnce` 收集并关闭，生命周期边界清晰，对现有代码零侵入。
+#### 注意什么
+不要直接给 `self.is_sub_agent` 赋值（如 `self.is_sub_agent = is_sub_agent`），因为它是只读属性。我们应当将其存储在 `self.config` 中。
 
 ---
 
-整个实现的核心洞察：**子 Agent 本质上就是一个配置不同的 Agent 实例**。通过给 Agent 类添加少量可选参数（`customTools`、`customSystemPrompt`、`isSubAgent`），同一套 agent loop 同时服务于主 Agent 和子 Agent，避免了代码重复。
+### 步骤 4：流式输出捕获与一次性运行接口设计
 
-> **下一章**：让 Agent 连接外部工具服务器——MCP 集成。
+#### 为什么做
+主 Agent 需要获取子 Agent 所有的文字分析总结。因此，子 Agent 运行时产生的流式文本不能像主 Agent 那样直接打到控制台，而是需要拦截并拼接收集到一个字符串缓冲区（`output_buffer`）中，在运行结束后打包带回给主 Agent。
+
+#### 做什么
+1. **修改输出拦截器**：修改 `python/mini_claude/agent.py` 的 `_emit_text` 输出管道函数。当检测到 `output_buffer` 激活时，将文本追加至缓冲区，否则直接打印：
+
+```python
+# python/mini_claude/agent.py
+
+    def _emit_text(self, text: str) -> None:
+        if self.state.output_buffer is not None:
+            self.state.output_buffer.append(text)
+        else:
+            print_assistant_text(text)
+```
+
+2. **实现 `run_once` 执行入口**：在 `Agent` 中编写子代理单次生命周期内的执行控制逻辑，运行结束后计算消耗的 Token 并返回缓冲区文本：
+
+```python
+# python/mini_claude/agent.py
+
+    async def run_once(self, prompt: str) -> dict:
+        self.state.output_buffer = []  # 激活文本捕获缓冲区
+        prev_in = self.state.total_input_tokens
+        prev_out = self.state.total_output_tokens
+        
+        await self.chat(prompt)  # 运行标准的 chat 会话逻辑
+        
+        text = "".join(self.state.output_buffer)
+        self.state.output_buffer = None  # 关闭缓冲区
+        
+        # 返回捕获的完整文本与产生的 Token 消耗增量
+        return {
+            "text": text,
+            "tokens": {
+                "input": self.state.total_input_tokens - prev_in,
+                "output": self.state.total_output_tokens - prev_out,
+            },
+        }
+```
+
+#### 注意什么
+Token 消耗要使用增量计算（`self.state.total_input_tokens - prev_in`），因为即使在单次运行中，大模型可能也会经历多轮工具调用，我们需要捕获这段生命周期内产生的所有 Token 开销并加总。
+
+---
+
+### 步骤 5：实现子代理的执行与权限继承逻辑
+
+#### 为什么做
+当主大模型选择调用 `agent` 工具时，我们需要根据大模型传入的 `agent_type` 获取对应的 Prompt 和工具集、实例化子代理，并驱动其运行。为了防止安全越权，子代理必须精准继承父代理的特定权限（尤其是 Plan Mode 状态下的只读约束）。
+
+#### 做什么
+1. **编写 `_execute_agent_tool` 方法**：在 `python/mini_claude/agent.py` 中，实现子代理的实例化、API 继承、执行驱动以及 Token 统计结算：
+
+```python
+# python/mini_claude/agent.py
+
+    async def _execute_agent_tool(self, inp: dict) -> str:
+        agent_type = inp.get("type", "general")
+        description = inp.get("description", "sub-agent task")
+        prompt = inp.get("prompt", "")
+
+        # 打印子代理启动的紫色标志
+        print_sub_agent_start(agent_type, description)
+
+        config = get_sub_agent_config(agent_type)
+        sub_agent = Agent(
+            model=self.config.model,
+            # 继承父 Agent 的 OpenAI API 后端地址，避免后端脱钩
+            api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
+            custom_system_prompt=config["system_prompt"],
+            custom_tools=config["tools"],
+            is_sub_agent=True,
+            # 权限继承：如果父级处于只读 plan 模式，子级强制继承 plan 模式；否则直接放行子代理
+            permission_mode="plan" if self.config.permission_mode == "plan" else "bypassPermissions",
+        )
+
+        try:
+            result = await sub_agent.run_once(prompt)
+            # 将子代理消耗的 Token 累加到主代理账单中，合并计费
+            self.state.total_input_tokens += result["tokens"]["input"]
+            self.state.total_output_tokens += result["tokens"]["output"]
+            print_sub_agent_end(agent_type, description)
+            return result["text"] or "(Sub-agent produced no output)"
+        except Exception as e:
+            logger.error(f"Sub-agent error: {e}")
+            print_sub_agent_end(agent_type, description)
+            return f"Sub-agent error: {e}"
+```
+
+2. **在工具分发器中注册该工具处理流程**：
+
+```python
+# python/mini_claude/agent.py -> _execute_tool_call()
+
+        if name == "agent":
+            return await self._execute_agent_tool(inp)
+```
+
+同时，我们还要在 `Agent` 内部对流式输出结束的自动保存、账单显示等模块加装 `if not self.config.is_sub_agent` 的卫语句拦截，防止子代理的中间执行干扰主 REPL 的输出。
+
+#### 注意什么
+`api_base` 继承是跨后端（OpenAI 兼容平台）执行时的生命线。一旦遗漏该参数，子代理会盲目向默认的 Anthropic 端发起请求，导致 API Key 不匹配报错。此外，`permission_mode` 的计划模式继承在安全性上也极其关键。
+
+---
+
+## ⚖️ 设计权衡
+
+### 方案 A：Fork-Return 派生子代理模式（本节采用）
+* **优点**：
+  1. 上下文天然隔离：主子代理使用完全独立的对话历史（`MessageHistory` 实例），防止代码探索的大文本数据污染主上下文导致主模型“健忘”或爆栈。
+  2. 极佳的容错性：子代理发生任何编译或网络报错都会被主 Agent 捕获并转为错误文本。主模型可以根据报错自主决定重新委派或是换用其他方法。
+* **缺点**：
+  * 主子代理之间无法实现无缝的“交互式聊天”，必须通过明确的 Prompt 和 Tool Use 任务指派来交换信息。
+
+### 方案 B：全局 Worker 进程隔离与信箱对等协作模式
+* **优点**：
+  * 支持多 Agent 并行同时修改多个文件，效率极高，适合超大工程协作。
+* **缺点**：
+  * 架构及其繁重，需要实现跨进程调度、文件锁与冲突合并，以及复杂的异步信箱机制，对于轻量 Coding Agent 而言开发成本和运行时负担过大。
+
+---
+
+## ⚠️ 常见陷阱
+
+### 1. 只读属性 `is_sub_agent` 的赋值错误
+* **陷阱**：如果在子代理的构造阶段，直接尝试使用 `self.is_sub_agent = True` 进行状态标识，Python 会抛出 `AttributeError: can't set attribute` 错误导致初始化失败。
+* **解决方案**：记住在 Python 中带有 `@property` 装饰器的函数都是只读的。我们必须将真实状态存储在 `self.config` 中，并在 property 函数中通过 `return self.config.is_sub_agent` 来提供读取接口。
+
+### 2. 子代理未继承 `api_base`
+* **陷阱**：如果学员在实现子代理实例化时，遗漏了 `api_base` 的透传，当用户通过中转节点（如 `aihubmix.com`）使用自定义 OpenAI 后端运行 `mini-claude` 时，子代理在后台会被直接路由至官方向外请求，导致服务阻断。
+* **解决方案**：实例化时务必增加以下继承：`api_base=str(self._openai_client.base_url) if self.use_openai else None`。
+
+---
+
+## ✅ 验收点
+
+### 1. 验证内置只读子代理启动
+* **输入指令**：
+  ```bash
+  mini-claude-py "我想修改 tools.py 中的一个注释。在此之前，请先用 explore 子代理在 python 目录搜索 tools.py，看看它目前有哪些工具定义"
+  ```
+* **预期效果**：
+  1. 控制台流式输出中，会显示带紫色边框的 `┌─ Sub-agent [explore]: search tools.py` 字样。
+  2. 子代理只读运行，通过 `grep_search` 获取结果后关闭并输出 `Sub-agent completed`。
+  3. 主代理汇总信息并给用户呈现最终结果。
+
+### 2. 验证子代理写操作拦截
+* **测试用例**：
+  给子代理发送任务，明确要求其修改某个代码文件，例如：“用 general 子代理修改 README.md 文件并追加一句话”。
+* **预期效果**：
+  1. 如果指定启动的是 `explore` 或 `plan` 类型的子代理，底层的写操作在权限阶段直接被物理拦截，向模型返回只读错误。
+  2. 主代理获得子代理返回的“操作被拒绝”的错误信息，并向用户报告任务失败及原因。
+
+---
+
+## 🧠 思考题
+
+1. **如果在 Plan Mode (规划模式) 下，用户批准了清空历史并执行（Clear + Execute），此时主 Agent 派生出的通用子 Agent（General Sub-Agent），能不能绕过只读限制去修改代码？**
+   *(提示：关注 `permission_mode="plan" if self.config.permission_mode == "plan" else "bypassPermissions"` 这一行逻辑)*
+
+2. **为什么在 `subagent.py` 的 `get_sub_agent_config` 函数中，我们从 `general` 代理的可用工具集中特意排除了 `agent` 工具？如果不排除，可能会发生什么？**
+
+---
+
+## 📦 本节收获
+
+* **Fork-Return 控制流**：学会了如何在同一个类（`Agent`）下通过属性覆盖和输出拦截实现快速的轻量级子进程分叉与回收。
+* **隔离上下文**：理解了在复杂工程项目中，利用子代理实现“局部信息探索 -> 文本摘要提炼 -> 回传主模型”来节省核心上下文空间的高级玩法。
+* **安全沙箱继承**：掌握了在多级智能体系统下，如何通过传递配置项在子智能体中延续父智能体的安全与只读限制。
+
+---
+
+> **下一章**：现在 Agent 具备了独立派生并隔离控制子代理的能力。下一步我们将扩展其工具使用边界，使 Agent 无需修改源码便能连接外部的丰富服务生态——构建基于 Stdio 的 MCP（Model Context Protocol）连接客户端。

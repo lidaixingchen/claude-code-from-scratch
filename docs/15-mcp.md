@@ -1,8 +1,8 @@
-# 12. MCP 集成
+# 第 15 课：MCP 集成 (Model Context Protocol)
 
-## 本章目标
+## 🎯 本节目标
 
-让 Agent 动态加载外部工具——连接数据库、Slack、GitHub 等服务，声明一个服务器地址即可，不改源码。
+为 Agent 实现 **MCP（Model Context Protocol，模型上下文协议）客户端**：MCP 是 Anthropic 推出的开放协议。通过该协议，Agent 无需修改底层源码，便能通过外部工具服务器（MCP Server）动态连接各种第三方服务（如本地文件系统、SQLite 数据库、GitHub、Slack 等）。我们将不依赖任何外部 SDK，直接利用 Python 底层子进程与标准 JSON-RPC 协议手写一个 stdio 传输通道，实现配置加载、握手协商、工具自动发现与运行时透明路由分发。
 
 ```mermaid
 graph TB
@@ -21,156 +21,487 @@ graph TB
     style Agent fill:#e8e0ff
 ```
 
-核心思路：**spawn 子进程 → JSON-RPC 握手 → 发现工具 → 前缀注册 → 透明路由**。对 Agent Loop 来说，MCP 工具和内置工具没有区别——都是名字 + schema + 执行函数。
+---
 
-## Claude Code 怎么做的
+## 🏆 最终效果
 
-MCP（Model Context Protocol）是 Anthropic 发布的开放协议，用于连接 AI 助手与外部工具。Claude Code 的 MCP 实现有以下要点：
+完成本节课的开发后，学员可以配置一个本地文件系统 MCP 服务来进行测试。
 
-**配置发现**：从 `settings.json`（用户级、项目级）和 `.mcp.json`（项目根目录）三处读取服务器配置，优先级后读覆盖先读。企业级还支持 MDM 策略下发。
-
-**传输协议**：支持 stdio（子进程通信）和 SSE（HTTP 长连接）两种传输方式。stdio 是主流，SSE 用于远程服务。
-
-**工具命名**：所有 MCP 工具以 `mcp__serverName__toolName` 格式注册，三段式命名同时解决了命名冲突和路由问题——从名字就能知道该转发到哪个服务器。
-
-**连接生命周期**：spawn 进程 → `initialize` 握手（交换版本和能力）→ `notifications/initialized` 确认 → `tools/list` 发现工具 → 就绪。初始化和工具发现各有 15 秒超时。
-
-**动态刷新**：Claude Code 支持运行时重新发现工具（服务器可以通知客户端工具列表已变更），我们简化为一次性发现。
-
-**SDK 依赖**：Claude Code 使用 `@anthropic-ai/sdk` 内置的 MCP 客户端，封装了 JSON-RPC 细节。我们直接实现原始 JSON-RPC，不依赖任何 MCP SDK。
-
-## 配置格式
-
-用户只需在配置文件中声明 MCP 服务器，Agent 启动时自动连接：
-
+### 1. 声明服务器配置文件
+在当前项目根目录创建 `.mcp.json`：
 ```json
-// ~/.claude/settings.json（用户级）或 .claude/settings.json（项目级）
 {
   "mcpServers": {
     "filesystem": {
       "command": "npx",
-      "args": ["@modelcontextprotocol/server-filesystem", "/tmp"],
-      "env": {}
-    },
-    "github": {
-      "command": "npx",
-      "args": ["@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_TOKEN": "ghp_xxx"
-      }
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "e:/project/claude-code-from-scratch/test"]
     }
   }
 }
 ```
 
-也可以使用项目根目录的 `.mcp.json`，格式相同。三处配置的服务器合并后一起连接，同名服务器后读覆盖先读。
+### 2. 自动建立连接与发现工具
+启动 `mini-claude-py` 时，控制台打印出握手与工具加载信息：
+```
+[mcp] Connected to 'filesystem' — 9 tools
+  Mini Claude Code — A minimal coding agent
+> 
+```
 
-## 我们的实现
-
-用 **~266 行** 的 `mcp.ts` 实现完整的 MCP 客户端，无任何 SDK 依赖。
-
-| Claude Code | 我们的实现 | 简化原因 |
-|-------------|-----------|---------|
-| `@anthropic-ai/sdk` MCP 客户端 | 原始 JSON-RPC（~100 行） | 无 SDK 依赖，读者能看到协议细节 |
-| stdio + SSE 两种传输 | 仅 stdio | stdio 覆盖 95% 场景 |
-| 动态工具刷新 | 一次性发现 | 教程场景不需要热更新 |
-| 企业策略 + 3 种配置源 | settings.json + .mcp.json | 去掉企业级配置 |
-| 重试 + 降级 | 静默跳过失败服务器 | 简化错误处理 |
-
-## 关键代码
-
-### 1. MCP 连接 — `McpConnection` 类
-
-每个 MCP 服务器对应一个 `McpConnection` 实例，负责子进程管理和 JSON-RPC 通信。
-
-三个关键状态：`process` 是子进程句柄，`pending` 是请求-响应关联表（id → Promise），`rl` 是 readline 实例用于按行解析 JSON-RPC。
-
-#### 连接与消息解析
-
-stdio 模式的核心：子进程的 stdin/stdout 作为双向通信通道，每行一个 JSON-RPC 消息。`pending` Map 用自增 id 关联请求和响应——发送时存入 Promise，收到响应时 resolve 或 reject。
-
-#### 请求与通知
-
-JSON-RPC 有两种消息：**请求**（有 id，期望响应）和**通知**（无 id，发后不管）。
-
-区别只在有无 `id` 字段。有 `id` 的消息写入 `pending` 等待配对；无 `id` 的直接写入 stdin 就结束。
-
-#### 握手、发现、调用
-
-三步标准流程：`initialize`（版本协商）→ `listTools`（工具发现）→ `callTool`（执行调用）。MCP 协议要求 `initialize` 之后必须发 `notifications/initialized` 通知，告诉服务器客户端准备就绪。
-
-`callTool` 的返回值处理值得注意：MCP 返回 `{ content: [{ type: "text", text: "..." }] }` 格式，我们只提取 `text` 类型的内容拼接返回——图片等其他类型暂不处理。
-
-### 2. MCP 管理器 — `McpManager` 类
-
-管理所有 MCP 连接的生命周期，对外提供统一接口。
-
-#### 配置加载
-
-三处配置依次读取、合并，同名服务器后读覆盖先读。`raw.mcpServers || raw` 这行兼容两种格式：`settings.json` 的 `mcpServers` 嵌套结构和 `.mcp.json` 的扁平结构。
-
-#### 连接与发现
-
-`Promise.race` 配合 `setTimeout` 实现超时。为什么是 15 秒？MCP 服务器常用 `npx` 启动，首次运行需要下载包，但也不应该无限等待。每个服务器独立连接，一个失败不影响其他。
-
-#### 工具定义转换
-
-关键操作：把 MCP 原始工具名转换成三段式前缀名。`filesystem` 服务器的 `read_file` 工具变成 `mcp__filesystem__read_file`。返回的格式直接符合 Anthropic API 的 tool 定义规范，可以直接拼接到工具列表里。
-
-#### 路由与调用
-
-路由逻辑非常简洁：从前缀名中拆出服务器名和工具名，找到对应连接，转发调用。`parts.slice(2).join("__")` 处理工具名本身可能包含 `__` 的情况（虽然罕见，但协议不禁止）。
-
-### 3. Agent 集成
-
-MCP 对 Agent Loop 的侵入极小——只有两处改动。
-
-#### 首次 chat 时懒加载
-
-三个设计决策：
-
-1. **懒加载**（首次 chat 时，而非构造函数里）：用户可能只是想问个快问题，不需要付 MCP 连接的启动成本
-2. **只在主 Agent 加载**：子 Agent 继承主 Agent 的工具列表，不需要重复连接
-3. **失败不崩溃**：MCP 连接失败只输出日志，Agent 继续用内置工具工作
-
-#### 工具调用路由
-
-一行 `if` 判断，一行转发调用。MCP 工具对 Agent Loop 来说完全透明——模型看到的是 `mcp__filesystem__read_file`，发出 tool_use 调用，得到文本结果，跟内置工具没有任何区别。
-
-## 关键设计决策
-
-### 为什么用 JSON-RPC over stdio 而不是 HTTP？
-
-stdio 的优势是**零配置**：不需要端口管理、不需要发现服务、进程生命周期自动绑定到父进程。子进程退出时所有 pending 请求自动 reject，不存在连接泄漏。HTTP 方案需要处理端口冲突、进程发现、心跳检测，复杂度高一个数量级。
-
-### 为什么用三段式前缀名（`mcp__server__tool`）？
-
-一个名字同时解决两个问题：**避免冲突**（不同服务器可能有同名工具）和**嵌入路由信息**（从名字直接提取服务器名，无需额外映射表）。Claude Code 用完全相同的命名方案。
-
-### 为什么 15 秒超时？
-
-MCP 服务器常用 `npx` 启动，首次运行需要下载 npm 包，通常需要 3-8 秒。15 秒足够覆盖大多数情况，但不至于让用户等太久。超时后静默跳过该服务器，Agent 继续用其他可用工具工作。
-
-### 为什么懒连接（首次 chat 时而非启动时）？
-
-用户可能启动 Agent 只是想问一句"这个函数是什么意思"，根本用不到 MCP 工具。懒连接让这种场景零开销。代价是第一次需要 MCP 工具时会有几秒延迟，但只发生一次。
-
-### 为什么不用 MCP SDK？
-
-`@anthropic-ai/sdk` 提供了 MCP 客户端封装，但直接用原始 JSON-RPC 有两个好处：**零依赖**（不增加包体积）和**教学价值**（读者能看到协议的完整细节，理解 MCP 到底在做什么）。整个 JSON-RPC 通信只有 ~60 行代码，足够简单。
-
-## 简化对比
-
-| 维度 | Claude Code | mini-claude |
-|------|------------|-------------|
-| MCP SDK | `@anthropic-ai/sdk` 内置客户端 | 原始 JSON-RPC（无 SDK 依赖） |
-| 服务器协议 | stdio + SSE | 仅 stdio |
-| 工具发现 | 动态刷新（服务器可通知变更） | 一次性发现 |
-| 配置来源 | settings.json + .mcp.json + 企业策略 | settings.json + .mcp.json |
-| 错误处理 | 重试 + 降级 | 静默跳过失败服务器 |
-| 连接时机 | 首次 chat 时懒加载 | 首次 chat 时懒加载 |
-| 子 Agent 支持 | 独立 MCP 连接 | 主 Agent 专属，子 Agent 不连接 |
+### 3. 透明调用外部工具
+向大模型发送请求：“读取 test 目录下的 sample.txt 文件”。
+主大模型在后台会翻译为以下调用：
+```
+[mcp__filesystem__read_file] { "path": "e:/project/claude-code-from-scratch/test/sample.txt" }
+```
+`McpManager` 拦截调用，并将其转化为标准 JSON-RPC 消息经 `stdio` 管道发往 `filesystem` 进程。子进程执行后返回文本，Agent 成功读取并呈现给用户。对于主 Agent 逻辑来说，MCP 工具与内置工具无任何使用差异。
 
 ---
 
-> **下一章**：如何验证整个系统是否正确工作——测试与调试。
+## 🛠️ 本节任务
+
+- **任务 1**：在 `mcp_client.py` 中编写 `McpConnection` 类，利用 `asyncio.create_subprocess_exec` 派生服务器子进程，并设计 `asyncio.Future` 实现双向 JSON-RPC 的请求与响应配对机制。
+- **任务 2**：在 `McpConnection` 中编写初始化握手 `initialize`、获取工具列表 `list_tools` 以及工具执行调用 `call_tool` 方法。
+- **任务 3**：在 `mcp_client.py` 中编写 `McpManager` 类，负责合并读取多路径的 settings/mcp 配置，并提供路由派发 `call_tool` 与工具前缀注册功能。
+- **任务 4**：在 `agent.py` 的初始化阶段声明 `McpManager` 实例，并在首次 `chat` 消息进入时进行**延迟懒加载**连接与工具发现。
+- **任务 5**：在 `agent.py` 的 `_execute_tool_call` 工具分发逻辑中，拦截 `mcp__` 前缀的工具调用并路由至 `McpManager` 进行执行。
+
+---
+
+## 📦 涉及文件
+
+修改或创建：
+- [python/mini_claude/mcp_client.py](file:///e:/project/claude-code-from-scratch/python/mini_claude/mcp_client.py)
+- [python/mini_claude/agent.py](file:///e:/project/claude-code-from-scratch/python/mini_claude/agent.py)
+
+---
+
+## 🚀 开始实现
+
+### 步骤 1：利用 `asyncio.subprocess` 实现 `McpConnection` 子进程管道与消息配对
+
+#### 为什么做
+stdio 模式是 MCP 协议最通用的传输机制。我们需要 spawn 外部进程，通过往子进程的 `stdin` 管道写入单行 JSON 字符串发起调用，并在后台用异步循环不间断读取 `stdout` 输出行。
+由于请求与响应在 stdio 流中是异步交错的，我们需要使用一个自增 id 与 Python `asyncio.Future` 对象组合，在收到响应行时精确 resolve 挂起的请求。
+
+#### 做什么
+创建 [python/mini_claude/mcp_client.py](file:///e:/project/claude-code-from-scratch/python/mini_claude/mcp_client.py)，编写子进程管道建立与 JSON-RPC 消息后台读取循环：
+
+```python
+# python/mini_claude/mcp_client.py
+
+import asyncio
+import json
+import os
+import subprocess
+from pathlib import Path
+from typing import Any
+
+class McpConnection:
+    """管理单个 MCP 服务器子进程及 stdio 上的 JSON-RPC 通信。"""
+
+    def __init__(self, server_name: str, command: str, args: list[str] | None = None,
+                 env: dict[str, str] | None = None):
+        self.server_name = server_name
+        self.command = command
+        self.args = args or []
+        self.env = env or {}
+        self._process: asyncio.subprocess.Process | None = None
+        self._next_id = 1
+        self._pending: dict[int, asyncio.Future] = {}  # 挂起的请求 id -> Future
+        self._reader_task: asyncio.Task | None = None
+
+    async def connect(self) -> None:
+        """派生服务器子进程并监听其输出。"""
+        merged_env = {**os.environ, **self.env}
+        self._process = await asyncio.create_subprocess_exec(
+            self.command, *self.args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=merged_env,
+        )
+        # 启动后台异步任务循环读取 stdout 行
+        self._reader_task = asyncio.create_task(self._read_loop())
+
+    async def _read_loop(self) -> None:
+        """后台异步循环：按行解析 stdio 返回并激活 Future。"""
+        assert self._process and self._process.stdout
+        while True:
+            line = await self._process.stdout.readline()
+            if not line:
+                break
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            
+            msg_id = msg.get("id")
+            if msg_id is not None and msg_id in self._pending:
+                fut = self._pending.pop(msg_id)
+                if "error" in msg:
+                    e = msg["error"]
+                    fut.set_exception(
+                        RuntimeError(f"MCP error {e.get('code')}: {e.get('message')}")
+                    )
+                else:
+                    fut.set_result(msg.get("result"))
+
+    async def _send_request(self, method: str, params: dict | None = None) -> Any:
+        """发送 JSON-RPC 请求并挂起协程等待响应。"""
+        assert self._process and self._process.stdin
+        req_id = self._next_id
+        self._next_id += 1
+        msg = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}})
+        self._process.stdin.write((msg + "\n").encode())
+        await self._process.stdin.drain()
+        
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending[req_id] = fut
+        return await fut
+
+    def _send_notification(self, method: str, params: dict | None = None) -> None:
+        """发送 JSON-RPC 通知消息（无 id，不期望响应）。"""
+        if not self._process or not self._process.stdin:
+            return
+        msg = json.dumps({"jsonrpc": "2.0", "method": method, "params": params or {}})
+        self._process.stdin.write((msg + "\n").encode())
+```
+
+#### 注意什么
+`stdin.write` 后面必须增加 `(msg + "\n").encode()` 并调用 `await stdin.drain()`。因为子进程是按行（readline）解析的，如果没有换行符，子进程会一直处于等待输入的阻塞状态，导致请求超时挂起。
+
+---
+
+### 步骤 2：在 `McpConnection` 中编写初始化握手与发现调用逻辑
+
+#### 为什么做
+MCP 协议是标准的客户端/服务端结构。连接建立后，我们首先要完成握手流程：发送 `initialize` 协商协议版本，并紧接着发送 `notifications/initialized` 通知告诉服务端连接成功；随后通过 `tools/list` 获取服务端提供的工具 Schema，并封装工具执行调用函数。
+
+#### 做什么
+在 `McpConnection` 中编写握手协议、工具发现与远程调用的具体实现：
+
+```python
+# python/mini_claude/mcp_client.py -> McpConnection 内部
+
+    async def initialize(self) -> None:
+        """完成 MCP 协议初始化握手。"""
+        await self._send_request("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "mini-claude", "version": "1.0.0"},
+        })
+        # 握手成功后必须发送通知以完成最终确认
+        self._send_notification("notifications/initialized")
+
+    async def list_tools(self) -> list[dict]:
+        """向服务端请求发现所有可用工具 Schema。"""
+        result = await self._send_request("tools/list")
+        if not result or not isinstance(result.get("tools"), list):
+            return []
+        return [
+            {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "inputSchema": t.get("inputSchema"),
+                "serverName": self.server_name,
+            }
+            for t in result["tools"]
+        ]
+
+    async def call_tool(self, name: str, args: dict) -> str:
+        """路由调用远程工具，并提取其中的 text 内容返回。"""
+        result = await self._send_request("tools/call", {"name": name, "arguments": args})
+        if isinstance(result, dict) and isinstance(result.get("content"), list):
+            # 拼接文本结果块，过滤掉非文本流
+            return "\n".join(
+                c["text"] for c in result["content"] if c.get("type") == "text"
+            )
+        return json.dumps(result)
+
+    def close(self) -> None:
+        """关闭子进程，释放连接资源。"""
+        if self._reader_task:
+            self._reader_task.cancel()
+            self._reader_task = None
+        if self._process:
+            try:
+                self._process.kill()
+            except ProcessLookupError:
+                pass
+            self._process = None
+        # 将所有挂起等待响应的 Futures 异常 reject，防止悬空
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(RuntimeError(f"MCP server '{self.server_name}' closed"))
+        self._pending.clear()
+```
+
+#### 注意什么
+在 `call_tool` 的数据提取中，我们使用了 `c["text"] for c in result["content"] if c.get("type") == "text"`。这是因为 MCP 工具执行可能会返回包含多媒体、图片、文件等复杂格式的数据块，为了防止 Agent 收到乱码或无法理解的流，我们只提取文本类型进行拼接。
+
+---
+
+### 步骤 3：编写 `McpManager` 统一管理器与多路径配置合并
+
+#### 为什么做
+用户可能会同时在多个地方配置不同的服务器（用户级的全局配置 `~/.claude/settings.json`、项目级的 `.claude/settings.json` 以及 `.mcp.json`）。我们需要在启动时，依次读取这些路径并将它们合并（同名服务器后读覆盖先读），为每个服务器建立 `McpConnection` 连接，并将发现的工具名统一添加 `mcp__serverName__toolName` 前缀返回，从而规避命名冲突并嵌入路由信息。
+
+#### 做什么
+在 `python/mini_claude/mcp_client.py` 中编写 `McpManager` 类：
+
+```python
+# python/mini_claude/mcp_client.py
+
+class McpManager:
+    """管理所有配置的 MCP 服务生命周期与工具分发路由。"""
+
+    def __init__(self):
+        self._connections: dict[str, McpConnection] = {}
+        self._tools: list[dict] = []
+        self._connected = False
+
+    async def load_and_connect(self) -> None:
+        """解析并合并多地配置文件，异步启动每个服务器的连接并发现工具。"""
+        if self._connected:
+            return
+        self._connected = True
+
+        configs = self._load_configs()
+        if not configs:
+            return
+
+        timeout = 15.0  # 15秒握手超时
+
+        for name, cfg in configs.items():
+            conn = McpConnection(name, cfg["command"], cfg.get("args"), cfg.get("env"))
+            try:
+                await conn.connect()
+                # 使用 wait_for 控制握手与发现超时，防御卡死
+                await asyncio.wait_for(conn.initialize(), timeout=timeout)
+                server_tools = await asyncio.wait_for(conn.list_tools(), timeout=timeout)
+                self._connections[name] = conn
+                self._tools.extend(server_tools)
+                print(f"[mcp] Connected to '{name}' — {len(server_tools)} tools", flush=True)
+            except Exception as e:
+                print(f"[mcp] Failed to connect to '{name}': {e}", flush=True)
+                conn.close()
+
+    def get_tool_definitions(self) -> list[dict]:
+        """将发现的工具包装为 mcp__ 前缀形式，并返回标准的 Anthropic schema 定义。"""
+        return [
+            {
+                "name": f"mcp__{t['serverName']}__{t['name']}",
+                "description": t.get("description") or f"MCP tool {t['name']} from {t['serverName']}",
+                "input_schema": t.get("inputSchema") or {"type": "object", "properties": {}},
+            }
+            for t in self._tools
+        ]
+
+    def is_mcp_tool(self, name: str) -> bool:
+        return name.startswith("mcp__")
+
+    async def call_tool(self, prefixed_name: str, args: dict) -> str:
+        """从三段式前缀工具名中拆分出服务器与工具名，分发执行。"""
+        parts = prefixed_name.split("__")
+        if len(parts) < 3:
+            raise ValueError(f"Invalid MCP tool name: {prefixed_name}")
+        server_name = parts[1]
+        tool_name = "__".join(parts[2:])
+        conn = self._connections.get(server_name)
+        if not conn:
+            raise RuntimeError(f"MCP server '{server_name}' not connected")
+        return await conn.call_tool(tool_name, args)
+
+    async def disconnect_all(self) -> None:
+        for conn in self._connections.values():
+            conn.close()
+        self._connections.clear()
+        self._tools.clear()
+        self._connected = False
+
+    def _load_configs(self) -> dict[str, dict]:
+        """合并多路径配置文件。"""
+        merged: dict[str, dict] = {}
+        # 1. 全局配置
+        self._merge_config_file(Path.home() / ".claude" / "settings.json", merged)
+        # 2. 本地项目配置
+        self._merge_config_file(Path.cwd() / ".claude" / "settings.json", merged)
+        # 3. .mcp.json 标准配置
+        self._merge_config_file(Path.cwd() / ".mcp.json", merged)
+        return merged
+
+    def _merge_config_file(self, path: Path, target: dict[str, dict]) -> None:
+        if not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text())
+            # 兼容 settings.json 的 mcpServers 结构和 .mcp.json 的扁平结构
+            servers = raw.get("mcpServers", raw)
+            for name, config in servers.items():
+                if isinstance(config, dict) and "command" in config:
+                    target[name] = config
+        except Exception:
+            pass
+```
+
+#### 注意什么
+在连接时，我们为握手与加载外加了 `asyncio.wait_for` 超限机制。这是因为很多 MCP Server 是使用 `npx` 启动的，如果本地首次运行需要去拉取远程包，可能网络不稳定导致进程挂起。如果不做超时保护，整个 Agent 启动阶段将会无限期卡死。
+
+---
+
+### 步骤 4：主 Agent 集成懒加载与发现注入
+
+#### 为什么做
+MCP 服务的启动需要付出子进程拉起的网络与算力开销。为了保障在简易单轮对话（如单纯闲聊）时获得极致的启动体验，我们采取**延迟懒加载（Lazy Load）**机制：只有在 Agent 收到第一条正式 `chat` 消息时，才去连接 MCP 服务并注入工具，且仅对主代理进行连接（子代理只管继承工具集，无需重复握手连接）。
+
+#### 做什么
+打开 `python/mini_claude/agent.py`。在 `Agent` 的初始化阶段声明管理器；并在 `chat` 方法开始前，以懒加载方式启动：
+
+```python
+# python/mini_claude/agent.py -> Agent.__init__()
+
+        # MCP 客户端初始化
+        self._mcp_manager = McpManager()
+        self._mcp_initialized = False
+```
+
+修改 `chat` 方法：
+
+```python
+# python/mini_claude/agent.py -> chat()
+
+    async def chat(self, user_message: str) -> None:
+        # 懒加载：首次触发 chat 且是主代理时连接 MCP 服务器并扩充工具集
+        if not self._mcp_initialized and not self.config.is_sub_agent:
+            self._mcp_initialized = True
+            try:
+                await self._mcp_manager.load_and_connect()
+                mcp_defs = self._mcp_manager.get_tool_definitions()
+                if mcp_defs:
+                    # 追加外部工具到 Agent 自带的内置工具列表中
+                    self.tools = self.tools + mcp_defs
+            except Exception as e:
+                logger.warning(f"MCP init failed: {e}")
+
+        # ... 后续 chat openai/anthropic 流程 ...
+```
+
+#### 注意什么
+`is_sub_agent` 的判断非常关键。子代理本身运行在局部上下文中，其工具配置直接继承自父级，如果不加 `not self.config.is_sub_agent`，子代理会再次触发配置文件合并读取与子进程 spawn，导致系统进程暴涨和通信死锁。
+
+---
+
+### 步骤 5：在工具分发器中集成路由分派
+
+#### 为什么做
+当大模型在 API 响应中返回了形如 `mcp__filesystem__read_file` 的工具调用请求时，该工具并不存在于我们本地定义的 `execute_tool` Python 逻辑中。我们需要在分发层前置判定前缀，并将其切分路由转发给 `McpManager` 实际派发通信。
+
+#### 做什么
+打开 `python/mini_claude/agent.py`，定位至核心工具调用执行路由函数 `_execute_tool_call`，在其它逻辑分派前，增加 MCP 分支判定：
+
+```python
+# python/mini_claude/agent.py -> _execute_tool_call()
+
+    async def _execute_tool_call(self, name: str, inp: dict) -> str:
+        if name in ("enter_plan_mode", "exit_plan_mode"):
+            return await self._execute_plan_mode_tool(name)
+        if name == "agent":
+            return await self._execute_agent_tool(inp)
+        if name == "skill":
+            return await self._execute_skill_tool(inp)
+            
+        # 拦截所有带 mcp__ 前缀的外部工具调用，转发路由
+        if self._mcp_manager.is_mcp_tool(name):
+            return await self._mcp_manager.call_tool(name, inp)
+            
+        return await execute_tool(name, inp, self.state.read_file_state)
+```
+
+#### 注意什么
+由于 MCP 外部工具返回的结果已经在 `call_tool` 层提取为了干净的字符串，此处只需直接 return 即可。
+
+---
+
+## ⚖️ 设计权衡
+
+### 方案 A：基于 `stdio` 传输的子进程通信管道（本节采用）
+* **优点**：
+  1. **零管理开销**：不需要处理复杂的网络端口监听、防火墙放行、端口冲突以及网络握手。
+  2. **生命周期天然绑定**：子进程与主 Python 进程生命周期一致。父进程崩溃时，操作系统会自动关闭子进程，绝不会造成服务器僵尸进程泄漏。
+* **缺点**：
+  * 只适用于本地开发环境，无法直接连通分布在远程服务器上的 MCP 节点。
+
+### 方案 B：基于 `HTTP SSE` 的远程长连接
+* **优点**：
+  * 可以轻松连接云端、微服务化部署或由 SaaS 托管的中心化 MCP 工具服务器，极大扩展了工具获取边界。
+* **缺点**：
+  * 架构变得异常繁重，每个服务器连接需要网络探活、重连指数退避、身份鉴权，并需要面临复杂的网络时延和端口冲突问题。
+
+### 结论
+在 Coding Agent 构建的场景中，**“基于 stdio 的子进程”是最佳选择**。它几乎覆盖了本地调试、脚本调用和常规 MCP 应用 95% 以上的需求，且零端口开销。
+
+---
+
+## ⚠️ 常见陷阱
+
+### 1. initialize 握手后遗漏发送 initialized 通知
+* **陷阱**：在 JSON-RPC 调用 initialize 得到服务器返回后，有些学员认为已经得到了服务器信息就直接调用 listTools，结果程序直接超时挂起。这是因为 MCP 服务器遵循严格的状态机：在 initialize 之后必须给它发送一个无 id 的 `notifications/initialized` 通知以宣布握手就绪，否则一些严格遵照 MCP 协议规范的服务器（例如 filesystem 服务器）会选择拒绝后续的任何 Tools 请求。
+* **解决方案**：确保在 initialize 请求 resolve 后立即调用 `self._send_notification("notifications/initialized")`。
+
+### 2. 子进程 `stdout` 缓冲区死锁
+* **陷阱**：如果使用常规的进程 `stdout.read()` 且数据量特别大，一旦缓冲区填满而我们没有及时将其读取出来，子进程会直接停止写入，导致整个通信陷入相互等待的死锁状态。
+* **解决方案**：在 connect 时，在独立后台协程任务中启动 `create_task(self._read_loop())`，通过 `await stdout.readline()` 按行高频消费缓冲区，确保 stdio 传输始终畅通。
+
+---
+
+## ✅ 验收点
+
+### 1. 配置并启动本地 Filesystem 服务器
+* **步骤 1**：在项目根目录创建 `.mcp.json`，写入 filesystem 节点：
+  ```json
+  {
+    "mcpServers": {
+      "filesystem": {
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "e:/project/claude-code-from-scratch/test"]
+      }
+    }
+  }
+  ```
+  *(注：确保 test 目录存在且在其下新建一个包含文本的文件如 `test_file.txt`)*
+
+* **步骤 2**：运行启动：`mini-claude-py`
+* **预期效果**：控制台正确输出连接日志 `[mcp] Connected to 'filesystem' — 9 tools`。
+
+### 2. 验证工具发现与调用
+* **输入指令**：
+  ```
+  读取 test_file.txt 文件内容
+  ```
+* **预期效果**：
+  1. 主大模型在控制台调用：
+     `[mcp__filesystem__read_file] { "path": "e:/project/claude-code-from-scratch/test/test_file.txt" }`
+  2. 控制台顺利打印出文件内的真实文本，Agent 执行成功。
+
+---
+
+## 🧠 思考题
+
+1. **为什么我们在 `McpConnection.connect` 方法中使用 `asyncio.create_subprocess_exec`，而不是 Python 传统的 `subprocess.Popen`？它们在底层对待异步非阻塞 IO 的方式有什么不同？**
+   *(提示：这与 asyncio 的事件循环如何对进程 stdout 描述符进行 IO 多路复用监听有关)*
+
+2. **如果用户在项目级 `.mcp.json` 中配置了一个需要运行 npm 包的安全等级未知的外部服务器，该服务器具有写权限，这是否会引入安全漏洞？我们的 `check_permission` 对此该如何设计防御？**
+
+---
+
+## 📦 本节收获
+
+* **原生 JSON-RPC 消息配对**：在不引用任何臃肿库的情况下，掌握了在 Python 协程环境下运用 `asyncio.Future` 对无序异步 stdio 通信流进行精准同步配对请求的黑科技。
+* **双向 stdio 传输机制**：理解了子进程 `stdin.write`、换行符缓冲消耗与 `drain()` 之间的配合原理，彻底规避了子进程管道卡死地带。
+* **动态工具前缀路由**：学会了利用 `mcp__server__tool` 三段式命名规范同时解决命名污染与路由转发的设计范式。
+
+---
+
+> **下一章**：现在整个 coding agent 的核心功能和外部扩展接口已经全部就绪。在将它正式投入日常生产开发之前，我们需要确保它的运行质量与行为预期——构建系统的测试与调试体系。

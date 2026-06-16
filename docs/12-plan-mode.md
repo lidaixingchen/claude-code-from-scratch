@@ -1,8 +1,8 @@
-# 10. Plan Mode：只读规划模式
+# 第 12 课：只读规划模式 (Plan Mode)
 
-## 本章目标
+## 🎯 本节目标
 
-实现 Plan Mode：让 Agent 先制定计划再执行，避免盲目修改代码。包含模式切换、plan 文件持久化、权限联动和 4 选项审批工作流。
+为 Agent 实现 **Plan Mode (只读规划模式)**：使 Agent 在开始修改代码前，先进入只读沙箱状态探索代码结构、设计实现思路，并增量地将执行方案写入磁盘上的 plan 描述文件。在经用户交互审批后，切换回正常修改状态执行修改。这不仅可以减少盲目修改导致的 API 上下文爆栈，也能给用户提供明确的安全与方案确认机制。
 
 ```mermaid
 graph TB
@@ -25,352 +25,462 @@ graph TB
     style Manual fill:#ffe0e0
 ```
 
-## Claude Code 怎么做的
+---
 
-Claude Code 的 Plan Mode 是完整的 EnterPlanMode / ExitPlanMode 工具对：
+## 🏆 最终效果
 
-1. **进入**：切换到 read-only 模式，生成 plan 文件（`~/.claude/plans/` 目录），注入 plan 系统提示约束 Agent 行为
-2. **规划**：Agent 用只读工具探索代码，将实现计划写入 plan 文件
-3. **退出**：Agent 调用 ExitPlanMode，用户看到计划后选择执行方式
-4. **审批**：用户选择清空上下文执行、保留上下文执行、手动审批执行、或继续修改
-
-关键设计：**Plan Mode 不是"不让 Agent 做事"，而是让 Agent 先想清楚再做**。plan 文件持久化到磁盘意味着即使清空上下文，计划也不会丢失——Agent 可以从零开始执行一个经过审批的方案。
-
-## 我们的实现
-
-### 工具定义
-
-Plan Mode 需要两个工具，标记为 `deferred`（延迟加载，详见[第 2 章](docs/02-tools.md)）：
-
-```python
-# tools.py — Plan Mode 工具定义
-
-{
-    "name": "enter_plan_mode",
-    "description": "Enter plan mode to switch to a read-only planning phase. ...",
-    "input_schema": {"type": "object", "properties": {}},
-    "deferred": True,
-},
-{
-    "name": "exit_plan_mode",
-    "description": "Exit plan mode after you have finished writing your plan to the plan file. ...",
-    "input_schema": {"type": "object", "properties": {}},
-    "deferred": True,
-},
+当学员完成本节课的代码实现后，可以运行：
+```bash
+mini-claude --plan "为当前项目添加一个新的辅助模块"
 ```
 
-两个工具都没有参数——进入和退出是纯状态切换，所有数据（plan 文件路径、审批结果）都在 Agent 内部管理。标记为 `deferred` 是因为大多数会话不需要 Plan Mode，延迟加载避免占用提示词空间。
+此时系统不会直接修改任何代码，而是触发以下交互流程：
+1. **自动切换为 plan 权限**：系统提示 `[INFO] Entered plan mode. Plan file: <Home>/.claude/plans/plan-<sessionId>.md`
+2. **只读运行与编写规划**：Agent 自主调用只读工具（如 `read_file`、`grep_search`）探索 codebase，并调用 `write_file`/`edit_file` 将设计规划增量写入专属的 `plan-<sessionId>.md`。任何非只读的写操作或 Shell 执行都会被底层拦截并报错提示 `Blocked in plan mode`。
+3. **自主退出与四选项审批**：Agent 编写完成后自动调用 `exit_plan_mode`，控制台展示其制定的规划内容，并挂起等待用户从四个选项中输入进行审批：
+   ```
+     ==================================================
+     PLAN FOR APPROVAL (plan-xxx.md)
+     ==================================================
+     # Plan Mode Active
+     ...（规划内容）...
 
-### 模式切换
+     Approval Options:
+       1. Clear history and execute (Clear context + acceptEdits)
+       2. Execute in current context (Keep context + acceptEdits)
+       3. Execute manually (Keep context + normal manual approval)
+       4. Keep planning (Provide feedback and continue editing plan)
 
-Plan Mode 涉及 4 个状态变量：
+     Enter choice (1-4): 
+   ```
+4. **决策分流执行**：如果用户选择 `1`，对话上下文历史会被清空以节省 Token 预算，系统切换回自动修改模式（`acceptEdits`），Agent 读取写在磁盘上的方案文件并高效地实施更改。
+
+---
+
+## 🛠️ 本节任务
+
+- **任务 1**：在 `tools.py` 中定义 `enter_plan_mode` 和 `exit_plan_mode` 这对延迟加载工具的 Schema。
+- **任务 2**：在 `tools.py` 的权限校验器 `check_permission` 中，为 `plan` 模式添加强制约束规则（只允许对 Plan 文件的写入，其余写入和 Shell 工具一律拦截）。
+- **任务 3**：在 `agent.py` 的 `AgentState` 中，声明 Plan Mode 运行时所需的配置与状态字段，更新 `AgentState` 结构。
+- **任务 4**：在 `agent.py` 中编写 `toggle_plan_mode` 权限/系统提示词切换逻辑，并编写 Plan Mode 激活时的专属系统提示词构造函数。
+- **任务 5**：在 `agent.py` 中编写 `_execute_plan_mode_tool` 函数，处理进入与退出 Plan Mode 工具的底层实现（包含调用用户交互审批回调、清空对话历史等）。
+- **任务 6**：在 `__main__.py` 中开发 CLI REPL 交互式的 4 选项审批交互，并将其作为回调函数注入到 Agent 实例中。
+
+---
+
+## 📦 涉及文件
+
+修改：
+- [python/mini_claude/tools.py](file:///e:/project/claude-code-from-scratch/python/mini_claude/tools.py)
+- [python/mini_claude/agent.py](file:///e:/project/claude-code-from-scratch/python/mini_claude/agent.py)
+- [python/mini_claude/__main__.py](file:///e:/project/claude-code-from-scratch/python/mini_claude/__main__.py)
+
+---
+
+## 🚀 开始实现
+
+### 步骤 1：在 `tools.py` 中定义 Plan Mode 工具对
+
+#### 为什么做
+Plan Mode 的启动与终止是由大模型决策并驱动的。我们需要向模型暴露 `enter_plan_mode` 和 `exit_plan_mode` 工具，让模型明白“规划”也是一个可执行的控制流节点。
+
+#### 做什么
+打开 `python/mini_claude/tools.py`，在工具列表 `DEFINED_TOOLS` 中声明这两个工具。我们将它们标记为 `"deferred": True`（延迟加载），以便在常规对话中不占用宝贵的 Prompt 空间：
 
 ```python
-# agent.py — Plan Mode 状态
+# python/mini_claude/tools.py
 
-self._pre_plan_mode: str | None = None      # 进入前的模式
-self._plan_file_path: str | None = None     # plan 文件路径
-self._base_system_prompt: str = ""           # 基础提示词
-self._context_cleared: bool = False          # 是否清空了上下文
+    {
+        "name": "enter_plan_mode",
+        "description": "Enter plan mode to switch to a read-only planning phase. In plan mode, you can only read files and write to the plan file.",
+        "input_schema": {"type": "object", "properties": {}},
+        "deferred": True,
+    },
+    {
+        "name": "exit_plan_mode",
+        "description": "Exit plan mode after you have finished writing your plan to the plan file.",
+        "input_schema": {"type": "object", "properties": {}},
+        "deferred": True,
+    },
 ```
 
-`prePlanMode` 是关键——它记住进入 Plan Mode 之前的权限模式，这样退出时可以精确恢复。如果用户之前是 `acceptEdits` 模式，退出 Plan Mode 后应该回到 `acceptEdits`，而不是变成 `default`。
+#### 注意什么
+`deferred` 标记是由我们在第 3 章和第 4 章实现的工具延迟加载逻辑来处理的，大模型在需要时会先通过 `tool_search` 唤醒并获取它们的详细 Schema。
 
-切换逻辑是对称的进入/退出：
+---
+
+### 步骤 2：在 `check_permission` 中实施只读规则校验
+
+#### 为什么做
+System Prompt 只是引导，为了防御大模型在 `plan` 模式下“越轨”修改代码或运行 Shell 命令，我们需要在底层的权限控制器中实施硬性拦截，构筑安全的只读沙箱。
+
+#### 做什么
+修改 `python/mini_claude/tools.py` 中的 `check_permission` 函数，在开始拦截规则中加入 `mode == "plan"` 的校验。唯一的例外是：允许 Agent 修改 **Plan 方案文件本身**：
 
 ```python
-# agent.py — toggle_plan_mode()
+# python/mini_claude/tools.py
 
-def toggle_plan_mode(self) -> str:
-    if self.permission_mode == "plan":
-        self.permission_mode = self._pre_plan_mode or "default"
-        self._pre_plan_mode = None
-        self._plan_file_path = None
-        self._system_prompt = self._base_system_prompt
-        if self.use_openai and self._openai_messages:
-            self._openai_messages[0]["content"] = self._system_prompt
-        print_info(f"Exited plan mode → {self.permission_mode} mode")
-        return self.permission_mode
-    else:
-        self._pre_plan_mode = self.permission_mode
-        self.permission_mode = "plan"
-        self._plan_file_path = self._generate_plan_file_path()
-        self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
-        if self.use_openai and self._openai_messages:
-            self._openai_messages[0]["content"] = self._system_prompt
-        print_info(f"Entered plan mode. Plan file: {self._plan_file_path}")
-        return "plan"
+def check_permission(
+    tool_name: str,
+    inp: dict,
+    mode: str = "default",
+    plan_file_path: str | None = None,
+) -> dict:
+    """Returns {"action": "allow"|"deny"|"confirm", "message": ...}"""
+    if mode == "bypassPermissions":
+        return {"action": "allow"}
+
+    rule_result = _check_permission_rules(tool_name, inp)
+    if rule_result == "deny":
+        return {"action": "deny", "message": f"Denied by permission rule for {tool_name}"}
+    if rule_result == "allow":
+        return {"action": "allow"}
+
+    # 1. 允许所有只读操作
+    if tool_name in READ_TOOLS:
+        return {"action": "allow"}
+
+    # 2. 如果在 plan 模式下，实行严格沙箱限制
+    if mode == "plan":
+        if tool_name in EDIT_TOOLS:
+            file_path = inp.get("file_path") or inp.get("path")
+            # 只有当写入路径是专属的 plan_file_path 时才允许写入
+            if plan_file_path and file_path == plan_file_path:
+                return {"action": "allow"}
+            return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
+        if tool_name == "run_shell":
+            return {"action": "deny", "message": "Shell commands blocked in plan mode"}
+
+    # 3. Plan Mode 工具本身允许执行切换
+    if tool_name in ("enter_plan_mode", "exit_plan_mode"):
+        return {"action": "allow"}
+
+    if mode == "acceptEdits" and tool_name in EDIT_TOOLS:
+        return {"action": "allow"}
+    
+    # ... 后续为 default/confirm 交互式权限逻辑
 ```
 
-注意系统提示词的更新方式：进入时在 `baseSystemPrompt` 后追加 plan 提示，退出时恢复为 `baseSystemPrompt`。对于 OpenAI 格式，需要直接修改消息数组的第一条（系统消息）。
+#### 注意什么
+校验 `EDIT_TOOLS` 时，我们必须兼容不同的入参参数键名（有些工具入参是 `file_path`，有些是 `path`），所以在比对时使用了 `inp.get("file_path") or inp.get("path")`。
 
-### Plan 文件与系统提示
+---
 
-Plan 文件路径按会话 ID 生成，确保每个会话有独立的 plan 文件：
+### 步骤 3：在 `agent.py` 中初始化 Plan Mode 状态字段
+
+#### 为什么做
+Plan Mode 的生命周期涉及跨轮对话的状态，例如：进入前的原始权限模式（以便退出后精确恢复）、Plan 文件的落盘路径、以及本次会话的历史上下文是否被用户清空过。
+
+#### 做什么
+打开 `python/mini_claude/agent.py`。在运行时状态类 `AgentState` 中，声明这三个关键字段：
 
 ```python
-# agent.py — Plan 文件生成
+# python/mini_claude/agent.py
 
-def _generate_plan_file_path(self) -> str:
-    d = Path.home() / ".claude" / "plans"
-    d.mkdir(parents=True, exist_ok=True)
-    return str(d / f"plan-{self.session_id}.md")
+@dataclass
+class AgentState:
+    """Mutable runtime state for an Agent instance."""
+    # ... 原有字段 ...
+    pre_plan_mode: str | None = None      # 记录进入 Plan 模式之前的权限状态
+    plan_file_path: str | None = None     # 磁盘上 Plan Markdown 文件的绝对路径
+    context_cleared: bool = False          # 标识本会话是否为了节省 Token 而执行过上下文清空
 ```
 
-Plan 系统提示注入了严格的 read-only 约束和工作流指引：
+同时，我们要在 `agent.py` 的 `Agent` 初始化构造阶段，判断如果启动配置中的 `permission_mode` 就是 `"plan"`，则立即计算并初始化好 Plan 路径并生成提示词：
 
 ```python
-# agent.py — _build_plan_mode_prompt()
+# python/mini_claude/agent.py -> Agent.__init__()
 
-def _build_plan_mode_prompt(self) -> str:
-    return f"""
+        # 如果初始化时便直接以 plan 模式运行，立即进行状态绑定与提示词注入
+        if self.config.permission_mode == "plan":
+            self.state.plan_file_path = self._generate_plan_file_path()
+            self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
+```
+
+#### 注意什么
+`pre_plan_mode` 极其重要，如果用户先是以 `--accept-edits` 启动，再切入切出 Plan Mode，我们应该恢复至 `acceptEdits` 而非回退到 `default`。
+
+---
+
+### 步骤 4：实现权限/系统提示词切换逻辑与提示词构造
+
+#### 为什么做
+进入 Plan Mode 时，我们需要动态地将专属的沙箱指引和磁盘 Plan 文件路径织入 System Prompt，并在此阶段对大模型下达不准擅自修改代码的终极指令。
+
+#### 做什么
+在 `python/mini_claude/agent.py` 中编写 `_generate_plan_file_path` 生成磁盘存储路径、`_build_plan_mode_prompt` 构造指引提示词，以及 `toggle_plan_mode` 状态切换函数：
+
+```python
+# python/mini_claude/agent.py
+
+    def _generate_plan_file_path(self) -> str:
+        d = Path.home() / ".claude" / "plans"
+        d.mkdir(parents=True, exist_ok=True)
+        return str(d / f"plan-{self.session_id}.md")
+
+    def _build_plan_mode_prompt(self) -> str:
+        return f"""
 
 # Plan Mode Active
 
-Plan mode is active. You MUST NOT make any edits (except the plan file below),
-run non-readonly tools, or make any changes to the system.
+Plan mode is active. You MUST NOT make any edits (except the plan file below), run non-readonly tools, or make any changes to the system.
 
-## Plan File: {self._plan_file_path}
-Write your plan incrementally to this file using write_file or edit_file.
-This is the ONLY file you are allowed to edit.
+## Plan File: {self.state.plan_file_path}
+Write your plan incrementally to this file using write_file or edit_file. This is the ONLY file you are allowed to edit.
 
 ## Workflow
 1. **Explore**: Read code to understand the task. Use read_file, list_files, grep_search.
-2. **Design**: Design your implementation approach.
+2. **Design**: Design your implementation approach. Use the agent tool with type="plan" if the task is complex.
 3. **Write Plan**: Write a structured plan to the plan file including:
    - **Context**: Why this change is needed
    - **Steps**: Implementation steps with critical file paths
    - **Verification**: How to test the changes
 4. **Exit**: Call exit_plan_mode when your plan is ready for user review.
 
-IMPORTANT: When your plan is complete, you MUST call exit_plan_mode.
-Do NOT ask the user to approve — exit_plan_mode handles that."""
-```
+IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask the user to approve — exit_plan_mode handles that."""
 
-这个提示词做了三件事：
-
-1. **约束行为**：明确禁止编辑和 shell（配合权限检查双重保障）
-2. **声明 plan 文件**：告诉模型唯一可写的文件路径
-3. **规定工作流**：Explore → Design → Write → Exit，确保模型不会跳步
-
-最后一句"Do NOT ask the user to approve"很重要——没有这句，模型经常会在写完计划后问"这个计划可以吗？"而不是调用 `exit_plan_mode`，导致审批流程无法触发。
-
-### 权限集成
-
-Plan Mode 的 read-only 约束通过 `checkPermission()` 强制执行（详见[第 6 章](docs/06-permissions.md)）：
-
-```python
-# tools.py — check_permission() 中的 Plan Mode 处理
-
-if mode == "plan":
-    if tool_name in EDIT_TOOLS:
-        file_path = inp.get("file_path") or inp.get("path")
-        if plan_file_path and file_path == plan_file_path:
-            return {"action": "allow"}
-        return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
-    if tool_name == "run_shell":
-        return {"action": "deny", "message": "Shell commands blocked in plan mode"}
-
-if tool_name in ("enter_plan_mode", "exit_plan_mode"):
-    return {"action": "allow"}
-```
-
-这里有一个精巧的设计：**plan 文件路径作为参数传入 `checkPermission()`**。当 Agent 试图写文件时，权限检查会比对目标路径和 plan 文件路径——只有完全匹配才放行。这意味着系统提示词说"只能写 plan 文件"不只是建议，而是代码强制执行的约束。
-
-双重保障：
-
-- **系统提示词**：引导模型不要尝试写其他文件（减少无效 API 调用）
-- **权限检查**：即使模型无视提示词，写操作也会被拦截并返回错误
-
-### 工具执行逻辑
-
-`executePlanModeTool()` 处理 `enter_plan_mode` 和 `exit_plan_mode` 的执行：
-
-```python
-# agent.py — _execute_plan_mode_tool()
-
-async def _execute_plan_mode_tool(self, name: str) -> str:
-    if name == "enter_plan_mode":
-        if self.permission_mode == "plan":
-            return "Already in plan mode."
-        self._pre_plan_mode = self.permission_mode
-        self.permission_mode = "plan"
-        self._plan_file_path = self._generate_plan_file_path()
-        self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
-        if self.use_openai and self._openai_messages:
-            self._openai_messages[0]["content"] = self._system_prompt
-        print_info("Entered plan mode (read-only). Plan file: " + self._plan_file_path)
-        return (
-            f"Entered plan mode. You are now in read-only mode.\n\n"
-            f"Your plan file: {self._plan_file_path}\n"
-            f"Write your plan to this file. This is the only file you can edit.\n\n"
-            f"When your plan is complete, call exit_plan_mode."
-        )
-
-    if name == "exit_plan_mode":
-        if self.permission_mode != "plan":
-            return "Not in plan mode."
-        plan_content = "(No plan file found)"
-        if self._plan_file_path and Path(self._plan_file_path).exists():
-            plan_content = Path(self._plan_file_path).read_text()
-
-        if self._plan_approval_fn:
-            result = await self._plan_approval_fn(plan_content)
-            choice = result.get("choice", "manual-execute")
-
-            if choice == "keep-planning":
-                feedback = result.get("feedback") or "Please revise the plan."
-                return (
-                    f"User rejected the plan and wants to keep planning.\n\n"
-                    f"User feedback: {feedback}\n\n"
-                    f"Please revise your plan based on this feedback. "
-                    f"When done, call exit_plan_mode again."
-                )
-
-            if choice in ("clear-and-execute", "execute"):
-                target_mode = "acceptEdits"
-            else:
-                target_mode = self._pre_plan_mode or "default"
-
-            self.permission_mode = target_mode
-            self._pre_plan_mode = None
-            saved_plan_path = self._plan_file_path
-            self._plan_file_path = None
+    def toggle_plan_mode(self) -> str:
+        if self.config.permission_mode == "plan":
+            # 恢复原权限模式
+            self.config.permission_mode = self.state.pre_plan_mode or "default"
+            self.state.pre_plan_mode = None
+            self.state.plan_file_path = None
             self._system_prompt = self._base_system_prompt
+            self.history.update_system_prompt(self._system_prompt)
+            print_info(f"Exited plan mode → {self.config.permission_mode} mode")
+            return self.config.permission_mode
+        else:
+            # 切入 Plan Mode
+            self.state.pre_plan_mode = self.config.permission_mode
+            self.config.permission_mode = "plan"
+            self.state.plan_file_path = self._generate_plan_file_path()
+            self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
+            self.history.update_system_prompt(self._system_prompt)
+            print_info(f"Entered plan mode. Plan file: {self.state.plan_file_path}")
+            return "plan"
+```
 
-            if choice == "clear-and-execute":
-                self._clear_history_keep_system()
-                self._context_cleared = True
-                print_info(f"Plan approved. Context cleared, executing in {target_mode} mode.")
+#### 注意什么
+提示词的最后一行 `Do NOT ask the user to approve` 是核心精髓。大模型倾向于在写完方案后向用户对话确认“您觉得这个方案行吗？”，而不是调用工具。这句强制指令能确保它调用 `exit_plan_mode` 来唤起系统的审批流。
+
+---
+
+### 步骤 5：实现 Plan Mode 工具执行与用户审批流处理
+
+#### 为什么做
+当模型完成方案撰写并调用 `exit_plan_mode` 时，我们需要从磁盘中把 Plan 的 Markdown 内容读出来，通过外部注册的回调展示给用户，并根据用户的选择（1. 清空上下文，2. 保留上下文，3. 手动模式，4. 重新规划）来进行分流逻辑处理。
+
+#### 做什么
+在 `python/mini_claude/agent.py` 的 `_execute_plan_mode_tool` 中，完整实现进入与退出的一系列分支判定逻辑：
+
+```python
+# python/mini_claude/agent.py
+
+    async def _execute_plan_mode_tool(self, name: str) -> str:
+        if name == "enter_plan_mode":
+            if self.config.permission_mode == "plan":
+                return "Already in plan mode."
+            self.state.pre_plan_mode = self.config.permission_mode
+            self.config.permission_mode = "plan"
+            self.state.plan_file_path = self._generate_plan_file_path()
+            self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
+            self.history.update_system_prompt(self._system_prompt)
+            print_info("Entered plan mode (read-only). Plan file: " + self.state.plan_file_path)
+            return (
+                f"Entered plan mode. You are now in read-only mode.\n\n"
+                f"Your plan file: {self.state.plan_file_path}\n"
+                f"Write your plan to this file. This is the only file you can edit.\n\n"
+                f"When your plan is complete, call exit_plan_mode."
+            )
+
+        if name == "exit_plan_mode":
+            if self.config.permission_mode != "plan":
+                return "Not in plan mode."
+            plan_content = "(No plan file found)"
+            if self.state.plan_file_path and Path(self.state.plan_file_path).exists():
+                plan_content = Path(self.state.plan_file_path).read_text()
+
+            # 如果注册了外部审批回调函数（多在 REPL 等交互场景）
+            if self._plan_approval_fn:
+                result = await self._plan_approval_fn(plan_content)
+                choice = result.get("choice", "manual-execute")
+
+                if choice == "keep-planning":
+                    feedback = result.get("feedback") or "Please revise the plan."
+                    return (
+                        f"User rejected the plan and wants to keep planning.\n\n"
+                        f"User feedback: {feedback}\n\n"
+                        f"Please revise your plan based on this feedback. When done, call exit_plan_mode again."
+                    )
+
+                # 用户同意方案，解析目标权限模式
+                if choice == "clear-and-execute":
+                    target_mode = "acceptEdits"
+                elif choice == "execute":
+                    target_mode = "acceptEdits"
+                else:  # manual-execute 选项
+                    target_mode = self.state.pre_plan_mode or "default"
+
+                # 切换出只读模式
+                self.config.permission_mode = target_mode
+                self.state.pre_plan_mode = None
+                saved_plan_path = self.state.plan_file_path
+                self.state.plan_file_path = None
+                self._system_prompt = self._base_system_prompt
+                self.history.update_system_prompt(self._system_prompt)
+
+                if choice == "clear-and-execute":
+                    # 清空冗长的对话历史，释放上下文空间，但保留最初的 System Prompt 引导
+                    self.history.clear(keep_system=True)
+                    self.state.context_cleared = True
+                    print_info(f"Plan approved. Context cleared, executing in {target_mode} mode.")
+                    return (
+                        f"User approved the plan. Context was cleared. Permission mode: {target_mode}\n\n"
+                        f"Plan file: {saved_plan_path}\n\n"
+                        f"## Approved Plan:\n{plan_content}\n\n"
+                        f"Proceed with implementation."
+                    )
+
+                print_info(f"Plan approved. Executing in {target_mode} mode.")
                 return (
-                    f"User approved the plan. Context was cleared. "
-                    f"Permission mode: {target_mode}\n\n"
-                    f"Plan file: {saved_plan_path}\n\n"
+                    f"User approved the plan. Permission mode: {target_mode}\n\n"
                     f"## Approved Plan:\n{plan_content}\n\n"
                     f"Proceed with implementation."
                 )
 
-            print_info(f"Plan approved. Executing in {target_mode} mode.")
-            return (
-                f"User approved the plan. Permission mode: {target_mode}\n\n"
-                f"## Approved Plan:\n{plan_content}\n\n"
-                f"Proceed with implementation."
-            )
+            # Fallback 分支（未设置审批回调，通常发生在子 Agent 场景）
+            self.config.permission_mode = self.state.pre_plan_mode or "default"
+            self.state.pre_plan_mode = None
+            self.state.plan_file_path = None
+            self._system_prompt = self._base_system_prompt
+            self.history.update_system_prompt(self._system_prompt)
+            print_info("Exited plan mode. Restored to " + self.config.permission_mode + " mode.")
+            return f"Exited plan mode. Permission mode restored to: {self.config.permission_mode}\n\n## Your Plan:\n{plan_content}"
 
-        # Fallback: no approval function
-        self.permission_mode = self._pre_plan_mode or "default"
-        self._pre_plan_mode = None
-        self._plan_file_path = None
-        self._system_prompt = self._base_system_prompt
-        print_info("Exited plan mode. Restored to " + self.permission_mode + " mode.")
-        return (
-            f"Exited plan mode. Permission mode restored to: {self.permission_mode}\n\n"
-            f"## Your Plan:\n{plan_content}"
-        )
-
-    return f"Unknown plan mode tool: {name}"
+        return f"Unknown plan mode tool: {name}"
 ```
 
-核心逻辑分三层：
-
-1. **enter_plan_mode**：状态切换 + plan 文件创建 + 提示词注入。幂等设计——已在 plan 模式时返回提示而不是报错。
-
-2. **exit_plan_mode（有审批函数）**：读取 plan 文件 → 调用审批回调 → 根据用户选择处理：
-   - `keep-planning`：不退出 plan 模式，把用户反馈作为工具结果返回给模型
-   - `clear-and-execute`：清空消息历史（释放上下文）→ 切换到 `acceptEdits`
-   - `execute`：保留历史 → 切换到 `acceptEdits`
-   - `manual-execute`：恢复进入前的模式（用户手动审批每次编辑）
-
-3. **exit_plan_mode（无审批函数）**：直接退出恢复原模式。这个分支用于子 Agent 场景——子 Agent 不需要用户交互式审批。
-
-### 审批工作流
-
-审批通过回调函数注入，解耦了 Agent 和 UI 层：
-
-```python
-# __main__.py — 设置审批回调
-
-async def plan_approval(plan_content: str) -> dict:
-    print_plan_for_approval(plan_content)
-    print_plan_approval_options()
-    while True:
-        choice = input("  Enter choice (1-4): ").strip()
-        if choice == "1":
-            return {"choice": "clear-and-execute"}
-        elif choice == "2":
-            return {"choice": "execute"}
-        elif choice == "3":
-            return {"choice": "manual-execute"}
-        elif choice == "4":
-            feedback = input("  Feedback (what to change): ").strip()
-            return {"choice": "keep-planning", "feedback": feedback or None}
-        else:
-            print("  Invalid choice. Enter 1, 2, 3, or 4.")
-
-agent.set_plan_approval_fn(plan_approval)
-```
-
-四个选项的设计背后是不同的使用场景：
-
-| 选项 | 权限切换 | 上下文 | 适用场景 |
-|------|---------|--------|---------|
-| 1. Clear + Execute | → acceptEdits | 清空 | 计划完善，上下文已很长，从零执行最高效 |
-| 2. Execute | → acceptEdits | 保留 | 计划完善，Agent 已有足够上下文直接执行 |
-| 3. Manual | → 恢复原模式 | 保留 | 计划大致可以，但想逐步审批每个修改 |
-| 4. Keep Planning | 不变 | 保留 | 计划需要修改，给反馈让 Agent 继续调整 |
-
-### CLI 入口
-
-Plan Mode 有三个入口：
-
-```python
-# __main__.py — CLI 参数
-
-# 1. 命令行参数 --plan
-elif arg == "--plan":
-    permission_mode = "plan"
-
-# 2. REPL 命令 /plan
-if user_input == "/plan":
-    agent.toggle_plan_mode()
-    continue
-
-# 3. Agent 自主调用 enter_plan_mode 工具
-```
-
-三个入口的区别：
-
-- `--plan`：启动时就进入 Plan Mode，整个会话从规划开始
-- `/plan`：会话中途切换，适合"先聊后规划"的工作流
-- `enter_plan_mode` 工具：Agent 自己判断需要先规划再执行（需要通过 ToolSearch 激活）
-
-## 设计决策
-
-### 为什么 Plan 文件写磁盘？
-
-Plan 文件持久化到 `~/.claude/plans/` 有两个原因：
-
-1. **Clear-and-execute 选项需要**：清空上下文后，对话历史中的 plan 内容会丢失。但 plan 文件在磁盘上，Agent 可以重新读取。
-2. **跨会话可用**：用户可以 `--resume` 恢复会话时看到之前的 plan，或者手动查看历史 plan 文件。
-
-### 为什么审批是回调而不是直接实现？
-
-`planApprovalFn` 是外部注入的回调，而不是 Agent 内部直接实现。这让 Agent 类不依赖具体的 UI 实现——CLI 用 readline，IDE 集成可以用 GUI 对话框，测试时可以注入模拟函数。子 Agent 没有审批函数时直接退出，不需要特殊处理。
-
-### 为什么 clear-and-execute 切换到 acceptEdits？
-
-用户既然审批了计划并选择了自动执行，说明他们信任 Agent 的修改方向。切换到 `acceptEdits` 让 Agent 无需反复确认每次文件编辑，大幅提升执行效率。如果用户想逐步审批，有专门的选项 3。
-
-## 简化对比
-
-| 维度 | Claude Code | mini-claude | 差异 |
-|------|------------|-------------|------|
-| Plan 文件 | 全局 plans 目录 + 语义文件名 | `~/.claude/plans/plan-{sessionId}.md` | 简化命名 |
-| 审批选项 | 多种执行模式 + 权限提示 | 4 种选项（clear/execute/manual/revise） | 核心对齐 |
-| 权限联动 | 深度集成（7 层权限体系） | checkPermission 特殊分支 + plan 文件白名单 | 简化但等效 |
-| 工具加载 | 始终可用 | deferred 延迟加载 | 节省提示词空间 |
-| 子 Agent | Plan Agent 类型 | Fallback 直接退出 | 简化分支 |
+#### 注意什么
+注意 `clear-and-execute` 分支：执行 `self.history.clear(keep_system=True)` 后，为了防止模型“失忆”不知道下一步该做什么，我们将先前在磁盘上读取好的 `Approved Plan` 作为提示喂回给模型，以便它带着这份计划快速且精准地恢复执行。
 
 ---
 
-> **下一章**：Agent 能自主执行了，但不能让它无限跑下去——预算控制与成本管理。
+### 步骤 6：在入口端实现 CLI 审批交互与回调注入
+
+#### 为什么做
+控制台入口（REPL）是大模型与真实用户交互的核心。我们需要在命令行前端捕获退出工具触发的事件，提供友好的菜单选项并收集反馈，最终传回给 Agent 驱动内部状态机。
+
+#### 做什么
+打开 `python/mini_claude/__main__.py`。在 `run_repl` 入口函数中，定义 `plan_approval_fn` 回调逻辑，并通过 `set_plan_approval_fn` 绑定到 Agent 实例上：
+
+```python
+# python/mini_claude/__main__.py
+
+    async def plan_approval_fn(plan_content: str) -> dict:
+        print_plan_for_approval(plan_content)
+        print_plan_approval_options()
+        while True:
+            try:
+                choice = input("  Enter choice (1-4): ").strip()
+            except EOFError:
+                return {"choice": "manual-execute"}
+            
+            if choice == "1":
+                return {"choice": "clear-and-execute"}
+            elif choice == "2":
+                return {"choice": "execute"}
+            elif choice == "3":
+                return {"choice": "manual-execute"}
+            elif choice == "4":
+                try:
+                    feedback = input("  Feedback (what to change): ").strip()
+                except EOFError:
+                    feedback = ""
+                return {"choice": "keep-planning", "feedback": feedback or None}
+            else:
+                print("  Invalid choice. Enter 1, 2, 3, or 4.")
+
+    agent.set_plan_approval_fn(plan_approval_fn)
+```
+
+#### 注意什么
+为了提高在各类非交互式终端测试或重定向环境下的稳健性，我们在接收输入时用 `try...except EOFError` 包裹了 `input()`。当遇到 `EOFError` 时，系统将默认降级到 `"manual-execute"`（手动逐次校验模式），防止程序陷入死循环或崩溃。
+
+---
+
+## ⚖️ 设计权衡
+
+### 方案 A：在磁盘生成 `.claude/plans/plan-{sessionId}.md`
+* **优点**：
+  1. 支持 `clear-and-execute`（清空上下文历史）工作流。哪怕当前内存对话链断开或为了节省 Token 将历史丢弃，Agent 依然能通过再次读取磁盘文件，找回完整的实现蓝图。
+  2. 极佳的审计性：用户随时可以在外部编辑器或系统文件管理器中翻阅该规划，甚至在中断会话重新进入（`--resume`）时也保留历史凭证。
+* **缺点**：
+  * 需要进行本地文件 IO 操作和临时目录创建，在只读磁盘或容器隔离环境下可能遇到写入权限限制。
+
+### 方案 B：纯内存维护 Plan 字符串
+* **优点**：
+  * 流程极其轻量，无需与操作系统文件系统发生交互，没有读写权限的隐患。
+* **缺点**：
+  * 一旦决定执行 `Clear + Execute` 动作，由于对话历史被彻底清空，写在上下文中的规划内容将无处可寻，Agent 无法在零历史状态下按计划展开实现。
+
+### 结论
+在 Coding Agent 的架构设计中，**“在磁盘持久化方案”是唯一的正解**。这既是维持 Agent 具备重组上下文（`clear-and-execute`）核心特征的基石，也能跨会话追溯历史。
+
+---
+
+## ⚠️ 常见陷阱
+
+### 1. System Prompt 状态还原遗漏
+* **陷阱**：在退出 Plan Mode 时，如果在把权限切回 `acceptEdits` 的同时，没有将模型的系统提示词从 `self._system_prompt` 中剔除，那么大模型仍会认为自己身处“只读规划”阶段，在执行时会不断提示“我不能修改代码”并再次调用 `exit_plan_mode`，陷入逻辑黑洞。
+* **解决方案**：确保在 `toggle_plan_mode` 和 `_execute_plan_mode_tool` 的每一个退出分支中，将 `self._system_prompt` 精确重置为 `self._base_system_prompt`，并同步更新消息管道（`self.history.update_system_prompt`）。
+
+### 2. 权限校验中的路径判定不精确
+* **陷阱**：大模型可能会以相对路径（如 `../../.claude/plans/plan-xxx.md`）或包含环境变量的路径来请求工具。如果我们在 `check_permission` 中只进行简单的绝对路径字符串比对，可能会误判为非法路径进而予以拒绝，导致模型无法更新 Plan 方案。
+* **解决方案**：在实际比对前，统一将获取到的路径解析为规范的绝对路径（在 Python 中通常使用 `Path(file_path).resolve()`）再进行判定。
+
+---
+
+## ✅ 验收点
+
+### 1. 验证启动只读规划模式
+* **输入命令**：
+  ```bash
+  mini-claude-py --plan "在当前目录创建一个 test_plan.py 并写入 print('plan ok')"
+  ```
+* **预期效果**：
+  1. 控制台输出 `[INFO] Entered plan mode. Plan file: ...`
+  2. 模型识别当前处于 Plan Mode，不调用普通文件写工具，而是自主读取已有代码。
+
+### 2. 验证非 Plan 文件防写沙箱
+* **输入**：故意命令大模型在规划阶段去修改项目已有的 `tools.py`。
+* **预期效果**：底层的 `check_permission` 拦截非法编辑，并在调用时向模型返回以下阻断消息：
+  ```json
+  {"action": "deny", "message": "Blocked in plan mode: write_to_file"}
+  ```
+  大模型必须知难而退，返回文本说明受限于规划模式。
+
+### 3. 验证 4 选项审批分流
+* **输入**：当大模型完成规划并调用 `exit_plan_mode` 后，触发终端暂停。
+* **验证流程**：
+  1. 在控制台的 `Enter choice (1-4):` 提示下输入 `4` 并输入修改反馈（例如：“步骤2中请加上单元测试规划”），确认大模型返回规划阶段，并且其 Plan 文件的内容包含你的反馈。
+  2. 再次退出时，输入 `1`（Clear + Execute）。
+  3. 控制台打印 `[INFO] Plan approved. Context cleared...` 并开启清空历史后的自动修改流程。
+
+---
+
+## 🧠 思考题
+
+1. **为什么在 Plan Approved 后更推荐使用 `1. Clear + Execute` 选项，而不是 `2. Execute`？**
+   *(提示：这与 AI 编程中的 API 上下文长度、Token 花费以及大模型被历史对话干扰的注意力分散程度有关)*
+
+2. **如果用户在使用 `4. Keep Planning` 时给出了极长、极复杂的改动反馈，大模型在再次进入规划阶段时，会不会面临上下文溢出？该如何防范？**
+
+## 📦 本节收获
+
+* **只读安全沙箱**：学会了如何通过动态切换权限模式，在底层拦截写操作和危险 Shell 执行。
+* **解耦回调机制**：通过向 Agent 注入 `planApprovalFn` 回调函数，实现了底层模型调度逻辑与上层用户终端 UI（CLI/GUI）的彻底解耦。
+* **上下文重整（Clear & Execute）**：理解了在复杂大型任务中，通过“方案写入磁盘持久化 -> 审批 -> 归零历史 -> 按照方案极简执行”来攻克上下文膨胀问题的架构设计。
+
+---
+
+> **下一章**：现在 Agent 具备了只读规划与自动恢复的执行能力。下一步我们将教导 Agent 如何防范死循环与消费失控——构建预算控制与成本管理系统。
