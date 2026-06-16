@@ -1,134 +1,120 @@
-# 3. System Prompt 工程
+# 第 04 课：System Prompt 动态编译
 
-## 本章目标
+## 🎯 本节目标
 
-构造一个让 LLM 成为合格 coding agent 的 System Prompt：告诉它身份、规则、工具使用策略和环境信息。
+为 Agent 动态编译一个结构严密的 System Prompt。使其在运行时能够根据当前环境（包括工作目录、操作系统、Git 状态以及项目指令文件 `CLAUDE.md`）自动调整提示词，并为大模型接种“反模式疫苗”（防止模型过度工程和盲目修改代码）。
 
-```mermaid
-graph TB
-    Template[SYSTEM_PROMPT_TEMPLATE<br/>内联 Markdown 模板] --> Builder[buildSystemPrompt<br/>变量替换]
-    CWD[工作目录] --> Builder
-    Git[Git 信息] --> Builder
-    ClaudeMD[CLAUDE.md<br/>项目指令] --> Builder
-    Memory[记忆系统] --> Builder
-    Skills[技能描述] --> Builder
-    Agents[Agent 描述] --> Builder
-    Builder --> Final[最终 System Prompt]
-    Final --> API[传给 API<br/>system 参数]
+---
 
-    style Builder fill:#7c5cfc,color:#fff
-    style Final fill:#e8e0ff
-```
+## 🏆 最终效果
 
-## Claude Code 怎么做的
+完成本节后，当你在不同目录下、或在不同的 Git 分支中运行 Agent 时，Agent 发送给大模型的 System Prompt 将会动态更新。
 
-Claude Code 的 System Prompt 不是随意堆砌的指令，而是经过大量 A/B 测试和模型行为观察迭代打磨的工程产物。
+你可以通过添加测试代码打印编译后的 Prompt，或者直接观察 Agent 的行为：
+- 当项目根目录下存在 `CLAUDE.md` 时，大模型能自动读取其中的项目规范并严格遵守。
+- 当有 Git 未提交的文件时，大模型能清晰知道哪些代码正处于修改中，避免盲目重置你的本地工作区。
 
-### 7 层递进结构
+---
 
-提示词从抽象到具体分为 7 层——**先建立身份和约束框架，再填充具体行为指导**。这个顺序很重要：模型先建立的概念会成为理解后续内容的框架。
+## 🛠️ 本节任务
 
-```
-1. Identity   → 我是谁？interactive agent
-2. System     → 运行环境的基本事实
-3. Doing Tasks → 怎么写代码？（反模式接种）
-4. Actions    → 哪些操作需要确认？（爆炸半径框架）
-5. Using Tools → 怎么用工具？（偏好映射表）
-6. Tone & Style → 输出什么格式？
-7. Output Efficiency → 怎么更简洁？
-```
+1. **定义基础 System Prompt 模板**：编写 `SYSTEM_PROMPT_TEMPLATE`，融入反模式疫苗和工具偏好表。
+2. **收集环境与 Git 上下文**：实现 `get_git_context()`，通过子进程获取 Git 分支、最近提交以及状态。
+3. **实现项目规则加载与 `@include` 解析**：实现 `load_claude_md()` 与 `_resolve_includes()`，支持向上递归查找项目规范。
+4. **编译与路由替换**：实现 `build_system_prompt()` 替换占位符。
+5. **在 Agent 中应用 Prompt**：修改 `agent.py`，将编译后的 System Prompt 注入 API 请求。
 
-### 反模式接种
+---
 
-**明确告诉模型"不要做什么"，比只描述"要做什么"有效得多。**
+## 📦 涉及文件
 
-正面指令（"be concise"）给模型留下了自我合理化的空间——它会认为"加注释是让代码更简洁易读的"，然后给每个函数加 docstring。而负面指令（"don't add docstrings to code you didn't change"）消除了解释余地。
+修改：
+- `python/mini_claude/prompt.py`
+- `python/mini_claude/agent.py`
 
-Claude Code 的 Doing Tasks 部分有三条精确的"不要"：
+---
 
-- **不要扩大范围**：修 bug 不需要顺手重构周围代码
-- **不要防御性编程**：不为不可能发生的场景加 try-catch 和校验
-- **不要过早抽象**："Three similar lines of code is better than a premature abstraction"
+## 🚀 开始实现
 
-这些规则的价值不在概念（谁都知道"不要过度工程"），而在**措辞的精确度**——给了模型具体的判断标准，而非模糊的原则。
+### 步骤 1：定义嵌入式 System Prompt 模板
 
-### 爆炸半径框架
+#### 为什么做
 
-Actions 部分没有罗列"不能做 X、Y、Z"，而是教给模型一个**风险评估框架**：
+静态提示词是 Agent 行为的基石。我们需要在此模板中定义 Agent 的身份，接种“反模式疫苗”（如“不要过早抽象”、“不要在未修改的代码中加注释”、“不要做未要求的重构”），并确立工具偏好表（强制大模型优先使用专用的 `read_file`/`edit_file` 而非通过 `run_shell` 调用命令行命令）。
 
-```
-Carefully consider the reversibility and blast radius of actions.
-```
+#### 做什么
 
-二维模型：**可逆性 × 影响范围**。高风险 = 不可逆 + 影响共享环境（force push、删除云资源）；低风险 = 可逆 + 只影响本地（编辑本地文件）。
-
-这比穷举规则扩展性强得多——模型遇到规则列表之外的新场景（比如调用 API 删除云资源）能自行推理，而不是不知道怎么做。
-
-还有一条关键规则：用户批准一次操作，不等于批准所有类似操作。每次授权只对当前范围有效。
-
-### 工具偏好映射表
-
-Claude Code 在提示词中明确要求模型用专用工具而非 bash 命令：
-
-```
-Use Read instead of cat/head/tail
-Use Edit instead of sed/awk
-Use Glob instead of find/ls
-Use Grep instead of grep/rg
-```
-
-专用工具和 bash 命令底层功能差不多，差异在用户体验：权限可以细粒度控制（读取 vs 写入分开授权）、输出结构化、原生支持并行调用。没有这张映射表，模型会默认用训练数据中出现最多的方式——即各种 bash 命令。
-
-### CLAUDE.md 层级发现
-
-CLAUDE.md 是项目级指令文件，类似 `.eslintrc` 但面向 AI。Claude Code 从 5 个位置加载：全局管理策略 → 用户主目录 → 项目目录（CWD 向上遍历）→ 本地文件 → 命令行指定目录。
-
-靠近 CWD 的文件**后加载、优先级更高**——利用 LLM 的近因效应，子目录规则可以覆盖父目录规则。
-
-## 我们的实现
-
-### SYSTEM_PROMPT_TEMPLATE
-
-模板内联在 `prompt.ts` 中，用 `{{placeholder}}` 标记动态变量。
-
-`{{memory}}`、`{{skills}}`、`{{agents}}` 放在末尾——近因效应，这些动态内容的权重更大（详见第 8、9 章）。
-
-### prompt.py 实现
+创建（或覆盖）`prompt.py`，嵌入基础模板及占位符：
 
 ```python
+# prompt.py
+
+from __future__ import annotations
+
 import os
 import platform
+import re
 import subprocess
 from pathlib import Path
 
+# 嵌入的 System Prompt 模板，包含核心行为限制与环境占位符
+SYSTEM_PROMPT_TEMPLATE = """\
+You are Mini Claude Code, a lightweight coding assistant CLI.
+You are an interactive agent that helps users with software engineering tasks.
 
-def load_claude_md() -> str:
-    parts: list[str] = []
-    d = Path.cwd().resolve()
-    while True:
-        f = d / "CLAUDE.md"
-        if f.is_file():
-            try:
-                content = f.read_text()
-                content = resolve_includes(content, str(d))  # @include 解析
-                parts.insert(0, content)
-            except Exception:
-                pass
-        parent = d.parent
-        if parent == d:
-            break
-        d = parent
-    rules = load_rules_dir(str(Path.cwd()))  # .claude/rules/*.md
-    claude_md = "\n\n# Project Instructions (CLAUDE.md)\n" + "\n\n---\n\n".join(parts) if parts else ""
-    return claude_md + rules
+# Doing tasks
+ - Avoid over-engineering. Only make changes that are directly requested or clearly necessary. Keep solutions simple and focused.
+   - Don't add features, refactor code, or make "improvements" beyond what was asked. A bug fix doesn't need surrounding code cleaned up.
+   - Don't add docstrings, comments, or type annotations to code you didn't change.
+   - Don't create helpers, utilities, or abstractions for one-time operations. Three similar lines of code is better than a premature abstraction.
+ - In general, do not propose changes to code you haven't read. If a user asks about or wants you to modify a file, read it first.
+
+# Using your tools
+ - Do NOT use run_shell to run commands when a relevant dedicated tool is provided. Using dedicated tools allows the user to better review your work:
+   - To read files use read_file instead of cat, head, or tail
+   - To edit files use edit_file instead of sed or awk
+   - To create files use write_file instead of echo redirection
+   - To search for files use list_files instead of find or ls
+
+# Environment
+Working directory: {{cwd}}
+Date: {{date}}
+Platform: {{platform}}
+Shell: {{shell}}
+{{git_context}}
+{{claude_md}}"""
+```
+
+#### 注意什么
+
+- 工具偏好表非常关键。若无显式要求，大模型会默认调用它最熟悉的命令行命令（如 `cat`、`sed`），这将导致我们在第 3 课实现的精确编辑工具失去用武之地。
+
+---
+
+### 步骤 2：收集 Git 上下文信息
+
+#### 为什么做
+
+让 Agent 了解当前的 Git 状态（所处分支、最近提交记录、未暂存的文件）。这些信息能让大模型了解项目的最新开发进展，防止在写代码时与已有的未提交修改发生冲突。
+
+#### 做什么
+
+在 `prompt.py` 中编写 `get_git_context` 函数，利用 `subprocess` 执行 git 命令并捕获其输出：
+
+```python
+# prompt.py（续）
 
 
 def get_git_context() -> str:
     try:
         opts = {"encoding": "utf-8", "timeout": 3, "capture_output": True}
+        # 获取分支名
         branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], **opts).stdout.strip()
+        # 获取最近 5 次提交
         log = subprocess.run(["git", "log", "--oneline", "-5"], **opts).stdout.strip()
+        # 获取文件简短状态
         status = subprocess.run(["git", "status", "--short"], **opts).stdout.strip()
+
         result = f"\nGit branch: {branch}"
         if log:
             result += f"\nRecent commits:\n{log}"
@@ -136,25 +122,129 @@ def get_git_context() -> str:
             result += f"\nGit status:\n{status}"
         return result
     except Exception:
+        # 非 Git 仓库或未安装 Git 时返回空，保证鲁棒性
         return ""
+```
+
+#### 注意什么
+
+- 调用外部命令必须添加超时机制（`timeout=3`），防止由于 Git 挂起或命令卡死导致编译 System Prompt 过程永久阻塞。
+
+---
+
+### 步骤 3：项目级规则加载与 `@include` 引用解析
+
+#### 为什么做
+
+Claude Code 项目的一个核心特色是 `CLAUDE.md`（项目级指令集，用于写明项目的构建、测试、代码规范命令）。
+为了让规则生效，我们需要：
+1. 从当前工作目录（CWD）开始，不断向上级目录递归检索 `CLAUDE.md` 文件并加载，离当前目录最近的规则优先级最高。
+2. 支持 `@` 语法（例如 `@./style.md`）导入子文件，从而实现配置文件的模块化管理。
+
+#### 做什么
+
+在 `prompt.py` 中实现简易的 `@include` 语法递归解析，并实现 `load_claude_md` 方法：
+
+```python
+# prompt.py（续）
+
+_INCLUDE_RE = re.compile(r"^@(\./[^\s]+|~/[^\s]+|/[^\s]+)$", re.MULTILINE)
+_MAX_INCLUDE_DEPTH = 3  # 防止恶性嵌套
+
+
+def _resolve_includes(
+    content: str,
+    base_path: Path,
+    visited: set[str] | None = None,
+    depth: int = 0,
+) -> str:
+    if depth >= _MAX_INCLUDE_DEPTH:
+        return content
+    if visited is None:
+        visited = set()
+
+    def _replace(m: re.Match) -> str:
+        raw = m.group(1)
+        # 兼容相对路径、用户主目录和绝对路径
+        if raw.startswith("~/"):
+            resolved = Path.home() / raw[2:]
+        elif raw.startswith("/"):
+            resolved = Path(raw)
+        else:
+            resolved = base_path / raw
+
+        resolved = resolved.resolve()
+        key = str(resolved)
+        if key in visited:
+            return f"<!-- circular include: {raw} -->"
+        if not resolved.is_file():
+            return f"<!-- file not found: {raw} -->"
+
+        try:
+            visited.add(key)
+            included = resolved.read_text(encoding="utf-8")
+            # 递归处理被引入文件的内部引用
+            return _resolve_includes(included, resolved.parent, visited, depth + 1)
+        except Exception:
+            return f"<!-- error reading: {raw} -->"
+
+    return _INCLUDE_RE.sub(_replace, content)
+
+
+def load_claude_md() -> str:
+    parts: list[str] = []
+    d = Path.cwd().resolve()
+    # 向上递归查找所有的 CLAUDE.md
+    while True:
+        f = d / "CLAUDE.md"
+        if f.is_file():
+            try:
+                content = f.read_text(encoding="utf-8")
+                # 解析其中的 @include 内容
+                content = _resolve_includes(content, d)
+                parts.insert(0, content)  # 父级目录的规则插在前面，近因效应使其在后方覆盖
+            except Exception:
+                pass
+        parent = d.parent
+        if parent == d:
+            break
+        d = parent
+
+    if parts:
+        return "\n\n# Project Instructions (CLAUDE.md)\n" + "\n\n---\n\n".join(parts)
+    return ""
+```
+
+#### 注意什么
+
+- **死循环防护**：引入 `visited` 集合记录已被读取的绝对路径。如果 A 引入 B，B 又引入 A，能防止递归调用栈爆掉。
+
+---
+
+### 步骤 4：编译提示词主函数 `build_system_prompt`
+
+#### 为什么做
+
+最后，我们将所有静态和动态信息结合起来，用收集到的数据替换模板中的 `{{placeholder}}` 占位符，生成最终发送给 API 的完整提示词。
+
+#### 做什么
+
+在 `prompt.py` 末尾编写 `build_system_prompt`：
+
+```python
+# prompt.py（续）
+
+from datetime import date
 
 
 def build_system_prompt() -> str:
-    from .memory import build_memory_prompt_section
-    from .skills import build_skill_descriptions
-    from .subagent import build_agent_descriptions
-    from datetime import date
-
     replacements = {
         "{{cwd}}": str(Path.cwd()),
         "{{date}}": date.today().isoformat(),
         "{{platform}}": f"{platform.system()} {platform.machine()}",
-        "{{shell}}": os.environ.get("SHELL", "/bin/sh"),
+        "{{shell}}": os.environ.get("SHELL") or os.environ.get("COMSPEC") or "unknown",
         "{{git_context}}": get_git_context(),
         "{{claude_md}}": load_claude_md(),
-        "{{memory}}": build_memory_prompt_section(),
-        "{{skills}}": build_skill_descriptions(),
-        "{{agents}}": build_agent_descriptions(),
     }
     result = SYSTEM_PROMPT_TEMPLATE
     for key, value in replacements.items():
@@ -162,44 +252,143 @@ def build_system_prompt() -> str:
     return result
 ```
 
-### 简化取舍
+---
 
-| Claude Code | mini-claude | 理由 |
-|------------|-------------|------|
-| Static/Dynamic 缓存边界 | 不实现 | 教程项目无需优化 API 成本 |
-| CLAUDE.md 5 层发现 + .claude 子目录 | 从 CWD 向上遍历 + .claude/rules/ | 覆盖常见场景 |
-| @include 指令 | 支持 @./path、@~/path、@/path | 完整实现 |
-| 反模式接种（3 条规则） | 完整保留 | 对输出质量影响极大 |
-| 爆炸半径框架 | 完整保留 | 安全性不能简化 |
-| 工具偏好映射表 | 适配工具名保留 | 必须有，否则模型默认用 bash |
-| Deferred 工具名注入 | getDeferredToolNames() | 告知模型哪些工具可按需激活 |
+### 步骤 5：在 Agent 请求中注入编译后的 Prompt
 
-### @include 语法与 Rules 自动加载
+#### 为什么做
 
-CLAUDE.md 文件支持 `@` 语法引用外部文件，实现项目配置的模块化。同时，`.claude/rules/*.md` 目录下的规则文件会自动加载。
+虽然编写了 `build_system_prompt`，但我们还需要在 `agent.py` 的 API 调用中实际使用它。
 
-三种路径格式：
-- `@./relative/path` — 相对于当前 CLAUDE.md 所在目录
-- `@~/path` — 相对于用户 home 目录
-- `@/absolute/path` — 绝对路径
+#### 做什么
 
-防护措施：
-- **visited Set** 防止循环引用（A include B，B include A）
-- **MAX_INCLUDE_DEPTH = 5** 防止嵌套过深
-- 找不到文件时留下 HTML 注释标记，不报错中断
+修改 `agent.py`。
+1. 在文件头部导入 `build_system_prompt`。
+2. 在调用大模型时，动态生成系统提示词，并分别传入 Anthropic（通过 `system` 参数）和 OpenAI 后端（通过插入到 messages 首位的 `system` 角色消息）。
 
-使用示例：
+```python
+# agent.py 中的修改
 
-```markdown
-# CLAUDE.md
-@./.claude/rules/chinese-greeting.md
-@./docs/coding-style.md
+# 1. 导入编译函数
+from .prompt import build_system_prompt
 
-This project uses Python with type hints.
+# ... 
+
+
+# 2. 修改 _chat_anthropic
+async def _chat_anthropic(self, user_message: str) -> None:
+    self._messages.append({"role": "user", "content": user_message})
+
+    while True:
+        # 动态编译最新的系统提示词
+        current_system_prompt = build_system_prompt()
+
+        response = await self._anthropic_client.messages.create(
+            model=self.model,
+            max_tokens=4096,
+            system=current_system_prompt,  # 传入编译后的提示词
+            tools=get_tool_definitions(),
+            messages=self._messages,
+        )
+        # ... 后续逻辑保持不变
+
+
+# 3. 修改 _chat_openai
+async def _chat_openai(self, user_message: str) -> None:
+    self._messages.append({"role": "user", "content": user_message})
+
+    while True:
+        # 动态编译最新的系统提示词
+        current_system_prompt = build_system_prompt()
+        system_msg = {"role": "system", "content": current_system_prompt}
+
+        response = await self._openai_client.chat.completions.create(
+            model=self.model,
+            messages=[system_msg] + self._messages,  # 拼装编译后的提示词消息
+            tools=self._to_openai_tools(get_tool_definitions()),
+        )
+        # ... 后续逻辑保持不变
 ```
-
-加载后，引用会被替换为文件内容。这让团队可以把共享规则放在 `.claude/rules/` 目录下，CLAUDE.md 只需一行引用。
 
 ---
 
-> **下一章**：有了工具和提示词，下一步是让 Agent 变得可交互——CLI 入口、REPL 循环和会话持久化。
+## ⚖️ 设计权衡
+
+### 本地编译提示词 vs 模型调用自动召回
+
+- **方案 A**：**本地编译注入**（我们所用）
+  - 每次请求前，在本地用 Python 执行轻量脚本，把环境、CWD、Git 信息编译成文本发给模型。
+  - **优点**：数据 100% 准确，无延迟，不需要额外的 LLM 调用。
+  - **缺点**：如果信息非常多（如超长的 Git status），会导致 Prompt 的基础 Token 占用增加。
+- **方案 B**：**Agent 自主使用工具查询**
+  - Prompt 里不包含环境信息，仅提供 `run_shell("git status")` 等工具，由大模型需要时自行调用。
+  - **优点**：初始 Prompt 干净。
+  - **缺点**：模型可能由于“不知道自己不知道”而漏掉调用，且多出一轮 API 往返，极大地降低了冷启动速度。
+
+**结论**：将关键的“只读性”环境要素直接本地编译进 System Prompt，是保障 Agent 高效做对事情的 industry standard。
+
+---
+
+## ⚠️ 常见陷阱
+
+### 1. 未处理 `@include` 自引用导致递归栈溢出
+
+```python
+# ❌ 错误：缺少已读和深度控制，若 CLAUDE.md 中包含 @./CLAUDE.md 则会直接陷入死循环导致内存耗尽
+def _resolve_includes(content, base_path):
+    # 直接正则替换，未检测 visited
+    return _INCLUDE_RE.sub(lambda m: Path(m.group(1)).read_text(), content)
+```
+
+**修正**：必须引入 `visited = set()` 记录文件绝对路径，并在深度 `depth >= _MAX_INCLUDE_DEPTH` 时进行截断保护。
+
+---
+
+### 2. Windows 下 Shell 占位符报错或为空
+
+在 Windows 环境下，`os.environ.get("SHELL")` 通常不存在，会导致在编译阶段该位置为 None 造成字符串拼接类型报错。
+
+**修正**：使用 `os.environ.get("SHELL") or os.environ.get("COMSPEC") or "unknown"`，兼容 Windows 下的 `cmd.exe`/`powershell.exe`。
+
+---
+
+## ✅ 验收点
+
+### 输入
+
+1. 在项目根目录下临时创建一个 `CLAUDE.md` 文件，写入以下特殊测试规则：
+   ```markdown
+   # Project Rules
+   Always greet the user with "Hello from CLAUDE.md!" before answering.
+   ```
+2. 运行 Agent 并发送任意消息：
+   ```bash
+   python -m mini_claude "你好"
+   ```
+
+### 预期结果
+
+大模型在回复中必须包含 `"Hello from CLAUDE.md!"` 的问候语。这证明 Agent 在调用 API 时成功加载了递归规则，并将其编译到了最终发送给大模型的 System Prompt 中。
+
+*测试完成后，请记得删除测试用的 `CLAUDE.md`，以免干扰后续学习。*
+
+---
+
+## 🧠 思考题
+
+1. **为什么在 `load_claude_md` 中，我们向上遍历目录找到的所有 `CLAUDE.md` 规则，是用 `parts.insert(0, content)` 将父级目录内容插在前面，而不是 `append` 插在后面？**
+   *(提示：大语言模型具有近因效应（Recency Effect），越靠后的内容模型越容易记住。因此我们把工作目录（CWD）最近的、最具体的规则插在最后，从而覆盖父级目录的通用规则。)*
+2. **在 `get_git_context` 中我们使用子进程运行 Git，如果用户把 Agent 拷贝到一个没有初始化 Git 仓库的普通文件夹下运行，代码会报错崩溃吗？**
+   *(提示：不会，因为我们用 `try...except` 块包裹了执行，返回了空字符串，这实现了优雅的“降级保障”。)*
+
+---
+
+## 📦 本节收获
+
+1. **动态编译设计**：理解了静态 Prompt 模板与动态运行时上下文的拼接融合技术。
+2. **近因效应应用**：掌握了规则分层覆盖（CWD 优先级高于 Parent Dir）的设计技巧。
+3. **健壮性防卫**：实现了死循环 include 防护和外部命令超时机制，保证提示词引擎 100% 稳定。
+
+---
+
+> **下一章**：有了工具和提示词，我们的 Agent 已经成型。下一步是让它变得更易用——打造交互式 CLI 终端、命令系统和会话恢复。

@@ -1,200 +1,282 @@
-# 2. 工具系统
+# 第 03 课：核心工具链
 
-## 本章目标
+## 🎯 本节目标
 
-定义 6 个核心工具（读文件、写文件、编辑文件、列文件、搜索、Shell）+ 5 个扩展工具（skill、agent、web_fetch、tool_search、plan mode），让 LLM 能真正操作你的代码库。实现编辑防护（read-before-edit + mtime 检查）和延迟加载（deferred tools）机制。
+为 Agent 构建基础操作系统。实现核心工具链（文件读取、写入、精细编辑与命令行执行），确保编辑操作具备幻觉安全（精确匹配且唯一匹配），并具备防御性的结果截断机制，防止 Token 爆表。
 
-```mermaid
-graph LR
-    LLM[LLM 响应] --> |tool_use block| Dispatch[executeTool<br/>分发器]
-    Dispatch --> RF[read_file]
-    Dispatch --> WF[write_file]
-    Dispatch --> EF[edit_file]
-    Dispatch --> LF[list_files]
-    Dispatch --> GS[grep_search]
-    Dispatch --> RS[run_shell]
-    Dispatch --> SK[skill]
-    Dispatch --> AG[agent]
-    Dispatch --> WEB[web_fetch]
-    Dispatch --> TS[tool_search]
-    Dispatch --> EP[enter_plan_mode<br/>deferred]
-    Dispatch --> XP[exit_plan_mode<br/>deferred]
-    RF --> Result[工具结果字符串]
-    WF --> Result
-    EF --> Result
-    LF --> Result
-    GS --> Result
-    RS --> Result
-    SK --> Result
-    AG --> Result
-    WEB --> Result
-    TS --> Result
-    EP --> Result
-    XP --> Result
+---
 
-    style Dispatch fill:#7c5cfc,color:#fff
-    style EF fill:#e8e0ff
-    style RF fill:#e8e0ff
+## 🏆 最终效果
+
+完成本节后，运行 Agent 并向其提问，它将具备浏览当前目录、读取文件内容、自动编辑修改代码以及运行测试或 shell 命令的能力：
+
+**运行测试**：
+```bash
+python -m mini_claude "把 python/mini_claude/tools.py 中的 MAX_RESULT_CHARS 修改为 60000"
 ```
 
-## Claude Code 怎么做的
+你将看到 Agent 能够自主进行链式操作：
+1. 调用 `read_file` 确认 `tools.py` 里的现有常量定义。
+2. 检索到具体字符串后，精确调用 `edit_file` 进行修改，并输出替换后的局部 diff。
+3. 退出循环并汇报任务完成。
 
-### Tool 接口 — 每个工具的完整契约
+---
 
-Claude Code 的每个工具都遵循统一的 `Tool` 泛型接口，不是简单函数签名，而是完整的行为契约：
+## 🛠️ 本节任务
+
+1. **实现读取与截断**：实现 `read_file` 并构建头尾截断函数 `_truncate_result`。
+2. **实现创建与写入**：实现 `write_file`，支持自动创建目录。
+3. **构建精确编辑工具**：实现 `edit_file`，内置“唯一精确匹配”校验和“直弯引号容错”。
+4. **构建命令执行工具**：实现 `run_shell`，支持超时捕获与标准错误输出合并。
+5. **更新工具定义与分发逻辑**：注册新工具并重构 `execute_tool`。
+
+---
+
+## 📦 涉及文件
+
+修改：
+- `python/mini_claude/tools.py`
+
+---
+
+## 🚀 开始实现
+
+### 步骤 1：文件读取 `read_file` 与结果截断保护
+
+#### 为什么做
+
+LLM 在阅读大型输出（如几百行的文件或超长的测试日志）时，容易因过量无用 Token 导致上下文窗口耗尽并产生巨大的 API 账单。
+我们需要：
+1. 读取文件时自动附带行号，方便 LLM 精准定位。
+2. 实现头尾截断（保留前段和尾段，裁剪中段），因为报错信息通常在尾部，导入声明和入口通常在头部。
+
+#### 做什么
+
+修改 `tools.py`，导入必要包，实现 `_read_file` 和 `_truncate_result`：
 
 ```python
-# Claude Code 的 Tool 接口（简化示意）
-class Tool:
-    name: str
-    aliases: list[str]              # 废弃别名，平滑迁移
-    max_result_size_chars: int      # 超过则持久化到磁盘
+# tools.py
 
-    async def call(self, args, context, can_use_tool, parent_message, on_progress=None) -> ToolResult
-    async def description(self, input, options) -> str  # 发给 API 的工具描述
-    async def prompt(self, options) -> str              # 注入 system prompt 的使用指南
+from __future__ import annotations
 
-    input_schema: dict              # JSON Schema
-    is_concurrency_safe: bool       # 同一工具不同参数可有不同安全语义
-    is_read_only: bool
-    is_destructive: bool
-    async def check_permissions(self, input, context) -> PermissionResult
-```
+import re
+import subprocess
+from pathlib import Path
 
-几个设计要点：
+MAX_RESULT_CHARS = 50000  # 限制单次工具返回最大字符数
 
-**`is_concurrency_safe(input)` 接收参数**——这意味着同一工具对不同输入可以有不同安全语义。BashTool 对 `ls` 返回 `is_read_only: True`，对 `rm` 返回 `False`。比给整个工具打标签精确得多。
 
-**`prompt()` 方法**——每个工具可以向 system prompt 注入自己的使用指南。FileEditTool 注入"精确匹配"规则，BashTool 注入安全执行提醒。工具行为指引和工具定义紧密关联，而非散落在全局 prompt 文件里。
+def _read_file(inp: dict) -> str:
+    try:
+        content = Path(inp["file_path"]).read_text(encoding="utf-8")
+        lines = content.split("\n")
+        # 加上行号，方便 LLM 查找并定位代码
+        return "\n".join(f"{i+1:4d} | {line}" for i, line in enumerate(lines))
+    except Exception as e:
+        return f"Error reading file: {e}"
 
-### buildTool 工厂 — Fail-Closed 默认值
 
-```python
-TOOL_DEFAULTS = {
-    "is_concurrency_safe": False,    # 默认不可并发
-    "is_read_only": False,           # 默认有写入副作用
-    "is_destructive": False,
-    "check_permissions": lambda: {"behavior": "allow", "updated_input": None},
-}
-```
-
-这是 **fail-closed** 设计：错误标记"只读"工具为"非只读"后果是不必要的权限弹窗（烦人但安全）；反向错误——错误标记"写入"工具为"只读"——可能让它在没有权限检查的情况下并发执行（危险且隐蔽）。默认值只能选安全的方向。
-
-### 工具注册 — 三层流水线
-
-```mermaid
-flowchart TD
-    L1["Layer 1: get_all_base_tools()<br/>核心工具直接 import<br/>+ Feature-gated 条件导入"] --> L2["Layer 2: get_tools()<br/>运行时上下文过滤<br/>SIMPLE模式 / deny规则 / is_enabled()"]
-    L2 --> L3["Layer 3: assemble_tool_pool()<br/>内置工具 + MCP桥接工具<br/>分区排序 + 去重"]
-    L3 --> Final[最终工具池]
-```
-
-Layer 1 的 Feature-gated 工具通过条件导入加载：
-
-```python
-# 条件导入示例
-if feature('PROACTIVE') or feature('KAIROS'):
-    from tools.SleepTool import SleepTool
-else:
-    SleepTool = None
-```
-
-Layer 3 的分区排序：内置工具按字母序在前，MCP 工具追加在后，不做全局排序。原因是 API 服务器在最后一个内置工具之后设置了缓存断点，分区确保添加 MCP 工具不影响内置工具的缓存命中。
-
-### 工具执行生命周期 — 8 个阶段
-
-```mermaid
-flowchart TD
-    Input[模型输出 tool_use block] --> Find["1. 工具查找"]
-    Find --> Validate["2. 输入验证（Schema + 业务逻辑）"]
-    Validate --> Parallel["3. 并行启动"]
-
-    subgraph 并行
-        Hook["Pre-Tool Hook"]
-        Classifier["Bash 安全分类器"]
-    end
-
-    Parallel --> Hook
-    Parallel --> Classifier
-    Hook --> Perm["4. 权限检查（Hook→工具→规则→分类器→交互确认）"]
-    Classifier --> Perm
-
-    Perm --> Exec["5. tool.call()（流式进度）"]
-    Exec --> Result["6. 结果处理（大结果持久化到磁盘）"]
-    Result --> PostHook["7. Post-Tool Hook"]
-    PostHook --> Emit["8. tool_result 返回给模型"]
-```
-
-几个值得关注的阶段：
-
-**Stage 2 两阶段验证**：Phase 1 是 Schema 验证（字段类型），Phase 2 是业务逻辑（如 FileEditTool 检查 old_string 是否唯一）。分离确保低成本检查先执行，减少不必要的磁盘 I/O。
-
-**Stage 3 并行启动**：Pre-Tool Hook 和 Bash 分类器同时启动，各需数十到数百毫秒，并行化降低权限检查总延迟。
-
-**Stage 6 大结果处理**：结果超过 `max_result_size_chars` 时，完整内容保存到磁盘，模型收到文件路径 + 截断指示符，需要时通过 FileReadTool 主动拉取。
-
-> **核心设计哲学：错误是数据，不是异常。** 任何阶段的错误都转换为带 `is_error: True` 的 `tool_result` 返回给模型，让模型自我纠正。
-
-### 并发控制
-
-```python
-def can_execute_tool(self, is_concurrency_safe: bool) -> bool:
-    executing_tools = [t for t in self.tools if t.status == 'executing']
+def _truncate_result(result: str) -> str:
+    if len(result) <= MAX_RESULT_CHARS:
+        return result
+    # 保留头尾，中间进行截断
+    keep = (MAX_RESULT_CHARS - 60) // 2
     return (
-        len(executing_tools) == 0 or
-        (is_concurrency_safe and all(t.is_concurrency_safe for t in executing_tools))
+        result[:keep]
+        + f"\n\n[... truncated {len(result) - keep * 2} chars ...]\n\n"
+        + result[-keep:]
     )
 ```
 
-规则很简单：非并发安全的工具必须独占执行；多个并发安全工具可以同时跑。`StreamingToolExecutor` 不等模型输出完所有 tool_use blocks，一旦检测到完整 block 就立即启动执行——工具执行延迟约 1 秒，模型流式输出持续 5-30 秒，大部分工具可以完全隐藏在流式窗口内。
+#### 注意什么
 
-并发上限 `MAX_TOOL_USE_CONCURRENCY = 10`。
+- 必须对大结果进行物理截断，否则一次错误的 Shell 输出（如输出上万行日志）就能彻底废掉当前会话。
 
-### edit_file 的核心设计
+---
 
-FileEditTool 执行前有 14 步验证（按 I/O 成本排序：先检查内存状态，再访问磁盘），其中最关键的三个：
+### 步骤 2：自动创建父目录的写入工具 `write_file`
 
-**读取前置检查**：代码层面的强制约束，不只是 prompt 建议。未先读取文件则拒绝执行，确保模型基于文件当前状态编辑而非过时记忆。
+#### 为什么做
 
-**外部修改检测**：通过 mtime 检测文件在读取后是否被外部修改（比如用户在 IDE 中编辑了同一个文件），解决真实竞争条件。
+Agent 经常需要创建新代码文件。如果直接调用底层的 Python 写入，一旦目标路径中的某些父目录不存在，就会报错失败。我们应该让写入工具具备自动创建缺失路径（`mkdir -p`）的能力，减少 Agent 对 Shell 命令的依赖。
 
-**配置文件保护**：对 `.claude/settings.json` 等，验证会模拟执行编辑后做 JSON Schema 校验，防止看似合理的编辑损坏配置格式。
+#### 做什么
 
-### 为什么用 search-and-replace
-
-在确定 search-and-replace 之前，有几种备选方案：
-
-| 方案 | 致命缺陷 |
-|------|---------|
-| 行号编辑 | 位置相关：第一次插入 3 行后，后续所有行号偏移，多步编辑需要复杂重算 |
-| AST 编辑 | 语法错误的文件恰恰最需要编辑，而 AST 解析器遇到语法错误会直接报错 |
-| Unified diff | LLM 生成严格格式时表现很差：hunk header 行号、`+`/`-`/空格前缀任一出错则 patch 无法应用 |
-| 全文件重写 | 大文件浪费 Token；模型可能遗漏未修改代码；用户无法快速 review |
-| **字符串替换** | 无上述缺陷 |
-
-search-and-replace 最被低估的优势是**幻觉安全**：模型提供了一个文件中不存在的字符串，工具直接失败，模型重新读取文件纠正记忆。全文件重写则可能静默地把错误的内容写入文件。
-
-## 我们的简化决策
-
-| Claude Code 的设计 | 我们的简化 | 简化理由 |
-|-------------------|-----------|---------|
-| 66+ 工具类，每个独立目录 | 1 个文件 + 6 个函数 | 教程不需要工业级模块化 |
-| 8 阶段生命周期 | 直接 switch 分发 + 执行 | 省略 Hook、权限检查、分类器 |
-| StreamingToolExecutor 并发 | 串行逐个执行 | 避免并发复杂度 |
-| 14 步验证流水线 | 唯一性检查 + 引号容错 | 保留最关键的 2 个验证 |
-| 三级大结果限制 | 单层 50K 截断 | 足够防止上下文爆炸 |
-| MCP 7 种传输 + OAuth | 不支持 MCP | 教程聚焦核心概念 |
-
-核心理念：**保留设计哲学，砍掉工程复杂度**。
-
-## 我们的实现
-
-### 工具定义：静态数组
+在 `tools.py` 中编写 `_write_file` 逻辑：
 
 ```python
-# tools.py — 工具定义（Anthropic Tool schema 格式）
+# tools.py（续）
 
-tool_definitions: list[ToolDef] = [
+
+def _write_file(inp: dict) -> str:
+    try:
+        path = Path(inp["file_path"])
+        # 自动创建任意不存在的父级目录
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(inp["content"], encoding="utf-8")
+
+        lines = inp["content"].split("\n")
+        preview = "\n".join(f"{i+1:4d} | {l}" for i, l in enumerate(lines[:30]))
+        trunc = f"\n  ... ({len(lines)} lines total)" if len(lines) > 30 else ""
+        return f"Successfully wrote to {inp['file_path']} ({len(lines)} lines):\n\n{preview}{trunc}"
+    except Exception as e:
+        return f"Error writing file: {e}"
+```
+
+#### 注意什么
+
+- 工具返回结果中包含了前 30 行的预览，使 Agent 能够确认写入内容格式正确，无需立即调用 `read_file` 进行再次读取。
+
+---
+
+### 步骤 3：具备引号容错和唯一匹配校验的 `edit_file`
+
+#### 为什么做
+
+这是 Coding Agent 中**最核心也是技术点最多**的工具。
+1. **精确替换（Search-and-Replace）**：通过要求 LLM 提供原文中唯一的 `old_string` 和准备替换的 `new_string` 实施修改。相较于“Unified diff”和“行号编辑”，这种方式对 LLM 极其友好且不容易因格式错乱损坏文件。
+2. **唯一性校验**：必须验证 `old_string` 在文件中仅出现 **1 次**。若匹配多次，必须拒绝，否则可能导致错误替换别处的代码。若为 0 次，说明模型记忆产生了幻觉。
+3. **引号容错（Quote Normalization）**：LLM 在处理 Token 时经常将直引号（`"`）和弯引号（`“`）混淆，导致匹配失败。我们必须在后台对其做容错对齐，匹配成功后仍换回文件原样。
+
+#### 做什么
+
+在 `tools.py` 中实现引号标准化、轻量级 diff 生成及 `edit_file` 替换方法：
+
+```python
+# tools.py（续）
+
+
+def _normalize_quotes(s: str) -> str:
+    s = re.sub("[‘’′]", "'", s)
+    s = re.sub('[“”″]', '"', s)
+    return s
+
+
+def _find_actual_string(file_content: str, search_string: str) -> str | None:
+    if search_string in file_content:
+        return search_string
+    # 转换为直引号后再次匹配
+    norm_search = _normalize_quotes(search_string)
+    norm_file = _normalize_quotes(file_content)
+    idx = norm_file.find(norm_search)
+    if idx != -1:
+        # 返回文件里的原样字符串，保持代码本身的风格
+        return file_content[idx : idx + len(search_string)]
+    return None
+
+
+def _generate_diff(old_content: str, old_string: str, new_string: str) -> str:
+    # 根据 old_string 在前文中出现的 \n 计算起始行号
+    line_num = old_content.split(old_string)[0].count("\n") + 1
+    old_lines = old_string.split("\n")
+    new_lines = new_string.split("\n")
+    parts = [f"@@ -{line_num},{len(old_lines)} +{line_num},{len(new_lines)} @@"]
+    parts.extend(f"- {l}" for l in old_lines)
+    parts.extend(f"+ {l}" for l in new_lines)
+    return "\n".join(parts)
+
+
+def _edit_file(inp: dict) -> str:
+    try:
+        path = Path(inp["file_path"])
+        content = path.read_text(encoding="utf-8")
+
+        actual = _find_actual_string(content, inp["old_string"])
+        if not actual:
+            return f"Error: old_string not found in {inp['file_path']}"
+
+        # 唯一性校验防止误替换
+        count = content.count(actual)
+        if count > 1:
+            return f"Error: old_string found {count} times in {inp['file_path']}. Must be unique."
+
+        new_content = content.replace(actual, inp["new_string"], 1)
+        path.write_text(new_content, encoding="utf-8")
+
+        diff = _generate_diff(content, actual, inp["new_string"])
+        note = " (matched via quote normalization)" if actual != inp["old_string"] else ""
+        return f"Successfully edited {inp['file_path']}{note}\n\n{diff}"
+    except Exception as e:
+        return f"Error editing file: {e}"
+```
+
+#### 注意什么
+
+- 当匹配到多次或未匹配时，要向模型返回清晰的报错，模型会自动读取文件重新尝试。**错误是数据，不是程序崩溃。**
+
+---
+
+### 步骤 4：超时捕获与合并输出的 `run_shell`
+
+#### 为什么做
+
+Agent 常运行测试或构建任务。我们需要：
+1. **合并捕获 stdout 和 stderr**：程序报错通常在 stderr 中，两者缺一不可。
+2. **超时机制**：防止运行像 `ping` 这种永远不会自动停止的命令导致整个 Agent 彻底挂起。
+
+#### 做什么
+
+在 `tools.py` 中编写命令执行逻辑：
+
+```python
+# tools.py（续）
+
+
+def _run_shell(inp: dict) -> str:
+    try:
+        timeout = inp.get("timeout") or 30
+        result = subprocess.run(
+            inp["command"],
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        stdout = f"\nStdout:\n{result.stdout}" if result.stdout else ""
+        stderr = f"\nStderr:\n{result.stderr}" if result.stderr else ""
+        if result.returncode != 0:
+            return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
+        return result.stdout or "(command succeeded with no output)"
+    except subprocess.TimeoutExpired:
+        return f"Error: Command timed out after {timeout} seconds"
+    except Exception as e:
+        return f"Error: {e}"
+```
+
+#### 注意什么
+
+- 当命令成功但无输出（例如 `mkdir`）时，要返回明确的说明（如 `(command succeeded with no output)`），避免 Agent 认为发生了异常或无休止重试。
+
+---
+
+### 步骤 5：注册新工具并重构工具分发器 `execute_tool`
+
+#### 为什么做
+
+最后，我们将所有实现的新工具声明加入 `tool_definitions` 数组中，并在 `execute_tool` 分发函数里配置相应的路由，同时应用大结果自动截断。
+
+#### 做什么
+
+更新 `tools.py` 中的静态声明及 `execute_tool` 分发方法：
+
+```python
+# tools.py（续）
+
+# 添加工具定义（合并入已有定义中）
+tool_definitions: list[dict] = [
+    # list_files 的定义（保留自第 1 课）
+    {
+        "name": "list_files",
+        "description": "List files matching a glob pattern.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Glob pattern"},
+                "path": {"type": "string", "description": "Base directory"},
+            },
+            "required": ["pattern"],
+        },
+    },
     {
         "name": "read_file",
         "description": "Read the contents of a file. Returns the file content with line numbers.",
@@ -206,386 +288,159 @@ tool_definitions: list[ToolDef] = [
             "required": ["file_path"],
         },
     },
-    # ... write_file, edit_file, list_files, grep_search, run_shell
+    {
+        "name": "write_file",
+        "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "The path to the file to write"},
+                "content": {"type": "string", "description": "The content to write to the file"},
+            },
+            "required": ["file_path", "content"],
+        },
+    },
+    {
+        "name": "edit_file",
+        "description": "Edit a file by replacing an exact string match with new content. The old_string must match exactly.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "The path to the file to edit"},
+                "old_string": {"type": "string", "description": "The exact string to find and replace"},
+                "new_string": {"type": "string", "description": "The string to replace it with"},
+            },
+            "required": ["file_path", "old_string", "new_string"],
+        },
+    },
+    {
+        "name": "run_shell",
+        "description": "Execute a shell command and return its output.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The shell command to execute"},
+                "timeout": {"type": "number", "description": "Timeout in seconds (default: 30)"},
+            },
+            "required": ["command"],
+        },
+    },
 ]
-```
 
-这些定义直接传给 Anthropic API 的 `tools` 参数，格式完全一致，不需要任何转换。
 
-**为什么用静态数组而非类？** Claude Code 用类体系是因为 66+ 工具需要继承、多态、独立测试。6 个工具用一个数组 + 一个 switch 就够了，简单性本身就是价值。
+def get_tool_definitions() -> list[dict]:
+    return tool_definitions
 
-### 工具执行：switch 分发器
 
-```python
 async def execute_tool(name: str, inp: dict) -> str:
     handlers = {
+        "list_files": _list_files,  # 第一课实现
         "read_file": _read_file,
         "write_file": _write_file,
         "edit_file": _edit_file,
-        "list_files": _list_files,
-        "grep_search": _grep_search,
         "run_shell": _run_shell,
     }
     handler = handlers.get(name)
     if not handler:
         return f"Unknown tool: {name}"
-    return _truncate_result(handler(inp))
+
+    # 执行对应函数并自动拦截大结果输出
+    result = handler(inp)
+    return _truncate_result(result)
+
+
+# _list_files 的实现（第一课已写好，此处省略）
 ```
 
-`default` 分支返回 `Unknown tool: {name}` 而非抛异常——体现"错误是数据"的设计，让模型能自我纠正幻觉出的工具名。
+#### 注意什么
 
-### 逐个工具详解
-
-#### read_file
-
-```python
-def _read_file(inp: dict) -> str:
-    try:
-        content = Path(inp["file_path"]).read_text()
-        lines = content.split("\n")
-        numbered = "\n".join(f"{i+1:4d} | {line}" for i, line in enumerate(lines))
-        return numbered
-    except Exception as e:
-        return f"Error reading file: {e}"
-```
-
-加行号是为了让 LLM 定位代码位置，但 `edit_file` 匹配时用的是实际内容字符串，不是行号。
-
-#### edit_file — 最关键的工具
-
-```python
-def _edit_file(inp: dict) -> str:
-    try:
-        path = Path(inp["file_path"])
-        content = path.read_text()
-
-        # 引号容错匹配
-        actual = _find_actual_string(content, inp["old_string"])
-        if not actual:
-            return f"Error: old_string not found in {inp['file_path']}"
-
-        count = content.count(actual)
-        if count > 1:
-            return f"Error: old_string found {count} times in {inp['file_path']}. Must be unique."
-
-        new_content = content.replace(actual, inp["new_string"], 1)
-        path.write_text(new_content)
-
-        diff = _generate_diff(content, actual, inp["new_string"])
-        quote_note = " (matched via quote normalization)" if actual != inp["old_string"] else ""
-        return f"Successfully edited {inp['file_path']}{quote_note}\n\n{diff}"
-    except Exception as e:
-        return f"Error editing file: {e}"
-```
-
-唯一匹配检查是核心：出现 0 次说明模型对文件内容记忆有误（幻觉检测），出现 > 1 次则要求模型提供更多上下文来唯一标识修改点。"宁可失败也不猜测"——静默替换第一个匹配远比告知失败危险。
-
-#### 引号容错 + Diff 输出
-
-LLM 的 tokenization 可能将直引号映射为弯引号（`"` → `"`），没有容错机制这类编辑会 100% 失败。
-
-```python
-def _normalize_quotes(s: str) -> str:
-    s = re.sub("[‘’′]", "'", s)
-    s = re.sub('[“”″]', '"', s)
-    return s
-
-def _find_actual_string(file_content: str, search_string: str) -> str | None:
-    if search_string in file_content:
-        return search_string
-    norm_search = _normalize_quotes(search_string)
-    norm_file = _normalize_quotes(file_content)
-    idx = norm_file.find(norm_search)
-    if idx != -1:
-        return file_content[idx:idx + len(search_string)]
-    return None
-```
-
-关键细节：匹配成功后返回**文件中的原始字符串**而非标准化版本，替换时保持文件原始字符风格。
-
-编辑成功后生成简易 diff，行号通过计算 `old_string` 前面有几个 `\n` 得出：
-
-```
-Successfully edited src/app.py (matched via quote normalization)
-
-@@ -15,1 +15,1 @@
-- msg = "hello"
-+ msg = "world"
-```
-
-#### write_file
-
-```python
-def _write_file(inp: dict) -> str:
-    try:
-        path = Path(inp["file_path"])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(inp["content"])
-        lines = inp["content"].split("\n")
-        line_count = len(lines)
-        preview = "\n".join(f"{i+1:4d} | {l}" for i, l in enumerate(lines[:30]))
-        trunc = f"\n  ... ({line_count} lines total)" if line_count > 30 else ""
-        return f"Successfully wrote to {inp['file_path']} ({line_count} lines)\n\n{preview}{trunc}"
-    except Exception as e:
-        return f"Error writing file: {e}"
-```
-
-自动创建父目录（`mkdir -p` 效果）避免模型还得额外调用 shell 命令。System Prompt 里告诉 LLM 优先用 `edit_file`，只对新文件用 `write_file`。
-
-#### grep_search
-
-```python
-def _grep_search(inp: dict) -> str:
-    pattern = inp["pattern"]
-    path = inp.get("path") or "."
-    include = inp.get("include")
-
-    try:
-        args = ["grep", "--line-number", "--color=never", "-r"]
-        if include:
-            args.append(f"--include={include}")
-        args.extend(["--", pattern, path])
-        result = subprocess.run(args, capture_output=True, text=True, timeout=10)
-        if result.returncode == 1:
-            return "No matches found."
-        if result.returncode != 0:
-            return f"Error: {result.stderr}"
-        lines = [l for l in result.stdout.split("\n") if l]
-        output = "\n".join(lines[:100])
-        if len(lines) > 100:
-            output += f"\n... and {len(lines) - 100} more matches"
-        return output
-    except Exception as e:
-        return f"Error: {e}"
-```
-
-`--color=never` 禁用 ANSI 颜色代码（输出给模型看的，不需要颜色）。Python 版本的 `--` 分隔符确保以 `-` 开头的 pattern 不被误解析为 grep 选项。
-
-grep 退出码 1 表示"无匹配"不是错误，2+ 才是真正错误，需要分别处理。结果截断为前 100 条，附加 `... and N more matches` 提示。
-
-Claude Code 用 ripgrep (`rg`)，我们用系统 `grep`——功能够用，少一个依赖。
-
-#### run_shell
-
-```python
-def _run_shell(inp: dict) -> str:
-    try:
-        timeout = inp.get("timeout", 30)
-        result = subprocess.run(
-            inp["command"],
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if result.returncode != 0:
-            stderr = f"\nStderr: {result.stderr}" if result.stderr else ""
-            stdout = f"\nStdout: {result.stdout}" if result.stdout else ""
-            return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
-        return result.stdout or "(no output)"
-    except subprocess.TimeoutExpired:
-        return f"Command timed out after {inp.get('timeout', 30)}s"
-    except Exception as e:
-        return f"Error: {e}"
-```
-
-失败时同时返回 stdout 和 stderr——很多编译器在 stderr 输出错误的同时，stdout 可能有有用的部分输出。`"(no output)"` 避免模型在命令成功但无输出时（`mkdir`、`touch`）产生困惑。
-
-Claude Code 的 BashTool 分布在 18 个源文件中，有 AST 解析命令、沙箱执行、23 个安全检查。我们只做 timeout 保护（安全机制在第 6 章详述）。
-
-### 工具结果截断
-
-```python
-MAX_RESULT_CHARS = 50000
-
-def _truncate_result(result: str) -> str:
-    if len(result) <= MAX_RESULT_CHARS:
-        return result
-    keep_each = (MAX_RESULT_CHARS - 60) // 2
-    return (
-        result[:keep_each]
-        + f"\n\n[... truncated {len(result) - keep_each * 2} chars ...]\n\n"
-        + result[-keep_each:]
-    )
-```
-
-保留头尾而非只保留头部，因为很多命令的关键输出在末尾（编译错误摘要、测试结果统计）。截断提示明确告知模型内容被截断，模型可据此决定是否用 `grep_search` 或 `read_file` 获取完整内容。
-
-### WebFetch 工具
-
-让 Agent 能访问 URL 获取内容——查文档、读 API 响应、抓取网页信息：
-
-```python
-# tools.py — web_fetch 定义
-{
-    "name": "web_fetch",
-    "description": "Fetch a URL and return its content as text. For HTML pages, tags are stripped.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "url": {"type": "string", "description": "The URL to fetch"},
-            "max_length": {"type": "number", "description": "Maximum content length (default 50000)"},
-        },
-        "required": ["url"],
-    },
-}
-
-# tools.py — web_fetch 执行
-async def _web_fetch(inp: dict) -> str:
-    url = inp["url"]
-    max_length = inp.get("max_length", 50000)
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(url, headers={"User-Agent": "mini-claude/1.0"})
-            response.raise_for_status()
-            text = response.text
-            if "html" in response.headers.get("content-type", ""):
-                text = re.sub(r"<script[\s\S]*?</script>", "", text, flags=re.I)
-                text = re.sub(r"<style[\s\S]*?</style>", "", text, flags=re.I)
-                text = re.sub(r"<[^>]*>", " ", text)
-                text = text.replace("&nbsp;", " ").replace("&amp;", "&")
-                text = re.sub(r"\s{2,}", " ", text)
-                text = re.sub(r"\n{3,}", "\n\n", text).strip()
-            if len(text) > max_length:
-                text = text[:max_length] + f"\n\n[... truncated at {max_length} characters]"
-            return text or "(empty response)"
-    except httpx.TimeoutException:
-        return "Error: Request timed out (30s)"
-    except Exception as e:
-        return f"Error fetching {url}: {e}"
-```
-
-设计选择：
-- **30 秒超时**：防止模型访问慢速或无响应的 URL 时阻塞整个循环
-- **HTML 去标签**：LLM 不需要看 HTML 标签，纯文本更高效
-- **50KB 上限**：避免网页内容挤占上下文窗口
-- 标记为并发安全（只读、无副作用），可并行执行
-
-### Read-before-edit + mtime 防护
-
-Claude Code 的一个重要安全机制：**编辑文件前必须先读取**。这防止模型在不了解文件当前内容的情况下盲目修改，同时检测外部修改避免覆盖用户的手动编辑。
-
-```python
-# tools.py — execute_tool 中的 mtime 追踪
-
-async def execute_tool(
-    name: str,
-    inp: dict,
-    read_file_state: dict[str, float] | None = None,  # filepath → mtime
-) -> str:
-    if name == "read_file":
-        result = _read_file(inp)
-        # 记录文件的修改时间
-        if read_file_state and not result.startswith("Error"):
-            abs_path = str(Path(inp["file_path"]).resolve())
-            try:
-                read_file_state[abs_path] = Path(abs_path).stat().st_mtime
-            except OSError:
-                pass
-        return result
-
-    if name in ("write_file", "edit_file"):
-        abs_path = str(Path(inp["file_path"]).resolve())
-        # 已存在的文件必须先 read
-        if read_file_state and Path(abs_path).exists():
-            if abs_path not in read_file_state:
-                return "Error: You must read this file before editing. Use read_file first."
-            # mtime 变化说明文件被外部修改
-            cur_mtime = Path(abs_path).stat().st_mtime
-            if cur_mtime != read_file_state[abs_path]:
-                return "Warning: file was modified externally. Please read_file again."
-
-        result = _write_file(inp) if name == "write_file" else _edit_file(inp)
-        # 更新 mtime
-        if read_file_state and not result.startswith("Error"):
-            try:
-                read_file_state[abs_path] = Path(abs_path).stat().st_mtime
-            except OSError:
-                pass
-        return result
-
-    # ... 其他工具
-```
-
-三个关键点：
-- **read_file_state dict** 在 Agent 实例中维护，key 是绝对路径，value 是上次读取时的 `mtime`
-- **新文件跳过检查**：`Path(abs_path).exists()` 为 False 时不强制先读——创建新文件不需要先读
-- **mtime 比较**：读取时记录 mtime，写入前比较。如果不一致，说明文件在 Agent 读取后被用户或其他进程修改了，返回警告而非静默覆盖
-
-这与 Claude Code 的 `readFileTimestamps` 机制对齐——编辑必须基于已知状态，不能"盲写"。
-
-### ToolSearch 延迟加载
-
-当工具数量增多时（66+ 工具），把所有工具的 schema 都发给 API 会浪费大量 token。Claude Code 的做法是**延迟加载**：不常用的工具只发名称，模型需要时通过 `ToolSearch` 按需激活。
-
-```python
-# tools.py — deferred 标记
-{
-    "name": "enter_plan_mode",
-    "description": "Enter plan mode to switch to a read-only planning phase...",
-    "input_schema": {"type": "object", "properties": {}},
-    "deferred": True,  # 标记为延迟加载
-}
-
-# tools.py — tool_search 工具
-{
-    "name": "tool_search",
-    "description": "Search for available tools by name or keyword. Returns full schemas for matching deferred tools.",
-    "input_schema": {
-        "type": "object",
-        "properties": {"query": {"type": "string", "description": "Tool name or search keywords"}},
-        "required": ["query"],
-    },
-}
-
-# tools.py — 激活逻辑
-_activated_tools: set[str] = set()
-
-def get_active_tool_definitions(all_tools=None):
-    tools = all_tools or tool_definitions
-    return [
-        {k: v for k, v in t.items() if k != "deferred"}
-        for t in tools
-        if not t.get("deferred") or t["name"] in _activated_tools
-    ]
-
-# tool_search 执行：匹配 → 激活 → 返回 schema
-def _tool_search(inp: dict) -> str:
-    query = inp.get("query", "").lower()
-    deferred = [t for t in tool_definitions if t.get("deferred")]
-    matches = [t for t in deferred
-               if query in t["name"].lower() or query in t.get("description", "").lower()]
-    if not matches:
-        return "No matching deferred tools found."
-    for m in matches:
-        _activated_tools.add(m["name"])
-    return json.dumps([
-        {"name": t["name"], "description": t["description"], "input_schema": t["input_schema"]}
-        for t in matches
-    ], indent=2)
-```
-
-工作流程：
-1. API 调用时，`get_active_tool_definitions()` 过滤掉未激活的 deferred 工具（只发名称，不发 schema）
-2. System prompt 中告知模型哪些工具可以通过 `tool_search` 激活
-3. 模型需要时调用 `tool_search`，匹配的工具被加入 `_activated_tools` Set
-4. 下一次 API 调用自动包含已激活工具的完整 schema
-
-我们只有 2 个 deferred 工具（plan mode），但这个机制对扩展到 20+ 工具时至关重要。
-
-## 简化对比
-
-| 维度 | Claude Code | mini-claude |
-|------|------------|-------------|
-| **工具数量** | 66+ | 13（6 核心 + web_fetch + tool_search + skill + agent + 2 plan mode） |
-| **执行模式** | 并发执行 + streaming 早期启动 | 并行执行（concurrencySafe）+ streaming 早期启动 |
-| **搜索引擎** | ripgrep（rg） | 系统 grep |
-| **编辑验证** | 14 步流水线 + readFileTimestamps | 引号容错 + 唯一性 + diff + read-before-edit + mtime |
-| **Shell 安全** | AST 解析 + 沙箱 | 正则匹配 + 确认 |
-| **结果截断** | 选择性裁剪 + 磁盘持久化 | 保留头尾 50K + 30KB 磁盘持久化 |
-| **延迟加载** | deferred tools + ToolSearch | deferred 标记 + tool_search |
-| **网络访问** | WebFetch（去标签 + 超时） | web_fetch（去标签 + 30s 超时 + 50KB 上限） |
+- 分发器没有抛出 Python 异常，而是选择返回 `"Unknown tool: {name}"` 的字符串。这有助于让模型自主理解并修复其拼写错误的“工具幻觉”。
 
 ---
 
-> **下一章**：工具定义了 agent 的能力，但 System Prompt 定义了它的行为——怎么用这些工具、什么时候该小心。
+## ⚖️ 设计权衡
+
+### 字符串精细替换（Search-and-Replace） vs Unified diff
+
+- **方案 A**：**字符串精细替换**（我们所用）
+  - 要求提供唯一的原文片段并给入新替换片段。
+  - **优点**：LLM 几乎不会犯错，即使由于引号混淆也有容错拦截；失败时极具“幻觉安全性”（不匹配直接报错失败，绝不猜）。
+  - **缺点**：如果大文件内存在多个一模一样的多行片段，则必须扩展定位上下文才能做唯一匹配。
+- **方案 B**：**Unified diff 补丁文件**
+  - 使用 Linux 的 `patch` 格式或提供包含修改位置的补丁文件。
+  - **优点**：支持多处同时替换。
+  - **缺点**：LLM 在精准输出 hunk header（例如 `@@ -12,4 +12,6 @@`）和 `+`/`-` 符号前缀时的格式控制极差，极易破坏补丁。
+
+**结论**：在 Agent 应用中，精确字符串匹配替换是最稳定、幻觉安全率最高的方案。
+
+---
+
+## ⚠️ 常见陷阱
+
+### 1. `edit_file` 未限制唯一匹配导致多处误改
+
+```python
+# ❌ 错误：这会导致只要找到匹配项就替换全部，或者静默改变别处代码
+new_content = content.replace(inp["old_string"], inp["new_string"])
+```
+
+**后果**：程序可能会把项目里其他完全不相关的方法一并修改，造成非常隐蔽的 Bug。
+**修正**：先使用 `.count()` 检测匹配计数是否精确为 1，如非 1 必须返回 Error。且使用 `.replace(..., ..., 1)` 确保即使发生了多次也只限制首个以保证受控。
+
+---
+
+### 2. 弯引号造成编辑大量报错
+
+大语言模型常输出中英文弯双引号（`“”`）或弯单引号（`‘’`）。如果不做后台统一化，会让 30% 以上的 `edit_file` 修改直接抛出 `old_string not found`。
+
+**修正**：运行 `_find_actual_string()` 过滤器，若匹配失败，则在后台通过正则将所有弯引号和特殊符号一并标准化对齐，再行检索文件内容。
+
+---
+
+## ✅ 验收点
+
+### 输入
+
+创建一个用于测试编辑的 `test_edit.txt` 文件，写入：
+```
+hello world
+"msg" = "hello"
+goodbye world
+```
+
+然后通过 Agent 将中间的直引号编辑为弯引号（如果能实现，说明编辑及引号容错工作完全正常）：
+```bash
+python -m mini_claude "把 test_edit.txt 文件中的直引号 '\"msg\" = \"hello\"' 替换为 '“msg” = “hello”'"
+```
+
+### 预期结果
+
+Agent 正确调用 `edit_file`，修改生效。再次查看该文件，内容已被正确更新。且终端输出成功渲染如下形式的局部 diff：
+```
+Successfully edited test_edit.txt
+
+@@ -2,1 +2,1 @@
+- "msg" = "hello"
++ “msg” = “hello”
+```
+
+---
+
+## 🧠 思考题
+
+1. **为什么在 `read_file` 中输出的行号我们用 ` | ` 隔开，而在 `edit_file` 替换时却不能把行号作为 `old_string` 的一部分匹配？**
+   *(提示：行号是我们的工具在读取时动态拼装上去提供给 LLM 参考的虚拟数据，文件物理磁盘上并没有这些行号。)*
+2. **在 `run_shell` 超时设计中，如果超时时间设置得太大或没有超时（例如 30s 变成无穷大），一旦 Agent 运行了持续监听进程（例如跑一个前端 `npm run dev` 服务器），系统会发生什么？**
+   *(提示：Agent 将在 `run_shell` 调用中永久死锁，直到父进程被硬杀。)*
+
+---
+
+## 📦 本节收获
+
+1. **精确替换机制**：掌握了精确匹配替换算法和幻觉拦截设计。
+2. **防过载截断**：实现了头尾截断方案，拦截大文件或日志对会话的撑爆。
+3. **鲁棒性边缘设计**：懂得了如何通过引号标准化提高工具对自然语言大模型的包容度。
+
+---
+
+> **下一章**：工具定义了 Agent 的物理能力边界，而 System Prompt 则定义了它在面对这些工具时的行为准则。

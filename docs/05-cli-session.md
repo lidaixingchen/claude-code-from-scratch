@@ -1,156 +1,322 @@
-# 4. CLI 与会话
+# 第 05 课：CLI 与会话持久化
 
-## 本章目标
+## 🎯 本节目标
 
-构建用户接口层：命令行参数解析、交互式 REPL、Ctrl+C 中断处理、会话持久化和恢复。
+为 Agent 构建用户交互层与状态持久化机制。实现交互式命令行终端（REPL）、Ctrl+C 优雅中断机制，并支持将会话历史以 JSON 格式持久化到本地磁盘，允许用户通过 `--resume` 参数恢复上次对话。
 
-```mermaid
-graph TB
-    Entry[__main__.py 入口] --> Parse[parseArgs<br/>参数解析]
-    Parse --> |有 prompt| OneShot[单次模式<br/>agent.chat → 退出]
-    Parse --> |无 prompt| REPL[REPL 模式<br/>readline 循环]
-    Parse --> |--resume| Restore[恢复会话]
-    Restore --> REPL
-    REPL --> |用户输入| Cmd{命令?}
-    Cmd -->|/clear| Clear[清空历史]
-    Cmd -->|/cost| Cost[显示费用]
-    Cmd -->|/compact| Compact[压缩上下文]
-    Cmd -->|/plan| Plan[切换 plan mode]
-    Cmd -->|普通文本| Chat[agent.chat]
-    Chat --> Save[自动保存会话]
+---
 
-    style Entry fill:#7c5cfc,color:#fff
-    style REPL fill:#e8e0ff
+## 🏆 最终效果
+
+完成本节后，用户可以直接启动 Agent 进入交互式终端（REPL）：
+
+```bash
+python -m mini_claude
 ```
 
-## Claude Code 怎么做的
-
-Claude Code 的入口是 `src/entrypoints/cli.tsx`——用 React/Ink 把组件模型搬进终端，支持流式 Markdown 渲染、Vim 模式、多 Tab、键盘自定义。会话用 JSONL 格式追加写入，崩溃安全。
-
-### 终端原生 vs GUI
-
-这是一个主动选择。开发者的工作流在终端里，打开浏览器意味着上下文切换。终端原生就是另一个命令行工具，跟 `git`、`grep` 一样嵌入到已有工作流。具体好处：SSH 环境可用、可接管道 (`echo "fix" | claude`)、支持 tmux 多实例并行、内存开销接近零。
-
-React/Ink 的作用是弥补终端的交互限制——有了组件模型，流式输出、diff 视图这类复杂 UI 才变得可维护。
-
-### 可观察的自主性
-
-Claude Code UX 的核心理念：**Agent 自由行动，但让用户实时看到每一步**。
-
+你将看到精美的欢迎信息与命令行提示符：
 ```
-📖 read_file src/app.py
-  1 | from flask import Flask
-  ... (1234 chars total)
+  Mini Claude Code — A minimal coding agent
 
-✏️ edit_file src/app.py
-  - port = 3000
-  + port = int(os.environ.get("PORT", 3000))
+  Type your request, or 'exit' to quit.
+  Commands: /clear /plan /cost
+
+> hello
 ```
 
-中断成本远低于撤销成本。用户在 Agent 走错方向前 3 秒就能按 Ctrl+C，而不是等 20 秒执行完再花更多时间撤销。每个工具有 4 种渲染方法（开始/完成/被拒/报错），长时间运行的工具实时流式输出 stdout，而不是等完成才展示。
+**功能测试**：
+1. **指令测试**：输入 `/clear` 可以清空对话历史。
+2. **中断测试**：当 Agent 正在思考或执行工具时，按下 `Ctrl+C` 将会中断本次执行并返回 `> ` 提示符，而不会导致整个程序退出。在空闲状态下，双击 `Ctrl+C` 会退出程序。
+3. **会话恢复测试**：输入几句对话后输入 `exit` 退出，再次运行 `python -m mini_claude --resume`，Agent 将完美读取历史会话。
 
-### JSONL 会话存储
+---
 
-整体 JSON 覆盖写入有两个问题：写入中途崩溃会损坏整个文件；对话越长每次保存越慢。
+## 🛠️ 本节任务
 
-JSONL 每轮追加一行，O(1) 写入，崩溃最多丢最后一行。文件系统的 append 操作通常是原子的。恢复时逐行解析，跳过末尾不完整的行即可。
+1. **实现会话存储读写库**：在 `session.py` 中编写会话保存、读取与检索逻辑。
+2. **封装 Agent 公共接口与自动保存**：在 `agent.py` 中实现 `chat()` 封装，并在对话结束时自动持久化。
+3. **编写命令行参数解析**：在 `__main__.py` 中解析运行参数，支持命令行 prompt 直发与 `--resume` 恢复。
+4. **构建交互式 REPL 循环与信号拦截**：在 `__main__.py` 中实现 REPL 循环，注入 `Ctrl+C` 信号处理器。
 
-## 我们的实现
+---
 
-### 参数解析
+## 📦 涉及文件
+
+修改：
+- `python/mini_claude/session.py`
+- `python/mini_claude/agent.py`
+- `python/mini_claude/__main__.py`
+
+---
+
+## 🚀 开始实现
+
+### 步骤 1：实现会话存储读写库 `session.py`
+
+#### 为什么做
+
+Agent 在运行过程中，我们需要随时将其当前的对话历史持久化到本地。这样即便程序崩溃或用户主动退出，对话记录也不会丢失。我们会将会话以 JSON 格式保存在用户主目录下的 `.mini-claude/sessions` 目录中。
+
+#### 做什么
+
+创建（或覆写）`session.py`，实现会话的目录创建、保存、读取与查找最新会话 ID 的功能：
 
 ```python
-# __main__.py — parse_args
+# session.py
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+SESSION_DIR = Path.home() / ".mini-claude" / "sessions"
+
+
+def _ensure_dir() -> None:
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_session(session_id: str, data: dict[str, Any]) -> None:
+    _ensure_dir()
+    # 转换为漂亮格式的 JSON 保存
+    (SESSION_DIR / f"{session_id}.json").write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+
+
+def load_session(session_id: str) -> dict[str, Any] | None:
+    path = SESSION_DIR / f"{session_id}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def list_sessions() -> list[dict[str, Any]]:
+    _ensure_dir()
+    results = []
+    for f in SESSION_DIR.glob("*.json"):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if "metadata" in data:
+                results.append(data["metadata"])
+        except Exception:
+            pass
+    return results
+
+
+def get_latest_session_id() -> str | None:
+    sessions = list_sessions()
+    if not sessions:
+        return None
+    # 按照启动时间降序排序，获取最新会话
+    sessions.sort(key=lambda s: s.get("startTime", ""), reverse=True)
+    return sessions[0].get("id")
+```
+
+---
+
+### 步骤 2：封装 Agent 公共接口与自动保存
+
+#### 为什么做
+
+我们在第 1、2 课中实现的 `_chat` 是包含核心 `while` 循环的内部逻辑。我们需要向外部调用者提供一个更加健壮的公共接口 `chat()`，在开始前重置状态，并在每轮对话顺利结束时自动触发会话存储。
+
+#### 做什么
+
+修改 `agent.py`。
+1. 在初始化中定义唯一的 `session_id` 和 `session_start_time`。
+2. 封装公共 `chat` 方法，并在其中添加 `_auto_save()` 和 `restore_session()` 逻辑。
+
+```python
+# agent.py 中的修改
+
+import uuid
+import time
+from .session import save_session  # 导入保存函数
+
+class Agent:
+    def __init__(
+        self,
+        model: str = "claude-sonnet-4-6",
+        api_base: str | None = None,
+        api_key: str | None = None,
+    ):
+        self.model = model
+        self.use_openai = bool(api_base)
+        self._messages: list[dict] = []
+        
+        # 实例化唯一的会话参数
+        self.session_id = uuid.uuid4().hex[:8]
+        self.session_start_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self._aborted = False  # 中断标志位
+
+        if self.use_openai:
+            self._openai_client = openai.AsyncOpenAI(base_url=api_base, api_key=api_key)
+            self._anthropic_client = None
+        else:
+            self._anthropic_client = anthropic.AsyncAnthropic(api_key=api_key)
+            self._openai_client = None
+
+    def abort(self) -> None:
+        self._aborted = True
+
+    # 封装公共的对外对话方法
+    async def chat(self, user_message: str) -> None:
+        self._aborted = False  # 重置中断标志
+        try:
+            await self._chat(user_message)
+        finally:
+            # 无论成功还是被 Ctrl+C 中断，均尝试自动保存会话
+            self._auto_save()
+
+    def _auto_save(self) -> None:
+        try:
+            # 保存元数据与消息历史
+            save_session(self.session_id, {
+                "metadata": {
+                    "id": self.session_id,
+                    "model": self.model,
+                    "cwd": str(Path.cwd()),
+                    "startTime": self.session_start_time,
+                    "messageCount": len(self._messages),
+                },
+                "messages": self._messages,
+            })
+        except Exception:
+            pass
+
+    def restore_session(self, data: dict) -> None:
+        if "messages" in data:
+            self._messages = data["messages"]
+            print(f"  [cyan]ℹ Session restored ({len(self._messages)} messages).[/cyan]")
+
+    def clear_history(self) -> None:
+        self._messages.clear()
+        print("  [cyan]ℹ Conversation history cleared.[/cyan]")
+```
+
+#### 注意什么
+
+- `_auto_save` 必须包裹在 `try...except` 块中。会话保存属于非核心功能，绝不能因为磁盘写保护、空间不足等外部 IO 问题导致整个 Agent 执行崩溃。
+
+---
+
+### 步骤 3：编写参数解析与会话恢复逻辑
+
+#### 为什么做
+
+我们需要在命令行接收各种执行选项（例如 `--resume`、`--model`），并获取环境变量中的 API Key。同时要实现：若传入了具体的提示词，则直接运行单次任务并退出；若无参数，则启动 REPL 交互环境。
+
+#### 做什么
+
+重写 `__main__.py` 中的 `main()` 函数，接入参数解析与会话恢复流程：
+
+```python
+# __main__.py
+
+import os
+import sys
+import signal
+import asyncio
+import argparse
+from .agent import Agent
+from .session import load_session, get_latest_session_id
+from .ui import print_welcome, print_user_prompt, print_error, print_info
+
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="mini-claude", add_help=False)
-    parser.add_argument("prompt", nargs="*")
-    parser.add_argument("--yolo", "-y", action="store_true")
-    parser.add_argument("--plan", action="store_true")
-    parser.add_argument("--accept-edits", action="store_true")
-    parser.add_argument("--dont-ask", action="store_true")
-    parser.add_argument("--thinking", action="store_true")
-    parser.add_argument("--model", "-m", default=None)
-    parser.add_argument("--api-base", default=None)
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--max-cost", type=float, default=None)
-    parser.add_argument("--max-turns", type=int, default=None)
-    parser.add_argument("--help", "-h", action="store_true")
+    parser = argparse.ArgumentParser(description="Mini Claude Code CLI")
+    parser.add_argument("prompt", nargs="*", help="Direct prompt to run")
+    parser.add_argument("--model", "-m", default=None, help="Model name")
+    parser.add_argument("--api-base", default=None, help="API base URL")
+    parser.add_argument("--resume", action="store_true", help="Resume latest session")
     return parser.parse_args()
 
 
-def _resolve_permission_mode(args: argparse.Namespace) -> str:
-    if args.yolo: return "bypassPermissions"
-    if args.plan: return "plan"
-    if args.accept_edits: return "acceptEdits"
-    if args.dont_ask: return "dontAsk"
-    return "default"
-```
-
-Python 使用标准库 `argparse` 解析参数，零外部依赖，简洁且功能完备。
-
-### 两种运行模式
-
-```python
-# __main__.py — main
-
-def main() -> None:
+async def main_async():
     args = parse_args()
-    permission_mode = _resolve_permission_mode(args)
-    model = args.model or os.environ.get("MINI_CLAUDE_MODEL", "claude-opus-4-6")
-
-    resolved_api_key: str | None = None
-    resolved_use_openai = bool(args.api_base)
-    if os.environ.get("OPENAI_API_KEY") and os.environ.get("OPENAI_BASE_URL"):
-        resolved_api_key = os.environ["OPENAI_API_KEY"]
-        resolved_use_openai = True
-    elif os.environ.get("ANTHROPIC_API_KEY"):
-        resolved_api_key = os.environ["ANTHROPIC_API_KEY"]
-    elif os.environ.get("OPENAI_API_KEY"):
-        resolved_api_key = os.environ["OPENAI_API_KEY"]
-        resolved_use_openai = True
-
-    if not resolved_api_key:
-        print_error("API key is required.")
+    
+    # 确定 API 密钥
+    api_base = args.api_base or os.environ.get("OPENAI_BASE_URL")
+    api_key = os.environ.get("OPENAI_API_KEY") if api_base else os.environ.get("ANTHROPIC_API_KEY")
+    
+    if not api_key:
+        print_error("API Key not found. Please set ANTHROPIC_API_KEY or OPENAI_API_KEY.")
         sys.exit(1)
-
-    agent = Agent(permission_mode=permission_mode, model=model, thinking=args.thinking,
-                  max_cost_usd=args.max_cost, max_turns=args.max_turns, api_key=resolved_api_key)
-
+        
+    model = args.model or os.environ.get("MODEL") or ("gpt-4o" if api_base else "claude-sonnet-4-6")
+    
+    agent = Agent(model=model, api_base=api_base, api_key=api_key)
+    
+    # 恢复最新会话
     if args.resume:
-        session_id = get_latest_session_id()
-        if session_id:
-            session = load_session(session_id)
-            if session: agent.restore_session(session)
-
+        latest_id = get_latest_session_id()
+        if latest_id:
+            session_data = load_session(latest_id)
+            if session_data:
+                agent.restore_session(session_data)
+                
     prompt = " ".join(args.prompt) if args.prompt else None
     if prompt:
-        asyncio.run(agent.chat(prompt))
+        # 单次执行模式
+        await agent.chat(prompt)
     else:
-        asyncio.run(run_repl(agent))
+        # 进入交互式 REPL 模式
+        await run_repl(agent)
+
+
+def main():
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        print("\nBye!")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-### REPL 实现
+---
+
+### 步骤 4：构建交互式 REPL 循环与信号拦截
+
+#### 为什么做
+
+在交互模式下，如果大模型输出失控或执行了错误的工具，用户按下 `Ctrl+C` 的首要期望是**终止本次 Agent 执行并退回输入提示符**，而不是直接杀掉整个进程导致历史记录全部丢失。只有在没有任务执行且处于输入状态下连续按下 `Ctrl+C` 时，才应该退出程序。
+
+#### 做什么
+
+在 `__main__.py` 中实现 REPL 循环函数 `run_repl`，并向 Python 系统信号器注册 `SIGINT` (Ctrl+C) 的动态分发拦截：
 
 ```python
-# __main__.py — run_repl
+# __main__.py（续）
 
-async def run_repl(agent: Agent) -> None:
+
+async def run_repl(agent: Agent):
     sigint_count = 0
 
+    # 信号处理器
     def handle_sigint(sig, frame):
         nonlocal sigint_count
-        if agent._aborted is False and agent._output_buffer is not None:
+        # 若 Agent 正在运行且未被标记中断，则终止运行并返回提示符
+        if agent._aborted is False:
             agent.abort()
             print("\n  (interrupted)")
             sigint_count = 0
             print_user_prompt()
         else:
+            # 空闲时连续按下两次 Ctrl+C 则安全退出
             sigint_count += 1
-            if sigint_count >= 2: print("\nBye!\n"); sys.exit(0)
+            if sigint_count >= 2:
+                print("\nBye!")
+                sys.exit(0)
             print("\n  Press Ctrl+C again to exit.")
             print_user_prompt()
 
+    # 注册信号拦截
     signal.signal(signal.SIGINT, handle_sigint)
     print_welcome()
 
@@ -159,87 +325,120 @@ async def run_repl(agent: Agent) -> None:
         try:
             line = input()
         except (EOFError, KeyboardInterrupt):
-            print("\nBye!\n"); break
+            # 捕获 EOF (Ctrl+D) 或输入时的 Ctrl+C 退出
+            print("\nBye!")
+            break
 
         inp = line.strip()
-        sigint_count = 0
-        if not inp: continue
-        if inp in ("exit", "quit"): print("\nBye!\n"); break
+        sigint_count = 0  # 重置中断计数
+        
+        if not inp:
+            continue
+        if inp in ("exit", "quit"):
+            print("Bye!")
+            break
 
-        if inp == "/clear": agent.clear_history(); continue
-        if inp == "/cost": agent.show_cost(); continue
-        if inp == "/compact": await agent.compact(); continue
-        if inp == "/plan": agent.toggle_plan_mode(); continue
+        # 处理 REPL 命令
+        if inp == "/clear":
+            agent.clear_history()
+            continue
+        if inp == "/plan":
+            print("  [cyan]ℹ Plan mode toggled (Not fully implemented yet).[/cyan]")
+            continue
+        if inp == "/cost":
+            print("  [cyan]ℹ Cost tracking: $0.00 (Mocked for now).[/cyan]")
+            continue
 
         try:
             await agent.chat(inp)
+        except asyncio.CancelledError:
+            # 捕获取消异常，防输出红字报错
+            pass
         except Exception as e:
-            if "abort" not in str(e).lower(): print_error(str(e))
+            if "abort" not in str(e).lower():
+                print_error(str(e))
 ```
 
-**Ctrl+C 的双重语义**：处理中按下 → 中断当前操作，回到输入提示；空闲时按下 → 第一次提醒，第二次退出。这避免了两种意外：手滑 Ctrl+C 导致整个会话丢失，以及 Agent 跑偏时只能眼睁睁等它跑完。
+#### 注意什么
 
-**`rl.once` vs `rl.on`**：`rl.on` 注册的 handler 不会等 `await agent.chat()` 完成就响应下一行输入，导致多个 chat 并发修改消息历史。`rl.once` 每次只监听一行，处理完再递归注册，天然串行。Python 的 `while + input() + await` 没有这个问题。
+- `signal.signal` 只在主线程有效。因为 `input()` 是阻塞性 IO，而在 Windows 和 Unix 下 Python 对 `input()` 中断的处理稍有不同，通过捕获 `KeyboardInterrupt` 异常和信号拦截双重机制可以保证在任意系统下都能优雅退回命令行提示符。
 
-### 会话持久化
+---
 
-```python
-# session.py
+## ⚖️ 设计权衡
 
-SESSION_DIR = Path.home() / ".mini-claude" / "sessions"
+### 覆盖式写入 JSON vs 追加式写入 JSONL
 
-def save_session(session_id: str, data: dict[str, Any]) -> None:
-    SESSION_DIR.mkdir(parents=True, exist_ok=True)
-    (SESSION_DIR / f"{session_id}.json").write_text(json.dumps(data, indent=2, default=str))
+- **方案 A**：**覆盖式写入 JSON**（我们所用）
+  - 每次调用后将完整的会话消息结构序列化为单个 JSON 文件。
+  - **优点**：结构简单，读取解析极度方便，原生支持复杂的元数据嵌套。
+  - **缺点**：如果对话很长，每次写入的文件较大。
+- **方案 B**：**追加式写入 JSONL**
+  - 每进行一轮对话，直接在历史文件末尾 append 写入一行新的 JSON。
+  - **优点**：写入性能始终为 O(1)，防中途崩溃损坏性极佳。
+  - **缺点**：元数据结构维护复杂，需要额外的解析处理才能恢复消息上下文。
 
-def get_latest_session_id() -> str | None:
-    sessions = list_sessions()
-    if not sessions: return None
-    sessions.sort(key=lambda s: s.get("startTime", ""), reverse=True)
-    return sessions[0].get("id")
-```
+**结论**：由于 Mini Agent 会在后续课时中实现上下文压缩，历史消息总数会受到合理限制，JSON 单文件写入的开销微乎其微，因此方案 A 具有更高的代码可维护性。
 
-每次 `agent.chat()` 完成后自动保存，保存失败静默忽略（不能因为磁盘满让整个对话崩溃）。恢复时直接把消息数组加载回 Agent：
+---
 
-```python
-# agent.py
-def _auto_save(self) -> None:
-    try:
-        save_session(self.session_id, {
-            "metadata": { "id": self.session_id, "model": self.model,
-                          "cwd": str(Path.cwd()), "startTime": self.session_start_time,
-                          "messageCount": self._get_message_count() },
-            "anthropicMessages": self._anthropic_messages if not self.use_openai else None,
-            "openaiMessages": self._openai_messages if self.use_openai else None,
-        })
-    except Exception:
-        pass
+## ⚠️ 常见陷阱
 
-def restore_session(self, data: dict) -> None:
-    if data.get("anthropicMessages"): self._anthropic_messages = data["anthropicMessages"]
-    if data.get("openaiMessages"): self._openai_messages = data["openaiMessages"]
-    print_info(f"Session restored ({self._get_message_count()} messages).")
-```
+### 1. `input()` 阻塞导致信号无法被即时处理
 
-### 终端 UI — ui.py
+在执行 `line = input()` 期间，操作系统处理 `Ctrl+C` 会直接在主线程抛出 `KeyboardInterrupt` 异常，而不会顺利进入 `handle_sigint` 回调。
 
-所有输出通过 `ui.ts` 统一格式化：
+**后果**：用户在空闲输入时按一下 `Ctrl+C` 程序便会直接闪退，体验很差。
+**修正**：必须在外层使用 `try...except (EOFError, KeyboardInterrupt):` 捕获此异常，使其安全输出 `Bye!` 并退出，而非让程序抛出冗长的报错堆栈。
 
-```python
-# ui.py（使用 rich）
+---
 
-def print_tool_call(name: str, inp: dict) -> None:
-    icon = _get_tool_icon(name)
-    summary = _get_tool_summary(name, inp)
-    console.print(f"\n  [yellow]{icon} {name}[/yellow][dim] {summary}[/dim]")
+### 2. 重置 `_aborted` 状态时机不对
 
-def print_tool_result(name: str, result: str) -> None:
-    max_len = 500
-    truncated = result[:max_len] + f"\n  ... ({len(result)} chars total)" if len(result) > max_len else result
-    lines = "\n".join("  " + l for l in truncated.split("\n"))
-    console.print(f"[dim]{lines}[/dim]")
-```
+如果 `_aborted` 标记在 `chat()` 执行后没有被重置，一旦用户中断了一次任务，随后的所有任务都将因为 `_aborted = True` 而被自动跳过。
 
-工具结果在 UI 层截断到 500 字符——这是给人看的显示，完整结果已在消息历史中。
+**修正**：在 `chat()` 入口函数的第一行，必须强制重置：`self._aborted = False`。
 
-> **下一章**：让 Agent 的输出实时显示——流式工具执行与流式输出。
+---
+
+## ✅ 验收点
+
+### 输入与执行
+
+1. 直接运行启动 REPL：
+   ```bash
+   python -m mini_claude
+   ```
+2. 输入 `hello` 并按下回车，等待 Agent 回复。
+3. 输入命令 `/clear`，验证历史是否清空。
+4. 输入 `exit` 退出。
+5. 运行恢复会话命令：
+   ```bash
+   python -m mini_claude --resume
+   ```
+
+### 预期结果
+
+- 运行 `exit` 退出时显示 `Bye!`。
+- 使用 `--resume` 恢复后，终端会打印出类似 `Session restored (X messages)` 的提示词。
+
+---
+
+## 🧠 思考题
+
+1. **为什么在 `chat` 接口的 `finally` 块中调用 `_auto_save`，而不是在 `try` 块的最后一行调用？**
+   *(提示：如果用户使用 `Ctrl+C` 强行终止了正在运行的 Agent，代码会抛出异常中断执行，如果放在 try 块末尾，中断前的对话历史就无法被保存。放进 finally 块可确保即便被中断也能保存已生成的内容。)*
+2. **在 `run_repl` 中，如果大模型返回了大量的工具调用，我们正在并发执行，此时按 `Ctrl+C` 会如何影响这些正在执行的子进程？**
+   *(提示：我们设置了 `agent.abort()` 会将中断标志置为 True。工具分发器在每次执行前或执行中可以检测该标志位，主动中止后续工具的调用。)*
+
+---
+
+## 📦 本节收获
+
+1. **会话持久化**：掌握了利用序列化文件恢复 Agent 工作上下文的设计方法。
+2. **信号流拦截**：掌握了利用系统 SIGINT 信号分流“任务中止”与“程序退出”的交互技巧。
+3. **REPL 健壮性**：体验了防御性异常拦截（IO 失败降级、阻塞异常捕获），使 CLI 工具具备了生产级的高可用交互体验。
+
+---
+
+> **下一章**：现在我们有了一个易用的终端交互界面。下一章我们将攻克流式输出——让 Agent 的思考过程与工具调用过程流式呈现在终端上。
