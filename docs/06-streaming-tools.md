@@ -1,63 +1,296 @@
-# Lesson 06：流式工具执行
+# 第 06 课：流式工具执行
 
 ## 🎯 本节目标
 
-TODO
+实现流式工具执行（Streaming Tool Execution）机制。当大模型流式输出工具调用块时，一旦某个只读的并发安全工具（如 `read_file`）的参数生成完毕，就立即通过异步后台任务“抢跑”执行，将工具的 I/O 延迟完全隐藏在模型的文本生成时间里。
 
 ---
 
 ## 🏆 最终效果
 
-TODO
+完成本节后，当 Agent 在处理复杂任务时：
+- 大模型流式输出回复的过程中，无副作用的安全工具（如读取文件、列出文件等）会在后台秘密启动。
+- 文本输出完全结束后，这些工具的结果已在后台加载完毕，Agent 可以**零延迟**地直接读取其结果进入下一轮思考，减少用户等待的迟滞感。
 
 ---
 
 ## 🛠️ 本节任务
 
-TODO
+1. **确定并发安全工具集**：明确哪些工具（如只读文件操作）可以安全地异步并行执行。
+2. **实现流式 API 监听与回调**：实现 `_call_anthropic_stream`，在流式生成期间解析 `tool_use` 并在块结束时触发 `_on_tool_block_complete`。
+3. **构建后台抢跑任务注册表**：在 `_chat_anthropic` 核心循环中引入 `early_executions` 字典，启动后台异步任务。
+4. **重构工具处理循环接收结果**：在获取回复后，对已抢跑的工具任务直接进行 `await`，未抢跑的工具则走常规同步调用。
 
 ---
 
 ## 📦 涉及文件
 
-TODO
+修改：
+- `python/mini_claude/agent.py`
 
 ---
 
 ## 🚀 开始实现
 
-TODO
+### 步骤 1：定义并发安全工具集
+
+#### 为什么做
+
+并非所有工具都能在后台异步“抢跑”。写文件（`write_file`/`edit_file`）或运行命令（`run_shell`）会修改外部世界状态，存在读写冲突等并发风险。只有无副作用的“只读工具”（如 `read_file`、`list_files`）才能被安全地提前执行。
+
+#### 做什么
+
+修改 `agent.py`，导入（或直接定义）并发安全工具集，用来筛选可以抢跑的工具名：
+
+```python
+# agent.py 中的修改
+
+# 哪些工具是只读、无副作用且可以并行抢跑的？
+CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files"}
+```
+
+---
+
+### 步骤 2：实现流式 API 调用与 `_on_tool_block_complete` 触发
+
+#### 为什么做
+
+我们需要在 Anthropic 客户端流式获取响应时，实时监控内容块。
+1. 当检测到 `tool_use` 类型的块开始（`content_block_start`）时，初始化一个字典记录其参数 JSON。
+2. 随着流的输入，累加 `partial_json` 片段。
+3. 一旦该块生成结束（`content_block_stop`），立即调用 `on_tool_block_complete` 回调通知 Agent，此时模型消息可能还在继续生成后续的文本。
+
+#### 做什么
+
+在 `agent.py` 中编写 `_call_anthropic_stream` 方法：
+
+```python
+# agent.py（续）
+
+    async def _call_anthropic_stream(self, on_tool_block_complete=None) -> Any:
+        create_params = {
+            "model": self.model,
+            "max_tokens": 4096,
+            "system": self._system_prompt,
+            "tools": get_tool_definitions(),
+            "messages": self._messages,
+        }
+
+        tool_blocks_by_index = {}
+
+        # 开启流式 API 监听
+        async with self._anthropic_client.messages.stream(**create_params) as stream:
+            async for event in stream:
+                # 1. 监测到工具块开始
+                if event.type == "content_block_start":
+                    cb = event.content_block
+                    if cb.type == "tool_use":
+                        tool_blocks_by_index[event.index] = {
+                            "id": cb.id,
+                            "name": cb.name,
+                            "input_json": "",
+                        }
+                # 2. 收集参数的 JSON 增量片段
+                elif event.type == "content_block_delta":
+                    delta = event.delta
+                    if delta.type == "input_json_delta":
+                        tb = tool_blocks_by_index.get(event.index)
+                        if tb:
+                            tb["input_json"] += delta.partial_json
+                # 3. 工具块接收完毕，解析参数并触发完成回调
+                elif event.type == "content_block_stop":
+                    tb = tool_blocks_by_index.pop(event.index, None)
+                    if tb and on_tool_block_complete:
+                        import json
+                        try:
+                            parsed = json.loads(tb["input_json"] or "{}")
+                        except Exception:
+                            parsed = {}
+                        
+                        # 执行回调，暴露已生成的完整工具调用信息
+                        on_tool_block_complete({
+                            "type": "tool_use",
+                            "id": tb["id"],
+                            "name": tb["name"],
+                            "input": parsed,
+                        })
+
+            final_message = await stream.get_final_message()
+        return final_message
+```
+
+---
+
+### 步骤 3：构建后台抢跑任务注册表 `early_executions`
+
+#### 为什么做
+
+我们需要在主循环中接入回调。每当一个流式内容块解析完成，我们就判断该工具是否在 `CONCURRENCY_SAFE_TOOLS` 安全白名单中。若符合，即刻通过 `asyncio.create_task()` 创建后台异步任务启动执行，并将对应的 Promise（Future 任务）存入 `early_executions` 字典中，使用 `tool_use_id` 作为键进行标识。
+
+#### 做什么
+
+修改 `_chat_anthropic` 循环的开头，注册 `_on_tool_block_complete` 回调逻辑：
+
+```python
+# agent.py（续）
+
+    async def _chat_anthropic(self, user_message: str) -> None:
+        self._messages.append({"role": "user", "content": user_message})
+
+        while True:
+            current_system_prompt = build_system_prompt()
+            
+            # 创建抢跑任务字典，保存 { tool_use_id -> asyncio.Task }
+            early_executions: dict[str, asyncio.Task] = {}
+
+            # 回调函数：当安全工具生成完，立即在后台异步跑起来
+            def _on_tool_block_complete(block: dict):
+                if block["name"] in CONCURRENCY_SAFE_TOOLS:
+                    # 创建后台异步任务，使其开始抢跑
+                    task = asyncio.create_task(execute_tool(block["name"], block["input"]))
+                    early_executions[block["id"]] = task
+
+            # 传入回调函数调用流式连接
+            response = await self._call_anthropic_stream(
+                on_tool_block_complete=_on_tool_block_complete
+            )
+```
+
+#### 注意什么
+
+- **UI 渲染与抢跑任务解耦（关键交互细节）**：当安全工具在后台抢跑时，我们**绝不在此时打印工具调用日志**。因为大模型的文本流此时正在终端中实时显示，如果在此时突然输出类似 `🔧 read_file ...` 的日志，会与模型的输出字符混杂在一起，导致终端排版错乱。工具抢跑必须保持“静默”。
+
+---
+
+### 步骤 4：重构工具处理循环接收结果
+
+#### 为什么做
+
+流式响应全部输出完毕后，Agent 会进入常规的工具执行处理循环。对于此前已经触发了抢跑的安全任务，我们无需重复调用工具，只需直接通过 `await early_task` 拿回后台的运行结果。对于未抢跑的非安全工具，则沿用以往的正常流程进行处理。
+
+#### 做什么
+
+继续修改 `_chat_anthropic` 循环的工具处理段落，增加任务接管判定：
+
+```python
+# agent.py（续）
+
+            self._messages.append({
+                "role": "assistant",
+                "content": [self._block_to_dict(b) for b in response.content],
+            })
+
+            tool_uses = [b for b in response.content if b.type == "tool_use"]
+            if not tool_uses:
+                break
+
+            tool_results = []
+            for tu in tool_uses:
+                inp = dict(tu.input) if hasattr(tu.input, "items") else tu.input
+
+                # 1. 检查当前工具是否早已在后台异步抢跑？
+                early_task = early_executions.get(tu.id)
+                if early_task:
+                    # 此时才把工具日志渲染到 UI
+                    print_tool_call(tu.name, inp)
+                    # 直接等待后台已在运行（甚至可能已经运行完）的任务返回
+                    result = await early_task
+                    print_tool_result(tu.name, result)
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tu.id,
+                        "content": result,
+                    })
+                    continue
+
+                # 2. 未能抢跑的非安全工具（如 write_file/run_shell），走常规常规同步处理
+                print_tool_call(tu.name, inp)
+                result = await execute_tool(tu.name, inp)
+                print_tool_result(tu.name, result)
+                
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tu.id,
+                    "content": result,
+                })
+
+            self._messages.append({"role": "user", "content": tool_results})
+```
 
 ---
 
 ## ⚖️ 设计权衡
 
-TODO
+### 异步抢跑（Early Execution） vs 串行阻塞等待
+
+- **方案 A**：**流式完成即抢跑**（我们所用）
+  - 利用异步 `create_task`，在大模型还没生成完 assistant 消息的时候就提前调用 I/O 工具。
+  - **优点**：隐藏网络与磁盘读写延迟，如果工具执行时间与模型生成剩余内容时间重合，用户的体感延迟接近于 0。
+  - **缺点**：增加了并发调度的复杂性，调试异常时需要额外注意 Task 的状态。
+- **方案 B**：**完全串行串联**
+  - 等待 API 流通道完全关闭，解析最终的消息对象，再开启工具执行循环。
+  - **优点**：逻辑极度简单，状态完全是线性的。
+  - **缺点**：工具执行在模型生成之后额外累加时间，连续交互时显得不够流畅。
+
+**结论**：流式抢跑是工业级 coding agent 提升极致响应速度的重要交互技术，方案 A 的少量异步代价可以换取极高的用户体验增益。
 
 ---
 
 ## ⚠️ 常见陷阱
 
-TODO
+### 1. 对非安全工具进行提前抢跑
+
+```python
+# ❌ 错误：如果对 run_shell 等带副作用的命令进行抢跑
+if block["name"] in ("run_shell", "edit_file"):
+    task = asyncio.create_task(execute_tool(...))
+```
+
+**后果**：由于这些工具包含副作用，可能会导致在用户输入、安全确认机制生效前，危险命令已经在后台悄悄执行完毕（例如 `rm -rf`），直接击穿了安全防线。
+**修正**：必须严格约束 `CONCURRENCY_SAFE_TOOLS` 白名单，只有无副作用的安全查询类工具才允许进入抢跑。
+
+---
+
+### 2. 忽略后台任务引发的异常
+
+如果在后台运行 `execute_tool` 时发生了异常崩溃而没有被捕获，可能会在 `await early_task` 阶段直接把异常抛给主循环，导致程序崩溃，且没有进行会话自动保存。
+
+**修正**：确保后台执行的 `execute_tool` 方法内具有健全的 `try...except` 容错机制，将异常包装为带 `Error:` 前缀的错误消息作为常规数据返回，让 Agent 在下一轮循环中自行处理该错误。
 
 ---
 
 ## ✅ 验收点
 
-TODO
+### 输入与验证
+
+1. 启动 Agent，输入一个会触发只读工具链式调用的请求：
+   ```bash
+   python -m mini_claude "读取 python/mini_claude/prompt.py 的前 10 行"
+   ```
+2. **观察体感**：注意观察大模型输出“正在思考”或输出字符时，在它停止吐字的瞬间，终端是否**几乎没有任何等待**，就立刻展现了 `📖 read_file` 工具的输出结果。
+
+### 预期结果
+
+`read_file` 的结果能够正常返回，且整个交互由于提前抢跑，中间的卡顿时间明显缩短。
 
 ---
 
 ## 🧠 思考题
 
-TODO
+1. **既然我们在 `_on_tool_block_complete` 回调中已经将工具在后台跑起来了，为什么不当时就执行 `print_tool_call` 把它显示在终端屏幕上，而要等到最后的 `for tu in tool_uses:` 中才进行打印？**
+   *(提示：大模型的文本输出和工具参数块生成通常是混合在一起的。如果抢跑时立即打印工具调用，它的控制台输出将会插在大模型正在流式输出的文本段落中间，导致控制台排版乱套。)*
+2. **如果大模型在一个回复中同时调用了 3 个 `read_file`（读取 3 个不同的文件），我们目前的抢跑逻辑会如何执行它们？**
+   *(提示：大模型是顺次流式输出这 3 个 block 的。当第 1 个 block 生成完毕触发 Stop 时，任务 1 在后台启动；随后模型继续输出，第 2 个 block 完毕触发 Stop，任务 2 启动；第 3 个同样如此。3 个读取任务实质上都在后台并行运行，极大缩短了总耗时。)*
 
 ---
 
 ## 📦 本节收获
 
-TODO
+1. **异步并行调度**：掌握了利用 `asyncio.create_task` 实现多任务并发重叠执行的方法。
+2. **流式增量解析**：理解了在 API 响应流中监听 `content_block_delta` 和 `content_block_stop` 获取实时局部数据的机制。
+3. **UX 界面防混乱设计**：理解了将“后台提前执行”与“前台终端日志输出”在时序上进行分离解耦的优秀交互准则。
 
 ---
 
-> **下一章**：流式工具执行解决了并行问题，但文本输出也需要实时显示——流式输出。
+> **下一章**：我们隐藏了工具调用的后台等待时间。接下来我们将攻克前台界面的流式输出——让 Agent 的思考文本实时呈现在用户面前。

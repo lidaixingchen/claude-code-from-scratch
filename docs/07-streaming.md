@@ -1,141 +1,194 @@
-# 5. 流式输出与双后端
+# 第 07 课：文本流式输出与 API 重试
 
-## 本章目标
+## 🎯 本节目标
 
-实现流式输出让回答逐字显示，并支持 Anthropic 和 OpenAI 两套 API 后端。
+为 Agent 构建流畅的流式字符输出界面和稳健的 API 网络容错机制。实现 Anthropic 与 OpenAI 两套后端的文本流渲染（逐字显示回复），滤除大模型的 Extended Thinking 冗余 Token 以节省上下文，并为 API 请求注入带随机抖动的“指数退避”重试保护。
 
-```mermaid
-graph LR
-    Agent[Agent] --> |useOpenAI?| Switch{后端选择}
-    Switch -->|false| Anthropic[callAnthropicStream<br/>SDK stream 事件]
-    Switch -->|true| OpenAI[callOpenAIStream<br/>手动 chunk 累积]
-    Anthropic --> |stream.on text| Console[逐字输出]
-    OpenAI --> |delta.content| Console
+---
 
-    Anthropic --> |content_block_stop| EarlyExec[流式工具执行<br/>安全工具立即启动]
-    OpenAI --> |响应完成| Batch[并行批量执行<br/>连续安全工具 Promise.all]
-    EarlyExec --> ToolResult[工具结果]
-    Batch --> ToolResult
+## 🏆 最终效果
 
-    style Switch fill:#7c5cfc,color:#fff
-    style Anthropic fill:#e8e0ff
-    style OpenAI fill:#e8e0ff
-    style EarlyExec fill:#d4edda
-    style Batch fill:#d4edda
-    style ToolResult fill:#fff3cd
+完成本节后，运行 Agent 时你将看到：
+- **逐字打字机效果**：大模型的回答不再是沉默等待数十秒后一次性砸向屏幕，而是字符如瀑布般顺畅流出，首字响应时间降至数百毫秒。
+- **思维隐藏**：大模型的 Extended Thinking（思考链）Token 仅在流式生成期间显示，完成后自动被过滤，防止撑爆消息历史。
+- **网络容错**：当遇到服务临时过载（429 报错）或网络瞬断时，终端会自动打印类似 `↻ Retry 1/3: HTTP 429` 的重试信息，自动指数退避延时后继续请求，确保执行不会意外中断。
+
+---
+
+## 🛠️ 本节任务
+
+1. **实现流式字符渲染方法**：实现 `_emit_text`，处理流式文本输出以及子代理输出缓冲。
+2. **实现 Anthropic 流式文本与思考过滤**：在 `_call_anthropic_stream` 中实现流式输出并过滤掉 `thinking` 块。
+3. **实现 OpenAI 增量分块参数重建**：在 `_call_openai_stream` 中手动拼装增量分片的 `arguments` 并流式渲染正文。
+4. **编写指数退避与抖动重试封装**：实现 `_is_retryable` 与 `_with_retry`，保护两套流式接口不受瞬时网络故障影响。
+
+---
+
+## 📦 涉及文件
+
+修改：
+- `python/mini_claude/agent.py`
+
+---
+
+## 🚀 开始实现
+
+### 步骤 1：实现流式字符渲染接口
+
+#### 为什么做
+
+由于 Python 默认的 `print()` 会自动换行，且标准输出（stdout）默认有缓冲区，在不换行打印时常常不会即时显示。我们需要通过调用底层 `sys.stdout.write` 并强行刷新（`sys.stdout.flush()`）来实现实时逐字打印。此外，子代理（Sub-agent）运行时，其输出需要被静默缓冲，不能直接打在主终端上。
+
+#### 做什么
+
+修改 `agent.py`，实现 `_emit_text` 方法分流控制：
+
+```python
+# agent.py 中的修改
+
+import sys
+from .ui import print_assistant_text  # UI 库封装了 sys.stdout.write/flush
+
+
+class Agent:
+    # ... 在 __init__ 中定义 self._output_buffer: list[str] | None = None
+
+    def _emit_text(self, text: str) -> None:
+        # 如果是子代理，只记录在缓冲区中，不打印至控制台
+        if self._output_buffer is not None:
+            self._output_buffer.append(text)
+        else:
+            print_assistant_text(text)
 ```
 
-## Claude Code 怎么做的
+---
 
-### 为什么需要流式输出？
+### 步骤 2：实现 Anthropic 后端文本流与思考过滤
 
-模型生成速度大约每秒 30-80 个 token，稍长的回答需要 10-30 秒。用户面对空白等待的容忍极限约 2-3 秒。流式输出让第一个字在几百毫秒内出现，把"等待 30 秒"变成"看着内容逐渐写出来"——主观等待感接近零，并且用户能在方向错误时提前中断。
+#### 为什么做
 
-底层用的是 SSE（Server-Sent Events）：服务端用一条持久 HTTP 连接持续推送 `data:` 行，每几个 token 就推一个 `content_block_delta` 事件。比 WebSocket 简单，对 LLM 应用来说单向推送已经够用。
+Anthropic API 的流式响应会混杂输出 `text` 块和 `thinking` 块。
+1. `thinking` 块包含模型的中间思考步骤，通常极其庞大（数千 Token），直接存入消息历史会导致后续上下文极速膨胀。我们必须在响应完全接收后过滤掉它们。
+2. `text` 块是返回给用户的自然语言，需捕获它并调用 `_emit_text` 实时输出。
 
-### 流式处理与并行工具执行
+#### 做什么
 
-Claude Code 的一个关键优化：`StreamingToolExecutor` 在模型还在生成后续内容时，已解析完成的 tool_use block 就立即开始执行。串行方式下工具执行只能等 API 完整响应后开始；流式并行下，第一个 tool_use 解析完毕时直接分发，不等第二个。
+在 `agent.py` 的 `_call_anthropic_stream` 中实现流监听及思考链清洗逻辑：
 
-在典型的 5-30 秒 API 流窗口内，文件读取（< 100ms）几乎能全部覆盖进去——流结束时工具结果往往已全部就绪。
-
-### 错误重试
-
-不是所有错误都值得重试：429/503/529 和网络瞬断（ECONNRESET）可以重试；400/401/404 反映代码或配置问题，重试没有意义。
-
-指数退避（而不是固定间隔）的原因：服务过载时，大量客户端固定 1 秒后同时重试会形成"重试风暴"，反而加剧过载。指数退避让间隔逐轮翻倍（1s → 2s → 4s），加上随机抖动打破多客户端同步，是标准的分布式容错做法。
-
-## 我们的实现
-
-### Anthropic 后端：SDK 内置 stream
-
-#### **Python**
 ```python
-# agent.py — _call_anthropic_stream
+# agent.py（续）
 
-async def _call_anthropic_stream(self):
-    async def _do():
-        create_params: dict[str, Any] = {
-            "model": self.model,
-            "max_tokens": _get_max_output_tokens(self.model) if self._thinking_mode != "disabled" else 16384,
-            "system": self._system_prompt,
-            "tools": self.tools,
-            "messages": self._anthropic_messages,
-        }
+    async def _call_anthropic_stream(self, on_tool_block_complete=None) -> Any:
+        async def _do():
+            create_params = {
+                "model": self.model,
+                "max_tokens": 4096,
+                "system": self._system_prompt,
+                "tools": get_tool_definitions(),
+                "messages": self._messages,
+            }
 
-        if self._thinking_mode in ("adaptive", "enabled"):
-            create_params["thinking"] = {"type": "enabled", "budget_tokens": _get_max_output_tokens(self.model) - 1}
+            tool_blocks_by_index = {}
+            first_text = True
 
-        first_text = True
-        async with self._anthropic_client.messages.stream(**create_params) as stream:
-            async for event in stream:
-                if hasattr(event, 'type') and event.type == "content_block_delta":
-                    delta = event.delta
-                    if hasattr(delta, 'text'):
-                        if first_text:
-                            stop_spinner()
-                            self._emit_text("\n")
-                            first_text = False
-                        self._emit_text(delta.text)
+            # 启动 API 监听流
+            async with self._anthropic_client.messages.stream(**create_params) as stream:
+                async for event in stream:
+                    if event.type == "content_block_start":
+                        cb = event.content_block
+                        if cb.type == "tool_use":
+                            tool_blocks_by_index[event.index] = {
+                                "id": cb.id,
+                                "name": cb.name,
+                                "input_json": "",
+                            }
+                    elif event.type == "content_block_delta":
+                        delta = event.delta
+                        # 捕获普通文本流并实时渲染到终端
+                        if delta.type == "text_delta":
+                            if first_text:
+                                self._emit_text("\n")  # 首字输出前先换行
+                                first_text = False
+                            self._emit_text(delta.text)
+                        
+                        # 收集工具调用 JSON 增量
+                        elif delta.type == "input_json_delta":
+                            tb = tool_blocks_by_index.get(event.index)
+                            if tb:
+                                tb["input_json"] += delta.partial_json
+                                
+                    elif event.type == "content_block_stop":
+                        # 触发上一章的流式工具抢跑（省略）
+                        pass
 
-            final_message = await stream.get_final_message()
+                final_message = await stream.get_final_message()
+            
+            # 【核心过滤】滤除思考块（thinking），不将它们保存到对话历史消息中
+            final_message.content = [
+                b for b in final_message.content if getattr(b, "type", None) != "thinking"
+            ]
+            return final_message
 
-        final_message.content = [b for b in final_message.content if b.type != "thinking"]
-        return final_message
-
-    return await _with_retry(_do)
+        # 使用步骤 4 实现的重试方法进行包裹
+        return await _with_retry(_do)
 ```
 
-Anthropic SDK 封装了全部 SSE 解析细节：`stream.on("text")` 直接给文本增量，`stream.finalMessage()` 返回和非流式完全一样的 `Message` 对象。`{ signal }` 把 AbortController 传进去，Ctrl+C 可以中断网络请求。
+---
 
-### OpenAI 兼容后端：手动 chunk 累积
+### 步骤 3：实现 OpenAI 增量分块参数重建与流式输出
 
-OpenAI streaming 的 tool_calls 参数是分 chunk 到达的，需要手动累积重建。
+#### 为什么做
 
-#### **Python**
+OpenAI 的流式格式和 Anthropic 大相径庭：
+1. **工具调用切片到达**：OpenAI 的 `tool_calls` 不是完整的 JSON 块，而是打碎成极小的 `delta` 块分片推送。比如 `arguments` 属性可能会每次推送 `{"fi`、`le_`、`pa` 这样几个字符。我们必须通过 `choices[0].delta.tool_calls` 的 `index` 识别出属于第几个工具，手动累加参数字符串，最后在流结束时进行拼装。
+2. **正文流输出**：捕获 `delta.content` 并进行流式打字渲染。
+
+#### 做什么
+
+在 `agent.py` 中实现 `_call_openai_stream` 的增量装配器：
+
 ```python
-# agent.py — _call_openai_stream
+# agent.py（续）
+
 
 async def _call_openai_stream(self) -> dict:
     async def _do():
+        # 启动 OpenAI 兼容端流式生成
         stream = await self._openai_client.chat.completions.create(
             model=self.model,
-            max_tokens=16384,
-            tools=_to_openai_tools(self.tools),
-            messages=self._openai_messages,
+            messages=[{"role": "system", "content": self._system_prompt}] + self._messages,
+            tools=self._to_openai_tools(get_tool_definitions()),
             stream=True,
-            stream_options={"include_usage": True},
         )
 
         content = ""
         first_text = True
         tool_calls: dict[int, dict] = {}
         finish_reason = ""
-        usage = None
 
         async for chunk in stream:
-            if chunk.usage:
-                usage = {"prompt_tokens": chunk.usage.prompt_tokens, "completion_tokens": chunk.usage.completion_tokens}
-
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
 
+            # 1. 处理正文输出文本，并进行流式刷新
             if delta and delta.content:
                 if first_text:
-                    stop_spinner()
                     self._emit_text("\n")
                     first_text = False
                 self._emit_text(delta.content)
                 content += delta.content
 
+            # 2. 收集与累加工具调用参数分片
             if delta and delta.tool_calls:
                 for tc in delta.tool_calls:
                     existing = tool_calls.get(tc.index)
                     if existing:
+                        # 累加参数字符串
                         if tc.function and tc.function.arguments:
                             existing["arguments"] += tc.function.arguments
                     else:
+                        # 初始化首个参数块
                         tool_calls[tc.index] = {
                             "id": tc.id or "",
                             "name": (tc.function.name if tc.function else "") or "",
@@ -145,223 +198,159 @@ async def _call_openai_stream(self) -> dict:
             if chunk.choices[0].finish_reason:
                 finish_reason = chunk.choices[0].finish_reason
 
-        assembled = [
-            {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments"]}}
-            for _, tc in sorted(tool_calls.items())
-        ] if tool_calls else None
+        # 3. 拼装成符合标准的 OpenAI 格式工具对象结构
+        assembled = (
+            [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                }
+                for _, tc in sorted(tool_calls.items())
+            ]
+            if tool_calls
+            else None
+        )
 
+        # 返回统一的数据包供外层主循环更新历史
         return {
-            "choices": [{"message": {"role": "assistant", "content": content or None, "tool_calls": assembled},
-                         "finish_reason": finish_reason or "stop"}],
-            "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0},
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": content or None,
+                        "tool_calls": assembled,
+                    },
+                    "finish_reason": finish_reason or "stop",
+                }
+            ]
         }
 
     return await _with_retry(_do)
 ```
 
-OpenAI tool_calls 的 `id` 和 `name` 只在第一个 chunk 出现，后续 chunk 只有 `arguments` 的增量片段。多个 tool_call 的 chunk 会交错到达，用 `index` 字段区分，累积结束后才能 `JSON.parse()`。
+---
 
-### 工具格式转换
+### 步骤 4：编写指数退避与抖动重试封装
 
-两个 API 的工具定义几乎相同，只是字段名不一样：
+#### 为什么做
 
-#### **Python**
+网络请求常会遇到服务器偶尔过载（HTTP 429）、服务器维护临时不可达（HTTP 503/529）或连接被外部重置（`ECONNRESET`）。
+- 我们应当只重试此类“可恢复的错误”（不应重试参数错误 400 或认证失败 401 ）。
+- 指数退避（每次重试等待时长翻倍，如 $1\text{s} \to 2\text{s} \to 4\text{s}$）能让下游服务器在大负荷时有喘息之机。
+- 随机抖动（Jitter）则能防止多台机器在同一时间同步重试，避免形成“重试风暴”。
+
+#### 做什么
+
+在 `agent.py` 文件中，编写重试拦截装饰逻辑：
+
 ```python
-def _to_openai_tools(tools: list[ToolDef]) -> list[dict]:
-    return [{"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}} for t in tools]
-```
+# agent.py（续）
 
-Anthropic 用 `input_schema`，OpenAI 用 `parameters`，内容完全一样。
+import asyncio
+import time
+from .ui import print_retry  # 导入重试渲染函数
 
-### 重试机制
 
-#### **Python**
-```python
 def _is_retryable(error: Exception) -> bool:
+    # 提取错误状态码
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
     if status in (429, 503, 529):
         return True
-    msg = str(error)
-    if "overloaded" in msg or "ECONNRESET" in msg or "ETIMEDOUT" in msg:
+    msg = str(error).lower()
+    if "overloaded" in msg or "econnreset" in msg or "etimedout" in msg:
         return True
     return False
+
 
 async def _with_retry(fn, max_retries: int = 3):
     for attempt in range(max_retries + 1):
         try:
             return await fn()
         except Exception as error:
+            # 如果重试次数耗尽，或者错误不可恢复，直接向上抛出
             if attempt >= max_retries or not _is_retryable(error):
                 raise
-            delay = min(1000 * (2 ** attempt), 30000) / 1000 + (hash(str(time.time())) % 1000) / 1000
-            reason = str(getattr(error, "status_code", "")) or str(error)[:60]
+            
+            # 指数退避计算：min(30s, 1s * 2^attempt) + 随机抖动时间
+            delay = min(1.0 * (2 ** attempt), 30.0) + (hash(str(time.time())) % 1000) / 1000
+            
+            status = getattr(error, "status_code", None) or getattr(error, "status", None)
+            reason = f"HTTP {status}" if status else "network error"
             print_retry(attempt + 1, max_retries, reason)
+            
             await asyncio.sleep(delay)
 ```
 
-延迟公式 `min(1000 * 2^attempt, 30000) + random(0, 1000)`：指数部分控制退避速度，30 秒上限防止等待过久，随机抖动防止多个客户端同步重试形成"重试风暴"。
+---
 
-### Extended Thinking
+## ⚖️ 设计权衡
 
-Extended Thinking 让模型在输出前有一个私有"草稿纸"做推理规划，对需要多步决策的 coding 任务有明显帮助。
+### 思考链历史保存 vs 丢弃（Filtering Thinking Tokens）
 
-三种模式：
-- **adaptive**：claude-4.x 模型自动开启，budget 10000 tokens，模型自行决定是否使用
-- **enabled**：`--thinking` flag 显式开启，budget 最大化
-- **disabled**：不支持 thinking 的模型（Claude 3.x 及 OpenAI）
+- **方案 A**：**从消息历史中过滤**（我们所用）
+  - 流式结束时，从 API 返回结果的消息体（`content` 数组）中剔除 `thinking` 类型的块，只保留 `text` 块存入 `self._messages`。
+  - **优点**：大幅节约上下文窗口空间，避免多轮对话时被思考文本占满，减缓大模型的生成成本。
+  - **缺点**：大模型在下一轮对话中无法看到自己上一轮具体的“心路历程”（只看得到自己的最终结论和工具输出），但实践证明其决策影响极小。
+- **方案 B**：**完全完整保存**
+  - 不做任何过滤，将 `thinking` 和 `text` 原封不动发回。
+  - **优点**：模型记忆完全一致。
+  - **缺点**：上下文 Token 消耗会呈数倍爆发，很快就会逼近极限，在真实工程环境中不推荐。
 
-#### **Python**
-```python
-def _resolve_thinking_mode(self) -> str:
-    if not self.thinking or not _model_supports_thinking(self.model):
-        return "disabled"
-    if _model_supports_adaptive_thinking(self.model):
-        return "adaptive"
-    return "enabled"
-
-# 构造请求参数
-if self._thinking_mode in ("adaptive", "enabled"):
-    create_params["thinking"] = {"type": "enabled", "budget_tokens": max_output - 1}
-
-# 过滤 thinking blocks，不存入历史
-final_message.content = [b for b in final_message.content if b.type != "thinking"]
-```
-
-thinking blocks 可能长达数千 token，对后续对话没有参考价值，过滤掉是避免上下文窗口被无效内容占满的直接手段。
-
-### 流式工具执行
-
-当 Anthropic 流式响应中某个 `tool_use` block 完整接收（`content_block_stop` 事件触发）时，如果该工具是并发安全的（`read_file`、`list_files`、`grep_search`、`web_fetch`），立即开始执行——不必等待整个 API 响应完成。这样可以把工具执行时间"藏"进模型生成后续内容的流式窗口中。
-
-#### **Python**
-```python
-# agent.py — 流式工具执行
-
-# 在流式过程中跟踪提前执行的工具
-early_executions: dict[str, asyncio.Task] = {}
-
-async def on_tool_block_complete(block):
-    if block["name"] in CONCURRENCY_SAFE_TOOLS:
-        perm = check_permission(block["name"], block["input"], self._permission_mode)
-        if perm["action"] == "allow":
-            task = asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
-            early_executions[block["id"]] = task
-
-response = await self._call_anthropic_stream(on_tool_block_complete=on_tool_block_complete)
-
-# 后续处理工具结果时：
-early_task = early_executions.get(tool_use["id"])
-if early_task:
-    raw = await early_task  # 已完成或即将完成
-    # ... 直接使用结果
-    continue
-```
-
-`callAnthropicStream` 内部通过回调机制实现：
-
-#### **Python**
-```python
-# agent.py — _call_anthropic_stream 工具 block 跟踪
-
-async def _call_anthropic_stream(self, on_tool_block_complete=None):
-    async def _do():
-        # ...
-        tool_blocks_by_index: dict[int, dict] = {}
-
-        async with self._anthropic_client.messages.stream(**create_params) as stream:
-            async for event in stream:
-                # 工具 block 跟踪：随着流式接收累积 input JSON
-                if hasattr(event, 'type'):
-                    if event.type == "content_block_start" and getattr(event, 'content_block', None):
-                        cb = event.content_block
-                        if cb.type == "tool_use":
-                            tool_blocks_by_index[event.index] = {
-                                "id": cb.id, "name": cb.name, "input_json": ""
-                            }
-                    elif event.type == "content_block_delta" and hasattr(event.delta, 'partial_json'):
-                        tracked = tool_blocks_by_index.get(event.index)
-                        if tracked:
-                            tracked["input_json"] += event.delta.partial_json
-                    elif event.type == "content_block_stop" and on_tool_block_complete:
-                        tracked = tool_blocks_by_index.get(event.index)
-                        if tracked:
-                            try:
-                                inp = json.loads(tracked["input_json"])
-                                await on_tool_block_complete({
-                                    "type": "tool_use", "id": tracked["id"],
-                                    "name": tracked["name"], "input": inp
-                                })
-                            except json.JSONDecodeError:
-                                pass
-
-            final_message = await stream.get_final_message()
-        # ...
-```
-
-设计要点：
-
-- **`content_block_stop` 是 block 级别事件**：当单个 `tool_use` block 的 JSON 完整接收时触发，并非整个响应结束。模型可能在一次响应中返回多个工具调用，第一个 block 完整时第二个可能还在流式传输中
-- **仅并发安全工具提前执行**：只有只读工具（`read_file`、`list_files`、`grep_search`、`web_fetch`）会被提前执行，写操作和命令执行不会
-- **权限检查仍然生效**：只有 `checkPermission` 返回 `"allow"` 的工具才会提前执行，需要用户确认的工具（`"confirm"`）不会被提前触发
-- **Promise/Task 存储，后续直接 await**：`earlyExecutions` Map 存储的是 Promise（TS）或 Task（Python），后续工具处理循环检查到已有提前执行的结果时，直接 await 即可——通常此时已经完成
-- **核心收益**：5-30 秒的流式窗口期内，工具执行与模型生成并行进行，文件读取等快速操作在流结束时往往已经就绪
-
-### 并行工具执行
-
-并行执行的前提是标记哪些工具是并发安全的——只读工具不会产生副作用，可以安全地同时运行：
-
-#### **Python**
-```python
-# tools.py
-CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
-```
-
-对于 Anthropic 后端，流式工具执行天然处理了并行——每个工具 block 完整时就启动执行，多个工具自然重叠运行。
-
-对于 OpenAI 后端（不支持流式工具 block 事件），采用显式批量并行：将连续的安全工具分组，用 `Promise.all` / `asyncio.gather` 一次性执行：
-
-#### **Python**
-```python
-# agent.py — OpenAI 并行执行
-
-# 将连续的并发安全工具分组为批次
-oai_batches: list[dict] = []
-for ct in oai_checked:
-    safe = ct["allowed"] and ct["fn_name"] in CONCURRENCY_SAFE_TOOLS
-    if safe and oai_batches and oai_batches[-1]["concurrent"]:
-        oai_batches[-1]["items"].append(ct)
-    else:
-        oai_batches.append({"concurrent": safe, "items": [ct]})
-
-# 执行：并发批次使用 asyncio.gather
-for batch in oai_batches:
-    if batch["concurrent"]:
-        async def _exec(ct):
-            raw = await self._execute_tool_call(ct["fn_name"], ct["input"])
-            return {"ct": ct, "res": self._persist_large_result(ct["fn_name"], raw)}
-        results = await asyncio.gather(*[_exec(ct) for ct in batch["items"]])
-        # ... 推入结果
-    else:
-        # 非安全工具顺序执行
-```
-
-两种后端的并行策略对比：
-
-- **Anthropic 后端**：流式执行自动处理并行——工具 block 完整时立即启动，多个工具的执行时间自然重叠
-- **OpenAI 后端**：响应完成后显式分批——将连续的安全工具归入同一批次，用 `Promise.all` 并行执行
-- **混合序列保持安全**：`[read, read, write, read]` 会被分为 `[read||read]`、`[write]`、`[read]` 三个批次，写操作前后的工具各自独立，不会跨越写操作并行
-- **典型加速效果**：当模型在一次响应中读取 3-5 个文件时，并行执行通常带来 2-3 倍的速度提升
-
-## 简化对比
-
-| 维度 | Claude Code | mini-claude |
-|------|------------|-------------|
-| **后端支持** | 仅 Anthropic | Anthropic + OpenAI 兼容 |
-| **重试策略** | 类似指数退避 | 指数退避 + 随机抖动 |
-| **Thinking 处理** | 深度集成，独立展示与折叠 | 基础支持，过滤 thinking blocks |
-| **流式工具执行** | StreamingToolExecutor 独立模块，全量事件处理 | 回调 + earlyExecutions Map，精简实现 |
-| **并行工具执行** | 完整的并发调度器 | Anthropic 流式提前执行 + OpenAI 批量 Promise.all |
+**结论**：过滤丢弃是高频交互 Agent 保持 Token 经济型的最重要前置策略。
 
 ---
 
-> **下一章**：Agent 能操作文件和执行命令了，但我们需要防止它做危险的事——权限系统保护你的系统。
+## ⚠️ 常见陷阱
+
+### 1. 弯单引号引起 OpenAI JSON 反序列化失败
+
+OpenAI 在推送 `tool_calls` 的 `arguments` 切片时，模型有时会误输出非标准的 JSON 字符串。如果在收集完毕时没有容错机制，直接使用 `json.loads()` 会发生解析崩溃。
+
+**修正**：在 `__main__.py` 或 `execute_tool` 中，我们必须提供解析的容错处理，如发生 `JSONDecodeError` 则退回默认空字典，防止抛出未处理异常。
+
+---
+
+### 2. 重试风暴（Retry Storm）中漏掉抖动因子
+
+```python
+# ❌ 错误：如果只使用纯粹的指数退避，没有引入随机抖动
+delay = 1.0 * (2 ** attempt)
+```
+
+**后果**：若并发客户端很多，一旦网络闪断，全部客户端都会在完全相同的物理时间点（比如第 1.0 秒、2.0 秒、4.0 秒）向 API 网关发起海量冲击重试，导致刚刚恢复的网关由于被瞬间压垮而再次挂掉。
+
+---
+
+## ✅ 验收点
+
+### 输入与验证
+
+1. 启动 Agent 进入 REPL 终端：
+   ```bash
+   python -m mini_claude
+   ```
+2. 输入一个需要较长文本回复的复杂查询（例如让模型写一段 100 行的算法）。
+3. **观察流式效果**：仔细核对字词是否是一个一个跳出来，在输出过程中，能否通过 `Ctrl+C` 中断输出流并成功返回 `> ` 提示符。
+4. **模拟重试测试**：可以通过暂时掐断网线或提供一个极低重载限流的模拟接口 base_url，验证终端是否能正确捕获网络异常并成功打印出 `↻ Retry 1/3: ...` 的提示。
+
+---
+
+## 🧠 思考题
+
+1. **为什么在 `_call_openai_stream` 中，我们需要使用 `sorted(tool_calls.items())` 对累加后的工具列表进行排序？**
+   *(提示：大模型流式发回切片时，即使是多个工具的 delta 包，它们也有可能会由于网络传输因素发生乱序。在拼接时按照 index 序号对其重新排序，可以保证构建出的 arguments 结构严格对应。)*
+2. **在 `_is_retryable` 判断中，我们为什么要主动忽略 HTTP 401（未授权）和 HTTP 400（请求不合法）错误而不进行重试？**
+   *(提示：因为这些错误由于参数或配置写死，是无法通过“等待一段时间重新发送”来自动解决的。盲目重试只会徒增 API 等待时间和算力浪费。)*
+
+---
+
+## 📦 本节收获
+
+1. **SSE 打字机交互**：掌握了利用 Server-Sent Events 事件机制渲染实时字符的终端交互技术。
+2. **切片数据流累加**：掌握了还原多路并行乱序切片参数包（OpenAI 格式）的数据组装算法。
+3. **退避防风暴设计**：理解了指数退避加随机抖动的算法在提高云端 API 交互可用性上的重大工程作用。
+
+---
+
+> **下一章**：现在 Agent 既能高速操作又能实时流式沟通。但一个能运行任意 Shell 命令的 Agent 是极其危险的，我们需要构筑防卫线——权限与安全系统。
