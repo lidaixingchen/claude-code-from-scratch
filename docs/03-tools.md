@@ -358,6 +358,51 @@ async def execute_tool(name: str, inp: dict) -> str:
 
 ---
 
+## 工具执行的副作用管理原则
+
+在大模型工具系统设计中，**副作用（Side Effects）的管理**是保障系统可预测性与简洁性的重要原则。
+
+### 什么是工具的副作用？
+工具执行除了向大模型返回文本结果外，对系统状态或外部世界产生的额外改变。例如：
+- 写入文件（直接副作用）
+- 自动更新项目记忆索引 `MEMORY.md`（间接/级联副作用）
+
+### 副作用隐藏的危害
+在早期设计中，我们可能会倾向于在具体工具的实现函数（如 `_write_file`）内部隐式调用这些副作用（如直接调用 `_auto_update_memory_index`）。这种做法被称为**副作用隐藏**，它会导致：
+1. **控制流模糊**：副作用在底层深处发生，高层调度器（`execute_tool`）无法感知和控制。
+2. **测试困难**：在对 `_write_file` 进行单元测试时，必须同时模拟或处理记忆系统的副作用，导致测试严重耦合。
+3. **并发隐患**：当在流式或多任务并发场景下，底层的隐式副作用可能导致意料之外的读写冲突。
+
+### 显式副作用管理原则
+为了消除这一隐患，我们应当将副作用提升到**分发器层（`execute_tool`）显式调用**，使底层工具实现函数保持“纯粹（Pure）”或仅产生最直接的副作用。
+
+- **不好的做法**：
+  ```python
+  def _write_file(inp: dict) -> str:
+      # ... 写入逻辑 ...
+      _auto_update_memory_index(inp["file_path"])  # ❌ 隐藏的间接副作用
+  ```
+- **推荐的做法**：
+  ```python
+  def _write_file(inp: dict) -> str:
+      # ... 仅限直接写入逻辑 ...
+      return "Success"
+
+  async def execute_tool(name: str, inp: dict) -> str:
+      # ... 分发执行 ...
+      result = handler(inp)
+      
+      # ✅ 在高层显式处理级联副作用
+      if name == "write_file" and not result.startswith("Error"):
+          _auto_update_memory_index(inp["file_path"])
+          
+      return result
+  ```
+
+这种显式设计提升了代码的教学价值，使工具的执行逻辑更加透明、独立且易于测试。
+
+---
+
 ## ⚖️ 设计权衡
 
 ### 字符串精细替换（Search-and-Replace） vs Unified diff

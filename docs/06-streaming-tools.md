@@ -220,6 +220,46 @@ CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files"}
 
 ---
 
+## 异步模式与并发设计
+
+在构建高并发与快速响应的 Agent 系统时，我们需要在 Python 中使用不同的异步（`asyncio`）调用模式。不少开发者可能会认为这是一种“异步模式不一致”，但实际上它们各自有最适合的应用场景。
+
+### 1. `asyncio.create_task` — 提前抢跑（并发）
+- **场景**：用于流式输出期间安全工具的“提前抢跑（Early Execution）”。
+- **原理**：`create_task` 会将协程包装为 `Task` 并提交给 `asyncio` 事件循环，使其在后台非阻塞地开始运行。大模型在继续生成字符的同时，磁盘/网络 I/O 已经在悄悄进行。
+- **关键代码**：
+  ```python
+  task = asyncio.create_task(execute_tool(block["name"], block["input"]))
+  early_executions[block["id"]] = task
+  ```
+
+### 2. `await` — 顺序执行（同步等待）
+- **场景**：用于常规工具的顺次执行或等待抢跑任务的最终结果。
+- **原理**：`await` 会暂停当前协程，直到目标协程或 Task 运行结束，这保证了执行的先后顺序与一致性。对于有副作用的工具（如 `edit_file`），必须使用 `await` 严格保证顺序，不能乱序或并行。
+- **关键代码**：
+  ```python
+  # 等待后台早已抢跑的异步任务
+  result = await early_task
+  # 或直接顺序调用常规工具
+  result = await execute_tool(tu.name, inp)
+  ```
+
+### 3. `asyncio.gather` — 并行工具执行（批量并发）
+- **场景**：在 OpenAI 兼容后端中，如果模型一次性返回了多个独立的工具调用，且我们需要在流式之外对其进行并行加速。
+- **原理**：`asyncio.gather` 会同时启动多个协程，并等待它们全部执行完毕。相较于 `create_task` 的“发后不管/稍后回收”，`gather` 用于在当前步骤中阻塞等待这组并行任务的全部结果。
+- **关键代码**：
+  ```python
+  results = await asyncio.gather(*(execute_tool(tc.name, tc.args) for tc in tool_calls))
+  ```
+
+### 总结：
+- **`create_task`** 是“非阻塞启动后台执行”。
+- **`await`** 是“同步等待单任务完成”。
+- **`gather`** 是“同步等待一组并行任务完成”。
+理解这三种模式的职责，能帮助我们构建既安全又高效的异步 Agent 系统。
+
+---
+
 ## ⚖️ 设计权衡
 
 ### 异步抢跑（Early Execution） vs 串行阻塞等待

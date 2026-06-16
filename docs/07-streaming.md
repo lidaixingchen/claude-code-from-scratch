@@ -284,6 +284,32 @@ async def _with_retry(fn, max_retries: int = 3):
 
 ---
 
+## 结合 MessageHistory 进行消息管理
+
+在前面的章节中，我们引入了 `MessageHistory` 来统一双后端的历史管理。在流式输出结束后，我们需要更新历史记录：
+1. **Anthropic 后端**：在 `_call_anthropic_stream` 结束后，剔除 `thinking` 块后的完整 `assistant` 消息通过 `self.history.append_assistant_message()` 添加。
+2. **OpenAI 后端**：在 `_call_openai_stream` 收集完文本和 `tool_calls` 后，通过 `self.history.append_assistant_message()` 添加带有 `tool_calls` 的回复。
+3. **工具执行结果**：流式结束后，工具被执行，其返回的结果统一通过 `self.history.append_tool_results()` 回填。
+
+使用 `MessageHistory` 的好处在于，流式逻辑不需要再直接操作底层的私有列表（如 `self._messages` 或 `self._openai_messages`），而是通过高层的方法统一追加，从而大大降低了双后端流式逻辑的耦合度，避免了重复的历史管理代码。
+
+---
+
+## 指数退避重试中的随机抖动（Jitter）
+
+在步骤 4 的重试机制中，**随机抖动（Jitter）** 是极其关键的设计：
+- **Thundering Herd 效应**：当大批客户端因网络瞬断或 API 服务抖动（如 429 限制）同时失败时，如果它们都采用纯粹的指数退避（例如都在 1s、2s、4s 等整秒处重试），会在相同的时间点对网关产生巨大的爆发请求。
+- **加入抖动**：通过在指数退避的基础延迟 `base_delay` 上加上一个 0 到 1 秒之间的随机抖动值 `jitter`，使得各个客户端的实际重试时间错开，平滑了流量波峰。
+
+```python
+# 推荐的实现方式
+base_delay = min(1000 * (2 ** attempt), MAX_RETRY_DELAY_MS) / 1000
+jitter = (hash(str(time.time())) % 1000) / 1000  # 0-1 秒随机抖动
+delay = base_delay + jitter
+```
+
+---
+
 ## ⚖️ 设计权衡
 
 ### 思考链历史保存 vs 丢弃（Filtering Thinking Tokens）

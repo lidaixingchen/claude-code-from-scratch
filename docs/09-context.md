@@ -49,35 +49,35 @@
 
 #### 做什么
 
-修改 `agent.py`，在初始化和 API 返回后记录 Token，并编写 `_check_and_compact` 方法：
+修改 `agent.py`，定义相关常量与 Token 跟踪，并编写 `_check_and_compact` 方法：
 
 ```python
 # agent.py 中的修改
 
+# ─── Constants ──────────────────────────────────────────────
+CONTEXT_WINDOW_SAFETY_MARGIN = 20000  # 窗口安全边界 (Tokens)
+AUTOCOMPACT_THRESHOLD = 0.85          # 触发自动压缩的阈值 (85%)
+LARGE_RESULT_THRESHOLD = 30 * 1024     # 大结果文件持久化阈值 (30 KB)
+LARGE_RESULT_PREVIEW_LINES = 200       # 大结果文件预览行数
 
 class Agent:
-    def __init__(
-        self,
-        model: str = "claude-sonnet-4-6",
-        api_base: str | None = None,
-        api_key: str | None = None,
-    ):
-        self.model = model
-        self.use_openai = bool(api_base)
-        self._messages: list[dict] = []
-
-        # 1. 声明 Token 跟踪和有效窗口边界（默认有效窗口设为 180,000 tokens）
-        self.last_input_token_count = 0
-        self.effective_window = 180000
-
+    def __init__(self, config: AgentConfig):
+        # 1. 声明有效窗口边界和状态
+        self.effective_window = _get_context_window(config.model) - CONTEXT_WINDOW_SAFETY_MARGIN
+        self.state = AgentState()
         # ... 其余初始化代码保持不变
 
     async def _check_and_compact(self) -> None:
         # 当最近一次模型返回的输入 Token 超过有效窗口的 85% 时，触发压缩
-        if self.last_input_token_count > self.effective_window * 0.85:
+        if self.state.last_input_token_count > self.effective_window * AUTOCOMPACT_THRESHOLD:
             print("  [cyan]ℹ Context window filling up, compacting conversation...[/cyan]")
             await self._compact_conversation()
 ```
+
+#### 常量说明
+1. **`CONTEXT_WINDOW_SAFETY_MARGIN` (20000)**: 保留 20,000 tokens 作为安全缓冲区。大模型的系统提示词、用户最新提问以及回复都需要占用空间，不能等窗口 100% 满时才处理。
+2. **`AUTOCOMPACT_THRESHOLD` (0.85)**: 触发自动压缩的水位线阈值。如果已用空间达到有效窗口（有效窗口为总容量减去安全边界）的 85%，即刻开始压缩。
+3. **`LARGE_RESULT_THRESHOLD` (30 KB)**: 用以检查单次工具结果（如极长的 shell 输出）是否过长，若过长则通过持久化文件保存并自动截断，避免单个巨大结果瞬间爆表。
 
 ---
 
@@ -86,10 +86,10 @@ class Agent:
 #### 为什么做
 
 这是本节最核心的技术实现。我们将利用大模型自身的理解和归纳能力来缩减对话。
-1. **备份最新消息**：必须先备份当前等待回复的最后一条 `user` 消息。
+1. **备份最新消息**：必须先备份当前等待回复 the 最后一条 `user` 消息。
 2. **请求摘要**：将除最后一条外的所有历史消息发给模型，要求模型提炼成一段摘要（保留核心决策、修改过的文件、目前进展）。
 3. **消息历史重构**：将历史清空，用 `[Previous conversation summary] \n 摘要` 和 `Understood...` 这一对问答覆盖历史，随后在队列最末尾追加回此前备份的最新 `user` 消息，实现无缝平滑替换。
-4. **后端协议差异**：Anthropic 消息历史是纯粹的消息数组；OpenAI 的第一条消息必须是 `system` 消息，在切片和覆盖时需要予以特判和保留。
+4. **封装性保证**：不要直接修改 `MessageHistory` 的底层私有列表（如 `_anthropic_messages`），而是调用其暴露的公有方法 `replace_anthropic_messages(new_messages)` 和 `replace_openai_messages(new_messages)`。
 
 #### 做什么
 
@@ -105,19 +105,23 @@ class Agent:
             await self._compact_anthropic()
 
     async def _compact_anthropic(self) -> None:
+        messages = self.history.anthropic_messages
         # 消息数过少（不足以进行有意义的总结）则直接返回
-        if len(self._messages) < 4:
+        if len(messages) < 4:
             return
 
         # 1. 备份最后一条当前正在处理的用户消息
-        last_user_msg = self._messages[-1]
+        last_user_msg = messages[-1]
 
         # 2. 向上游 API 请求对除最后一条外的历史进行总结
         response = await self._anthropic_client.messages.create(
-            model=self.model,
+            model=self.config.model,
             max_tokens=1024,
             system="You are a conversation summarizer. Be concise but preserve important decisions, file paths, and context.",
-            messages=self._messages[:-1],  # 排除最新的一条
+            messages=[
+                *messages[:-1],
+                {"role": "user", "content": "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work."},
+            ],
         )
         summary = (
             response.content[0].text
@@ -126,7 +130,7 @@ class Agent:
         )
 
         # 3. 重塑消息历史队列：一问一答，包含先前的摘要
-        self._messages = [
+        new_messages = [
             {"role": "user", "content": f"[Previous conversation summary]\n{summary}"},
             {
                 "role": "assistant",
@@ -136,33 +140,38 @@ class Agent:
 
         # 4. 将最新的一条用户请求重新接驳到历史队列末端，确保当前轮继续正常流式输出
         if last_user_msg.get("role") == "user":
-            self._messages.append(last_user_msg)
+            new_messages.append(last_user_msg)
+        
+        # ✅ 使用 MessageHistory 公共方法进行安全替换，不直接修改私有列表
+        self.history.replace_anthropic_messages(new_messages)
         
         # 重置计数器
-        self.last_input_token_count = 0
+        self.state.last_input_token_count = 0
 
     async def _compact_openai(self) -> None:
+        messages = self.history.openai_messages
         # OpenAI 最少包含 system + 2 轮对话 + 最新用户消息 = 5 条消息
-        if len(self._messages) < 5:
+        if len(messages) < 5:
             return
 
         # 1. 备份首位 system 消息和末位 user 消息
-        system_msg = self._messages[0]
-        last_user_msg = self._messages[-1]
+        system_msg = messages[0]
+        last_user_msg = messages[-1]
 
         # 2. 向上游 OpenAI API 发送总结请求
         response = await self._openai_client.chat.completions.create(
-            model=self.model,
+            model=self.config.model,
             max_tokens=1024,
             messages=[
                 {"role": "system", "content": "You are a conversation summarizer. Be concise but preserve important decisions, file paths, and context."},
-                *self._messages[1:-1],  # 排除首位的 system 和末位的最新 user 消息
+                *messages[1:-1],  # 排除首位的 system 和末位的最新 user 消息
+                {"role": "user", "content": "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work."},
             ],
         )
         summary = response.choices[0].message.content or "No summary available."
 
         # 3. 重新构造 OpenAI 历史列表
-        self._messages = [
+        new_messages = [
             system_msg,
             {"role": "user", "content": f"[Previous conversation summary]\n{summary}"},
             {
@@ -173,9 +182,11 @@ class Agent:
 
         # 4. 追加最新用户消息
         if last_user_msg.get("role") == "user":
-            self._messages.append(last_user_msg)
+            new_messages.append(last_user_msg)
             
-        self.last_input_token_count = 0
+        # ✅ 使用 MessageHistory 公共方法进行安全替换
+        self.history.replace_openai_messages(new_messages)
+        self.state.last_input_token_count = 0
 ```
 
 ---

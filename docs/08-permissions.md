@@ -313,6 +313,25 @@ class Agent:
 
 ---
 
+## 使用 Literal 强化类型约束
+
+在定义权限安全模式时，我们有 5 种预设的选项：`default`（默认模式）、`plan`（规划模式）、`acceptEdits`（自动接受修改）、`bypassPermissions`（YOLO 模式）、`dontAsk`（CI 模式）。
+
+如果我们将这个权限模式定义为普通的字符串类型（`str`），在代码调用和参数传递中容易因为拼写错误而引入隐蔽的 Bug。为此，我们使用了 Python typing 模块中的 `Literal` 类型：
+
+```python
+from typing import Literal
+
+PermissionMode = Literal["default", "plan", "acceptEdits", "bypassPermissions", "dontAsk"]
+```
+
+使用 `Literal` 类型的工程优势包括：
+1. **静态类型检查**：IDE 和 `mypy` 等类型检查工具能实时发现参数拼写错误（例如将 `"dontAsk"` 写错为 `"dont_ask"`）。
+2. **代码可读性**：清晰界定了该变量的取值范围，开发者无需查阅文档就能明白支持哪些模式。
+3. **安全卫士**：从类型层面保证了核心安全控制参数的取值严格可信。
+
+---
+
 ## ⚖️ 设计权衡
 
 ### 拦截报错作为异常终止 vs 拦截报错作为 Tool Result 返回给模型

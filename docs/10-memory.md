@@ -148,8 +148,8 @@ def list_memories() -> list[dict]:
                     "type": meta["type"],
                     "filename": f.name,
                 })
-        except Exception:
-            pass
+        except (OSError, ValueError) as e:
+            logger.debug(f"Skipping memory file {f}: {e}")
     return entries
 
 
@@ -163,6 +163,12 @@ def _update_memory_index() -> None:
     index_path = get_memory_dir() / "MEMORY.md"
     index_path.write_text("\n".join(lines), encoding="utf-8")
 ```
+
+#### 健全的错误处理与日志记录
+
+在扫描项目目录、读取和解析 YAML Frontmatter 记忆文件时，由于文件可能被外部程序占用、甚至被用户修改损坏，我们需要格外注意：
+1. **精准捕获**：使用 `except (OSError, ValueError) as e` 代替宽泛的 `except Exception`。
+2. **输出调试日志**：通过 `logger.debug(f"Skipping memory file {f}: {e}")` 记录具体的跳过原因，避免异常被无声隐藏，方便后期维护。
 
 ---
 

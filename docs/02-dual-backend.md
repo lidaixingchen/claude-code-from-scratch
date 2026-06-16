@@ -337,6 +337,29 @@ if __name__ == "__main__":
 
 ---
 
+## 消息历史抽象层
+
+为了避免 Anthropic/OpenAI 双后端的代码重复，我们引入了 `MessageHistory` 类：
+
+```python
+class MessageHistory:
+    def __init__(self, use_openai: bool, system_prompt: str): ...
+    def append_user_message(self, content: str | list) -> None: ...
+    def append_assistant_message(self, content: Any) -> None: ...
+    def append_tool_results(self, results: list[dict]) -> None: ...
+    def update_last_user_content(self, suffix: str) -> None: ...
+    def clear(self, keep_system: bool = True) -> None: ...
+    def to_dict(self) -> dict: ...
+    def restore(self, data: dict) -> None: ...
+```
+
+这个抽象层使得：
+1. **工具执行循环只需写一次**：统一处理双后端的 `messages` 数组增长。
+2. **消息格式转换逻辑集中管理**：屏蔽 Anthropic 与 OpenAI 格式（如 `tool_use`/`tool_result` 与 `tool_calls`/`tool` 消息）的底层协议差异。
+3. **序列化/反序列化逻辑统一**：在持久化保存会话时，无需分头处理，统一调用 `to_dict()` 与 `restore()`。
+
+---
+
 ## ⚖️ 设计权衡
 
 ### 方案 A：共用同一个 `_messages` 列表（我们所用的）
