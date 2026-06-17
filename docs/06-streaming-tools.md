@@ -47,7 +47,8 @@
 ```python
 # tools.py 中的新增常量
 
-# 哪些工具是只读、无副作用且可以并行抢跑的？
+# 并发安全工具白名单：只读、无副作用，允许在流式输出期间异步抢跑
+# 使用 set 实现 O(1) 查找，避免在回调中频繁遍历列表
 CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
 ```
 
@@ -59,7 +60,7 @@ CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
 from .tools import (
     tool_definitions,
     execute_tool,
-    CONCURRENCY_SAFE_TOOLS,  # 导入并发安全工具集
+    CONCURRENCY_SAFE_TOOLS,  # 并发安全工具白名单，用于判断是否可以异步抢跑
     # ... 其他导入保持不变
 )
 ```
@@ -82,30 +83,34 @@ from .tools import (
 ```python
 # agent.py（续）
 
+    # 流式调用 Anthropic API，监听 tool_use 块并在完成时触发回调
     async def _call_anthropic_stream(self, on_tool_block_complete=None) -> Any:
         max_output = _get_max_output_tokens(self.config.model)
         create_params = {
             "model": self.config.model,
+            # thinking 模式下使用动态上限，禁用时使用默认 16384
             "max_tokens": max_output if self.state.thinking_mode != "disabled" else 16384,
             "system": self._system_prompt,
             "tools": get_active_tool_definitions(self.tools),
             "messages": self.history.anthropic_messages,
         }
 
+        # thinking 模式启用时，预留几乎全部 token 给思考过程
         if self.state.thinking_mode in ("adaptive", "enabled"):
             create_params["thinking"] = {
                 "type": "enabled",
                 "budget_tokens": max_output - 1,
             }
 
+        # 按 content_block 的 index 追踪各工具块的累积参数
         tool_blocks_by_index = {}
 
-        # 开启流式 API 监听
+        # 开启流式 API 监听，使用 async with 确保流正确关闭
         async with self._anthropic_client.messages.stream(**create_params) as stream:
             async for event in stream:
                 if not hasattr(event, 'type'):
                     continue
-                # 1. 监测到工具块开始
+                # 1. 工具块开始：记录 id 和 name，初始化空的 input_json
                 if event.type == "content_block_start":
                     cb = getattr(event, 'content_block', None)
                     if cb and getattr(cb, 'type', None) == "tool_use":
@@ -114,14 +119,14 @@ from .tools import (
                             "name": cb.name,
                             "input_json": "",
                         }
-                # 2. 收集参数的 JSON 增量片段
+                # 2. JSON 增量片段：逐步拼接工具参数（流式传输时 JSON 是分片到达的）
                 elif event.type == "content_block_delta":
                     delta = event.delta
                     if hasattr(delta, 'partial_json'):
                         tb = tool_blocks_by_index.get(event.index)
                         if tb:
                             tb["input_json"] += delta.partial_json
-                # 3. 工具块接收完毕，解析参数并触发完成回调
+                # 3. 工具块结束：解析完整 JSON 并触发抢跑回调
                 elif event.type == "content_block_stop":
                     tb = tool_blocks_by_index.pop(event.index, None)
                     if tb and on_tool_block_complete:
@@ -130,7 +135,7 @@ from .tools import (
                         except Exception:
                             parsed = {}
 
-                        # 执行回调，暴露已生成的完整工具调用信息
+                        # 回调通知 Agent：此工具的参数已完整，可以开始执行
                         on_tool_block_complete({
                             "type": "tool_use",
                             "id": tb["id"],
@@ -138,6 +143,7 @@ from .tools import (
                             "input": parsed,
                         })
 
+            # 等待流完全结束，获取最终的完整消息对象
             final_message = await stream.get_final_message()
         return final_message
 ```
@@ -149,15 +155,16 @@ from .tools import (
 ```python
 # agent.py 顶部的辅助函数
 
+# 根据模型名称动态返回最大输出 token 数，避免硬编码
 def _get_max_output_tokens(model: str) -> int:
     m = model.lower()
     if "opus-4-6" in m:
-        return 64000
+        return 64000   # opus-4-6 拥有最大的输出能力
     if "sonnet-4-6" in m:
         return 32000
     if any(x in m for x in ("opus-4", "sonnet-4", "haiku-4")):
         return 32000
-    return 16384
+    return 16384  # 未知模型使用保守默认值
 ```
 
 ---
@@ -175,21 +182,26 @@ def _get_max_output_tokens(model: str) -> int:
 ```python
 # agent.py — 大结果持久化
 
-LARGE_RESULT_THRESHOLD = 30 * 1024      # 30 KB
-LARGE_RESULT_PREVIEW_LINES = 200
+LARGE_RESULT_THRESHOLD = 30 * 1024      # 30 KB 阈值，超过则持久化到磁盘
+LARGE_RESULT_PREVIEW_LINES = 200        # 预览保留的行数
 
 
+    # 当工具结果超过阈值时，将完整内容保存到磁盘并返回预览摘要
     def _persist_large_result(self, tool_name: str, result: str) -> str:
+        # 小结果直接返回，避免不必要的磁盘 IO
         if len(result.encode()) <= LARGE_RESULT_THRESHOLD:
             return result
+        # 创建工具结果存储目录
         d = Path.home() / ".mini-claude" / "tool-results"
         d.mkdir(parents=True, exist_ok=True)
+        # 文件名包含毫秒时间戳和工具名，便于事后追溯
         filename = f"{int(time.time() * 1000)}-{tool_name}.txt"
         filepath = d / filename
         filepath.write_text(result, encoding="utf-8")
 
         lines = result.split("\n")
         preview = "\n".join(lines[:LARGE_RESULT_PREVIEW_LINES])
+        # 使用字节数而非字符数衡量，确保中文等多字节字符被正确计算
         size_kb = len(result.encode()) / 1024
 
         return (
@@ -226,24 +238,26 @@ LARGE_RESULT_PREVIEW_LINES = 200
 
         while True:
             current_system_prompt = build_system_prompt()
-            
-            # 创建抢跑任务字典，保存 { tool_use_id -> asyncio.Task }
+
+            # 抢跑任务注册表：{ tool_use_id -> asyncio.Task }
+            # 用于在流式结束后直接 await 已启动的后台任务
             early_executions: dict[str, asyncio.Task] = {}
 
-            # 回调函数：当安全工具生成完，先检查权限，通过后立即在后台异步跑起来
+            # 回调函数：当安全工具参数生成完毕时被调用
             def _on_tool_block_complete(block: dict):
+                # 只有白名单中的只读工具才允许抢跑
                 if block["name"] in CONCURRENCY_SAFE_TOOLS:
-                    # 权限检查：只有被允许的操作才能抢跑，避免绕过安全防线
+                    # 权限检查：即使工具在白名单中，仍需验证用户是否授权
                     perm = check_permission(
                         block["name"], block["input"],
                         self.config.permission_mode, self.state.plan_file_path,
                     )
                     if perm["action"] == "allow":
-                         # 创建后台异步任务，使其开始抢跑
+                         # 创建后台异步任务立即开始执行，不阻塞流式接收
                          task = asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
                          early_executions[block["id"]] = task
 
-            # 传入回调函数调用流式连接
+            # 将回调传入流式 API 调用，每个工具块完成时都会触发
             response = await self._call_anthropic_stream(
                 on_tool_block_complete=_on_tool_block_complete
             )
@@ -268,24 +282,26 @@ LARGE_RESULT_PREVIEW_LINES = 200
 ```python
 # agent.py（续）
 
+            # 将助手消息（含文本和工具调用）追加到历史记录
             self.history.append_assistant_message(
                 [self._block_to_dict(b) for b in response.content]
             )
 
+            # 提取所有工具调用块
             tool_uses = [b for b in response.content if b.type == "tool_use"]
             if not tool_uses:
-                break
+                break  # 没有工具调用，对话循环结束
 
             tool_results = []
             for tu in tool_uses:
                 inp = dict(tu.input) if hasattr(tu.input, "items") else tu.input
 
-                # 1. 检查当前工具是否早已在后台异步抢跑？
+                # 1. 检查此工具是否已在后台抢跑执行
                 early_task = early_executions.get(tu.id)
                 if early_task:
-                    # 此时才把工具日志渲染到 UI
+                    # 抢跑任务静默运行，此时才渲染 UI 日志（避免与流式文本混杂）
                     print_tool_call(tu.name, inp)
-                    # 直接等待后台已在运行（甚至可能已经运行完）的任务返回
+                    # await 可能已完成的任务，几乎零等待
                     raw = await early_task
                     res = self._persist_large_result(tu.name, raw)
                     print_tool_result(tu.name, res)
@@ -297,7 +313,7 @@ LARGE_RESULT_PREVIEW_LINES = 200
                     })
                     continue
 
-                # 2. 未能抢跑的非安全工具（如 write_file/run_shell），走常规同步处理
+                # 2. 非安全工具（write_file/run_shell 等）走常规同步执行
                 print_tool_call(tu.name, inp)
                 raw = await self._execute_tool_call(tu.name, inp)
                 res = self._persist_large_result(tu.name, raw)
@@ -309,6 +325,7 @@ LARGE_RESULT_PREVIEW_LINES = 200
                     "content": res,
                 })
 
+            # 将所有工具执行结果追加到历史，供下一轮对话使用
             self.history.append_tool_results(tool_results)
 ```
 
@@ -376,7 +393,8 @@ LARGE_RESULT_PREVIEW_LINES = 200
 ### 1. 对非安全工具进行提前抢跑
 
 ```python
-# ❌ 错误：如果对 run_shell 等带副作用的命令进行抢跑
+# ❌ 错误示例：对带副作用的工具进行抢跑
+# run_shell 和 edit_file 会修改外部状态，不能在用户确认前静默执行
 if block["name"] in ("run_shell", "edit_file"):
     task = asyncio.create_task(execute_tool(...))
 ```

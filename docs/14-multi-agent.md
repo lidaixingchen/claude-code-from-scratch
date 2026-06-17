@@ -76,7 +76,7 @@ graph TB
 ```python
 # subagent.py
 
-# 定义只读工具的白名单
+# 只读工具白名单：explore 和 plan 代理仅允许使用这些工具
 READ_ONLY_TOOLS = {"read_file", "list_files", "grep_search"}
 
 EXPLORE_PROMPT = """You are a file search specialist for Mini Claude Code. You excel at thoroughly navigating and exploring codebases.
@@ -100,7 +100,7 @@ IMPORTANT CONSTRAINTS:
 
 GENERAL_PROMPT = """You are an agent for Mini Claude Code. Given the user's message, you should use the tools available to complete the task."""
 
-# 扫描并加载本地/项目级自定义代理
+# 扫描并加载本地/项目级自定义代理配置（从 ~/.claude/agents/ 和 .cwd()/.claude/agents/ 读取 Markdown）
 def _discover_custom_agents() -> dict[str, dict]:
     # 扫描 ~/.claude/agents/ 和 .cwd()/.claude/agents/ 目录下的 Markdown
     # 复用 frontmatter 解析器并返回代理配置字典
@@ -112,14 +112,16 @@ def _discover_custom_agents() -> dict[str, dict]:
 ```python
 # subagent.py
 
+# 根据代理类型返回对应的系统提示词和工具集
 def get_sub_agent_config(agent_type: str) -> dict:
     """为指定类型的子代理分配 {system_prompt, tools}。"""
+    # 优先检查用户自定义代理（通过 _discover_custom_agents 扫描）
     custom = _discover_custom_agents().get(agent_type)
     if custom:
         if custom["allowed_tools"]:
             tools = [t for t in tool_definitions if t["name"] in custom["allowed_tools"]]
         else:
-            tools = [t for t in tool_definitions if t["name"] != "agent"]  # 排除递归派生
+            tools = [t for t in tool_definitions if t["name"] != "agent"]  # 排除递归派生，防止无限嵌套
         return {"system_prompt": custom["system_prompt"], "tools": tools}
 
     # 内置只读工具集（只允许读取与搜索，不允许写操作）
@@ -130,6 +132,7 @@ def get_sub_agent_config(agent_type: str) -> dict:
     elif agent_type == "plan":
         return {"system_prompt": PLAN_PROMPT, "tools": read_only}
     else:  # general
+        # general 代理拥有完整工具集，但排除 agent 工具以防止递归创建子代理
         return {"system_prompt": GENERAL_PROMPT, "tools": [t for t in tool_definitions if t["name"] != "agent"]}
 ```
 
@@ -138,6 +141,7 @@ def get_sub_agent_config(agent_type: str) -> dict:
 ```python
 # subagent.py
 
+# 返回所有可用代理类型（内置 + 自定义）的名称与描述
 def get_available_agent_types() -> list[dict[str, str]]:
     """返回所有可用代理类型（内置 + 自定义）的名称与描述。"""
     types = [
@@ -145,18 +149,20 @@ def get_available_agent_types() -> list[dict[str, str]]:
         {"name": "plan", "description": "Read-only analysis with structured implementation plans"},
         {"name": "general", "description": "Full tools for independent tasks"},
     ]
+    # 追加用户通过 .claude/agents/ 自定义的代理类型
     for name, defn in _discover_custom_agents().items():
         types.append({"name": name, "description": defn["description"]})
     return types
 
 
+# 将自定义代理类型描述注入 System Prompt（仅在存在自定义代理时生成，避免冗余）
 def build_agent_descriptions() -> str:
     """将自定义代理类型描述注入 System Prompt（仅当存在自定义代理时）。"""
     types = get_available_agent_types()
     if len(types) <= 3:
-        return ""  # 仅有内置类型，已在 System Prompt 中硬编码
+        return ""  # 仅有内置类型，已在 System Prompt 中硬编码，无需注入
 
-    custom = types[3:]
+    custom = types[3:]  # 跳过前 3 个内置类型
     lines = ["\n# Custom Agent Types", ""]
     for t in custom:
         lines.append(f"- **{t['name']}**: {t['description']}")
@@ -182,6 +188,7 @@ def build_agent_descriptions() -> str:
 ```python
 # tools.py
 
+    # agent 工具：允许主 Agent 派生子代理处理独立任务
     {
         "name": "agent",
         "description": "Launch a sub-agent to handle a task autonomously. Sub-agents have isolated context and return their result. Types: 'explore' (read-only), 'plan' (read-only, structured planning), 'general' (full tools).",
@@ -225,9 +232,9 @@ def build_agent_descriptions() -> str:
         max_cost_usd: float | None = None,
         max_turns: int | None = None,
         confirm_fn: Callable[[str], Awaitable[bool]] | None = None,
-        custom_system_prompt: str | None = None,
-        custom_tools: list[ToolDef] | None = None,
-        is_sub_agent: bool = False, # 新增标志位
+        custom_system_prompt: str | None = None,   # 子代理自定义系统提示词
+        custom_tools: list[ToolDef] | None = None,  # 子代理裁剪后的工具集
+        is_sub_agent: bool = False,                  # 标识是否为子代理（影响输出捕获与 MCP 初始化）
     ):
         # 封装至统一的 AgentConfig 中
         self.config = AgentConfig(
@@ -247,7 +254,7 @@ def build_agent_descriptions() -> str:
         self.state = AgentState()
         # ... 其它初始化 ...
 
-        # 覆写工具列表与基础系统提示词
+        # 子代理覆写工具列表与系统提示词，主 Agent 使用默认值
         self.tools = custom_tools or tool_definitions
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
 ```
@@ -257,6 +264,7 @@ def build_agent_descriptions() -> str:
 ```python
 # agent.py
 
+    # 只读属性：不可直接赋值，需通过 self.config 存储
     @property
     def is_sub_agent(self) -> bool:
         return self.config.is_sub_agent
@@ -278,11 +286,12 @@ def build_agent_descriptions() -> str:
 ```python
 # agent.py
 
+    # 输出拦截器：子代理运行时将文本写入缓冲区，主 Agent 直接打印
     def _emit_text(self, text: str) -> None:
         if self.state.output_buffer is not None:
-            self.state.output_buffer.append(text)
+            self.state.output_buffer.append(text)   # 子代理：捕获流式文本供后续回传
         else:
-            print_assistant_text(text)
+            print_assistant_text(text)               # 主 Agent：直接输出到控制台
 ```
 
 2. **实现 `run_once` 执行入口**：在 `Agent` 中编写子代理单次生命周期内的执行控制逻辑，运行结束后计算消耗的 Token 并返回缓冲区文本：
@@ -290,17 +299,19 @@ def build_agent_descriptions() -> str:
 ```python
 # agent.py
 
+    # 子代理一次性运行接口：激活缓冲区 -> 执行 chat -> 收集输出与 Token 消耗
     async def run_once(self, prompt: str) -> dict:
-        self.state.output_buffer = []  # 激活文本捕获缓冲区
+        self.state.output_buffer = []  # 激活文本捕获缓冲区，子代理的流式输出不再打印到控制台
+        # 记录运行前的 Token 数，用于计算本次运行的消耗增量
         prev_in = self.state.total_input_tokens
         prev_out = self.state.total_output_tokens
         
         await self.chat(prompt)  # 运行标准的 chat 会话逻辑
         
-        text = "".join(self.state.output_buffer)
-        self.state.output_buffer = None  # 关闭缓冲区
+        text = "".join(self.state.output_buffer)  # 将缓冲区中的流式片段拼接为完整文本
+        self.state.output_buffer = None  # 关闭缓冲区，恢复主 Agent 的直接打印行为
         
-        # 返回捕获的完整文本与产生的 Token 消耗增量
+        # 返回捕获的完整文本与产生的 Token 消耗增量（增量计算，而非绝对值）
         return {
             "text": text,
             "tokens": {
@@ -326,29 +337,30 @@ Token 消耗要使用增量计算（`self.state.total_input_tokens - prev_in`）
 ```python
 # agent.py
 
+    # 子代理执行入口：根据类型获取配置 -> 实例化 -> 运行 -> 合并 Token 账单
     async def _execute_agent_tool(self, inp: dict) -> str:
         agent_type = inp.get("type", "general")
         description = inp.get("description", "sub-agent task")
         prompt = inp.get("prompt", "")
 
-        # 打印子代理启动的紫色标志
-        print_sub_agent_start(agent_type, description)
+        print_sub_agent_start(agent_type, description)  # 紫色边框标记子代理启动
 
         config = get_sub_agent_config(agent_type)
         sub_agent = Agent(
             model=self.config.model,
-            # 继承父 Agent 的 OpenAI API 后端地址，避免后端脱钩
+            # 继承父 Agent 的 API 后端地址（如 aihubmix 中转），否则子代理会路由到默认 Anthropic 端点
             api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
+            anthropic_base_url=str(self._anthropic_client.base_url) if not self.use_openai and self._anthropic_client else None,
             custom_system_prompt=config["system_prompt"],
             custom_tools=config["tools"],
             is_sub_agent=True,
-            # 权限继承：如果父级处于只读 plan 模式，子级强制继承 plan 模式；否则直接放行子代理
+            # 权限继承：父级处于 plan 模式时，子级强制继承只读约束；否则放行以支持子代理自主执行
             permission_mode="plan" if self.config.permission_mode == "plan" else "bypassPermissions",
         )
 
         try:
             result = await sub_agent.run_once(prompt)
-            # 将子代理消耗的 Token 累加到主代理账单中，合并计费
+            # 将子代理消耗的 Token 累加到主代理账单中，实现统一计费
             self.state.total_input_tokens += result["tokens"]["input"]
             self.state.total_output_tokens += result["tokens"]["output"]
             print_sub_agent_end(agent_type, description)
@@ -364,6 +376,7 @@ Token 消耗要使用增量计算（`self.state.total_input_tokens - prev_in`）
 ```python
 # agent.py -> _execute_tool_call()
 
+        # 工具分发器：拦截 agent 工具调用，路由至子代理执行
         if name == "agent":
             return await self._execute_agent_tool(inp)
 ```

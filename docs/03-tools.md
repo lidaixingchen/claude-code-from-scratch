@@ -63,23 +63,25 @@ import re
 import subprocess
 from pathlib import Path
 
-MAX_RESULT_CHARS = 50000  # 限制单次工具返回最大字符数
+MAX_RESULT_CHARS = 50000  # 限制单次工具返回最大字符数——防止撑爆上下文窗口
 
 
 def _read_file(inp: dict) -> str:
+    """读取文件内容并附加行号，方便 LLM 精准定位"""
     try:
         content = Path(inp["file_path"]).read_text(encoding="utf-8")
         lines = content.split("\n")
         # 加上行号，方便 LLM 查找并定位代码
         return "\n".join(f"{i+1:4d} | {line}" for i, line in enumerate(lines))
     except Exception as e:
-        return f"Error reading file: {e}"
+        return f"Error reading file: {e}"  # 返回错误字符串而非抛异常，让 LLM 自行重试
 
 
 def _truncate_result(result: str) -> str:
+    """头尾截断：保留文件开头和末尾（报错通常在尾部），裁剪中间部分"""
     if len(result) <= MAX_RESULT_CHARS:
         return result
-    # 保留头尾，中间进行截断
+    # 预留 60 字符给截断提示信息，其余平均分配给头尾
     keep = (MAX_RESULT_CHARS - 60) // 2
     return (
         result[:keep]
@@ -109,12 +111,14 @@ Agent 经常需要创建新代码文件。如果直接调用底层的 Python 写
 
 
 def _write_file(inp: dict) -> str:
+    """写入文件，自动创建不存在的父目录"""
     try:
         path = Path(inp["file_path"])
-        # 自动创建任意不存在的父级目录
+        # 自动创建任意不存在的父级目录——减少 Agent 对 Shell mkdir 的依赖
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(inp["content"], encoding="utf-8")
 
+        # 返回前 30 行预览，让 Agent 确认写入格式正确，无需再调 read_file
         lines = inp["content"].split("\n")
         preview = "\n".join(f"{i+1:4d} | {l}" for i, l in enumerate(lines[:30]))
         trunc = f"\n  ... ({len(lines)} lines total)" if len(lines) > 30 else ""
@@ -147,57 +151,65 @@ def _write_file(inp: dict) -> str:
 
 
 def _normalize_quotes(s: str) -> str:
-    s = re.sub("[‘’′]", "'", s)
-    s = re.sub('[“”″]', '"', s)
+    “””将弯引号和特殊引号统一为直引号——LLM 常混淆这些字符”””
+    s = re.sub(“[‘’′]”, “’”, s)
+    s = re.sub(‘[“”″]’, ‘”’, s)
     return s
 
 
 def _find_actual_string(file_content: str, search_string: str) -> str | None:
+    “””在文件中查找目标字符串，支持引号容错”””
+    # 先尝试精确匹配——优先使用原始字符串
     if search_string in file_content:
         return search_string
-    # 转换为直引号后再次匹配
+    # 精确匹配失败，转为直引号后再次匹配——处理 LLM 的引号混淆问题
     norm_search = _normalize_quotes(search_string)
     norm_file = _normalize_quotes(file_content)
     idx = norm_file.find(norm_search)
     if idx != -1:
         # 返回文件里的原样字符串，保持代码本身的风格
         return file_content[idx : idx + len(search_string)]
-    return None
+    return None  # 完全未匹配——LLM 可能产生了幻觉
 
 
 def _generate_diff(old_content: str, old_string: str, new_string: str) -> str:
+    “””生成轻量级 diff 输出，方便 Agent 确认修改内容”””
     # 根据 old_string 在前文中出现的 \n 计算起始行号
-    line_num = old_content.split(old_string)[0].count("\n") + 1
-    old_lines = old_string.split("\n")
-    new_lines = new_string.split("\n")
-    parts = [f"@@ -{line_num},{len(old_lines)} +{line_num},{len(new_lines)} @@"]
-    parts.extend(f"- {l}" for l in old_lines)
-    parts.extend(f"+ {l}" for l in new_lines)
-    return "\n".join(parts)
+    line_num = old_content.split(old_string)[0].count(“\n”) + 1
+    old_lines = old_string.split(“\n”)
+    new_lines = new_string.split(“\n”)
+    parts = [f”@@ -{line_num},{len(old_lines)} +{line_num},{len(new_lines)} @@”]
+    parts.extend(f”- {l}” for l in old_lines)
+    parts.extend(f”+ {l}” for l in new_lines)
+    return “\n”.join(parts)
 
 
 def _edit_file(inp: dict) -> str:
+    “””精确编辑：通过唯一匹配的 old_string 替换为 new_string”””
     try:
-        path = Path(inp["file_path"])
-        content = path.read_text(encoding="utf-8")
+        path = Path(inp[“file_path”])
+        content = path.read_text(encoding=”utf-8”)
 
-        actual = _find_actual_string(content, inp["old_string"])
+        # 带引号容错的查找
+        actual = _find_actual_string(content, inp[“old_string”])
         if not actual:
-            return f"Error: old_string not found in {inp['file_path']}"
+            return f”Error: old_string not found in {inp[‘file_path’]}”
 
-        # 唯一性校验防止误替换
+        # 唯一性校验防止误替换——匹配多次时拒绝执行，由 LLM 调整 old_string 重试
         count = content.count(actual)
         if count > 1:
-            return f"Error: old_string found {count} times in {inp['file_path']}. Must be unique."
+            return f”Error: old_string found {count} times in {inp[‘file_path’]}. Must be unique.”
 
-        new_content = content.replace(actual, inp["new_string"], 1)
-        path.write_text(new_content, encoding="utf-8")
+        # replace 第三个参数 1 表示只替换首个匹配——即使校验通过也做防御
+        new_content = content.replace(actual, inp[“new_string”], 1)
+        path.write_text(new_content, encoding=”utf-8”)
 
-        diff = _generate_diff(content, actual, inp["new_string"])
-        note = " (matched via quote normalization)" if actual != inp["old_string"] else ""
-        return f"Successfully edited {inp['file_path']}{note}\n\n{diff}"
+        diff = _generate_diff(content, actual, inp[“new_string”])
+        # 若实际匹配的字符串与请求不同，说明经历了引号标准化
+        note = “ (matched via quote normalization)” if actual != inp[“old_string”] else “”
+        return f”Successfully edited {inp[‘file_path’]}{note}\n\n{diff}”
     except Exception as e:
-        return f"Error editing file: {e}"
+        return f”Error editing file: {e}”
 ```
 
 #### 注意什么
@@ -223,19 +235,21 @@ Agent 常运行测试或构建任务。我们需要：
 
 
 def _run_shell(inp: dict) -> str:
+    """执行 Shell 命令，合并 stdout 和 stderr，支持超时保护"""
     try:
-        timeout_ms = inp.get("timeout", 30000)
+        timeout_ms = inp.get("timeout", 30000)  # 默认 30 秒超时
         timeout_s = timeout_ms / 1000
         result = subprocess.run(
             inp["command"],
             shell=True,
-            capture_output=True,
+            capture_output=True,  # 同时捕获 stdout 和 stderr
             text=True,
             timeout=timeout_s,
         )
         stdout = f"\nStdout:\n{result.stdout}" if result.stdout else ""
         stderr = f"\nStderr:\n{result.stderr}" if result.stderr else ""
         if result.returncode != 0:
+            # 非零退出码——将 stderr 一起返回，错误信息通常在 stderr 中
             return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
         return result.stdout or "(command succeeded with no output)"
     except subprocess.TimeoutExpired:
@@ -330,10 +344,12 @@ tool_definitions: list[dict] = [
 
 
 def get_tool_definitions() -> list[dict]:
+    """返回所有工具的定义，供 LLM API 调用时传入"""
     return tool_definitions
 
 
 async def execute_tool(name: str, inp: dict) -> str:
+    """工具分发器：根据名称路由到具体实现函数，并自动截断大结果"""
     handlers = {
         "list_files": _list_files,  # 第一课实现
         "read_file": _read_file,
@@ -343,7 +359,7 @@ async def execute_tool(name: str, inp: dict) -> str:
     }
     handler = handlers.get(name)
     if not handler:
-        return f"Unknown tool: {name}"
+        return f"Unknown tool: {name}"  # 返回字符串而非抛异常，让 LLM 自行修正工具名
 
     # 执行对应函数并自动拦截大结果输出
     result = handler(inp)
@@ -381,7 +397,8 @@ async def execute_tool(name: str, inp: dict) -> str:
   ```python
   def _write_file(inp: dict) -> str:
       # ... 写入逻辑 ...
-      _auto_update_memory_index(inp["file_path"])  # ❌ 隐藏的间接副作用
+      # ❌ 隐藏的间接副作用——高层调度器无法感知，测试时必须模拟
+      _auto_update_memory_index(inp["file_path"])
   ```
 - **推荐的做法**：
   ```python
@@ -390,13 +407,14 @@ async def execute_tool(name: str, inp: dict) -> str:
       return "Success"
 
   async def execute_tool(name: str, inp: dict) -> str:
+      """分发器：集中管理副作用，保持底层函数纯粹"""
       # ... 分发执行 ...
       result = handler(inp)
-      
-      # ✅ 在高层显式处理级联副作用
+
+      # ✅ 在高层显式处理级联副作用——清晰、可控、易测试
       if name == "write_file" and not result.startswith("Error"):
           _auto_update_memory_index(inp["file_path"])
-          
+
       return result
   ```
 

@@ -77,11 +77,13 @@ from .tools import execute_tool, get_tool_definitions
 
 @dataclass
 class AgentConfig:
-    model: str = "claude-sonnet-4-6"
+    """Agent 的静态配置，运行期间保持不变"""
+    model: str = "claude-sonnet-4-6"  # 默认使用的 LLM 模型
 
 
 @dataclass
 class AgentState:
+    """Agent 的运行时状态，随会话进行动态变化"""
     pass
 
 
@@ -89,8 +91,8 @@ class Agent:
     def __init__(self, model: str = "claude-sonnet-4-6"):
         self.config = AgentConfig(model=model)
         self.state = AgentState()
-        self._client = anthropic.AsyncAnthropic()
-        self._messages: list[dict] = []
+        self._client = anthropic.AsyncAnthropic()  # 异步 Anthropic API 客户端
+        self._messages: list[dict] = []  # 消息历史：Agent 的工作记忆
 ```
 
 `_messages` 是核心数据结构。它的增长方式：
@@ -143,6 +145,7 @@ Agent：用户问 → LLM 决定调用工具 → 执行工具 → 结果喂回 L
 # agent.py（续）
 
     async def _chat(self, user_message: str) -> None:
+        """Agent Loop 核心：循环调用 LLM 直到任务完成"""
         # 1. 把用户消息推入历史
         self._messages.append({"role": "user", "content": user_message})
 
@@ -156,13 +159,13 @@ Agent：用户问 → LLM 决定调用工具 → 执行工具 → 结果喂回 L
                 messages=self._messages,
             )
 
-            # 3. 把 LLM 的回复推入历史
+            # 3. 把 LLM 的回复推入历史——必须在检查 tool_use 之前，否则上下文断裂
             self._messages.append({
                 "role": "assistant",
                 "content": [self._block_to_dict(b) for b in response.content],
             })
 
-            # 4. 检查是否有 tool_use
+            # 4. 检查是否有 tool_use——这是循环终止的唯一判断条件
             tool_uses = [b for b in response.content if b.type == "tool_use"]
             if not tool_uses:
                 break  # 没有工具调用 → 任务完成，退出循环
@@ -173,13 +176,15 @@ Agent：用户问 → LLM 决定调用工具 → 执行工具 → 结果喂回 L
                 result = await execute_tool(tu.name, dict(tu.input))
                 tool_results.append({
                     "type": "tool_result",
-                    "tool_use_id": tu.id,
+                    "tool_use_id": tu.id,  # 必须关联回对应的 tool_use 调用
                     "content": result,
                 })
+            # 工具结果用 role: "user" 推入——这是 Anthropic API 的协议要求
             self._messages.append({"role": "user", "content": tool_results})
 
     @staticmethod
     def _block_to_dict(block) -> dict:
+        """将 Anthropic SDK 对象转为普通 dict，因为消息数组只能存 dict"""
         if block.type == "text":
             return {"type": "text", "text": block.text}
         if block.type == "tool_use":
@@ -187,6 +192,7 @@ Agent：用户问 → LLM 决定调用工具 → 执行工具 → 结果喂回 L
                 "type": "tool_use",
                 "id": block.id,
                 "name": block.name,
+                # block.input 可能是 dict 或自定义对象，需要统一处理
                 "input": dict(block.input) if hasattr(block.input, "items") else block.input,
             }
         return {"type": block.type}
@@ -252,10 +258,11 @@ tool_definitions: list[dict] = [
 
 
 def get_tool_definitions() -> list[dict]:
+    """返回所有工具的定义，供 LLM API 调用时传入"""
     return tool_definitions
 
 
-# 单次列文件的最大条目数
+# 单次列文件的最大条目数——防止超长输出撑爆上下文
 MAX_LIST_FILES = 200
 
 
@@ -263,21 +270,23 @@ MAX_LIST_FILES = 200
 async def execute_tool(name: str, inp: dict) -> str:
     if name == "list_files":
         return _list_files(inp)
-    return f"Unknown tool: {name}"
+    return f"Unknown tool: {name}"  # 返回字符串而非抛异常，让 LLM 自行修正
 
 
 def _list_files(inp: dict) -> str:
+    """列出目录下匹配 glob 模式的文件"""
     base = Path(inp.get("path") or ".")
     pattern = inp["pattern"]
     files = []
     for p in base.glob(pattern):
         if p.is_file():
             rel = str(p.relative_to(base) if base != Path(".") else p)
+            # 跳过 node_modules 和 .git，避免返回垃圾结果
             if "node_modules" in rel or ".git" in rel.split(os.sep):
                 continue
             files.append(rel)
             if len(files) >= MAX_LIST_FILES:
-                break
+                break  # 达到上限立即停止，避免不必要的遍历
     if not files:
         return "No files found matching the pattern."
     return "\n".join(files[:MAX_LIST_FILES])
@@ -318,10 +327,11 @@ from .agent import Agent
 
 
 async def main():
+    """程序入口：从命令行参数读取查询并启动 Agent"""
     # 读取命令行参数作为用户查询，默认为列出 .py 文件
     query = sys.argv[1] if len(sys.argv) > 1 else "列出当前目录下所有 .py 文件"
     agent = Agent()
-    await agent._chat(query)
+    await agent._chat(query)  # 暂用 _chat，后续章节会扩展为完整的 chat 方法
 
 
 if __name__ == "__main__":

@@ -69,25 +69,32 @@ from .frontmatter import parse_frontmatter
 
 @dataclass
 class SkillDefinition:
-    name: str
-    description: str
-    when_to_use: str | None = None
-    allowed_tools: list[str] | None = None
-    user_invocable: bool = True
-    context: str = "inline"  # "inline" or "fork"
-    prompt_template: str = ""
-    source: str = "project"  # "project" or "user"
-    skill_dir: str = ""
+    """技能的元数据定义，包含名称、描述、模板等信息。"""
+    name: str                                          # 技能唯一名称
+    description: str                                   # 一句话描述
+    when_to_use: str | None = None                     # 模型判断何时调用此技能的指引
+    allowed_tools: list[str] | None = None             # 技能可使用的工具白名单
+    user_invocable: bool = True                        # 是否允许用户通过 /name 手动调用
+    context: str = "inline"                            # 执行模式："inline" 或 "fork"
+    prompt_template: str = ""                          # Prompt 模板正文
+    source: str = "project"                            # 来源："project"（项目级）或 "user"（用户级）
+    skill_dir: str = ""                                # 技能目录的绝对路径
 
 
+# 模块级缓存，避免重复扫描文件系统
 _cached_skills: list[SkillDefinition] | None = None
 
 
 def discover_skills() -> list[SkillDefinition]:
+    """发现并返回所有已注册的技能，带缓存机制。
+
+    优先级规则：项目本地技能 > 用户全局技能（同名时覆盖）。
+    """
     global _cached_skills
     if _cached_skills is not None:
         return _cached_skills
 
+    # 使用字典以技能名为 key，确保同名技能自动覆盖实现优先级
     skills: dict[str, SkillDefinition] = {}
 
     # 1. 扫描低优先级的用户全局技能
@@ -100,6 +107,7 @@ def discover_skills() -> list[SkillDefinition]:
 
 
 def _load_skills_from_dir(directory: Path, source: str, skills: dict[str, SkillDefinition]) -> None:
+    """从指定目录扫描并加载技能定义，填充到 skills 字典中。"""
     if not directory.is_dir():
         return
     # 遍历子目录，每个子目录是一个独立技能，内含 SKILL.md 主文件
@@ -122,11 +130,14 @@ def _load_skills_from_dir(directory: Path, source: str, skills: dict[str, SkillD
             allowed_tools = None
             if "allowed-tools" in meta:
                 try:
+                    # 优先尝试 JSON 数组格式：["tool1", "tool2"]
                     import json
                     allowed_tools = json.loads(meta["allowed-tools"])
                 except Exception:
+                    # 降级为逗号分隔格式：tool1, tool2
                     allowed_tools = [t.strip() for t in meta["allowed-tools"].split(",")]
 
+            # 使用字典赋值，同名技能会自动覆盖（实现优先级机制）
             skills[name] = SkillDefinition(
                 name=name,
                 description=meta.get("description", ""),
@@ -165,15 +176,17 @@ def _load_skills_from_dir(directory: Path, source: str, skills: dict[str, SkillD
 
 
 def resolve_skill_prompt(skill: SkillDefinition, args: str) -> str:
+    """将技能模板中的占位符替换为实际参数值。"""
     prompt = skill.prompt_template
-    # 兼容 $ARGUMENTS 和 ${ARGUMENTS} 格式的替换
+    # 使用 re.sub 兼容 $ARGUMENTS 和 ${ARGUMENTS} 两种格式
     prompt = re.sub(r"\$ARGUMENTS|\$\{ARGUMENTS\}", args, prompt)
-    # 替换路径占位符
+    # 替换路径占位符，使技能可以引用目录下的其他资源文件
     prompt = prompt.replace("${CLAUDE_SKILL_DIR}", skill.skill_dir)
     return prompt
 
 
 def get_skill_by_name(name: str) -> SkillDefinition | None:
+    """根据名称查找已注册的技能，未找到返回 None。"""
     for s in discover_skills():
         if s.name == name:
             return s
@@ -183,6 +196,11 @@ def get_skill_by_name(name: str) -> SkillDefinition | None:
 def execute_skill(
     skill_name: str, args: str
 ) -> dict | None:
+    """执行技能的原子调用：查找、解析、替换三步封装。
+
+    返回包含 prompt、allowed_tools、context 的字典，
+    上层调用者无需关心底层细节，直接根据返回字典驱动执行。
+    """
     skill = get_skill_by_name(skill_name)
     if not skill:
         return None
@@ -220,6 +238,7 @@ def execute_skill(
             
         # 检测是否是斜杠技能命令
         if inp.startswith("/"):
+            # 解析 /{name} {arguments} 格式
             space_idx = inp.find(" ")
             cmd_name = inp[1:space_idx] if space_idx > 0 else inp[1:]
             cmd_args = inp[space_idx + 1:] if space_idx > 0 else ""
@@ -232,10 +251,10 @@ def execute_skill(
             if skill and skill.user_invocable:
                 resolved = resolve_skill_prompt(skill, cmd_args)
                 print(f"  [cyan]ℹ Invoking skill: {skill.name}[/cyan]")
-                # 触发 Agent 对话
+                # 将解析后的模板作为 user message 注入 Agent 对话
                 await agent.chat(resolved)
                 continue
-                
+
             # 若非技能，判定是否是系统内置 CLI 指令
             if cmd_name not in ("clear", "plan", "cost", "compact"):
                 print_error(f"Unknown skill command: /{cmd_name}")
@@ -271,6 +290,7 @@ tool_definitions: list[dict] = [
     # ... read_file / write_file 等工具保持不变
     {
         "name": "skill",
+        # 元指令工具：返回的不是数据，而是指导模型行为的 Prompt 指令
         "description": "Invoke a registered skill by name. Returns the skill's resolved prompt template to follow.",
         "input_schema": {
             "type": "object",
@@ -286,6 +306,7 @@ tool_definitions: list[dict] = [
 # ...
 
 # 2. 在 agent.py 的 _execute_tool_call 中挂载 skill 工具的分发路由
+# 必须在 agent.py 而非 tools.py 中，避免循环导入（Fork Mode 需要实例化 Agent）
 async def _execute_tool_call(self, name: str, inp: dict) -> str:
     # ... 挂载对 skill 工具的调用分发
     if name == "skill":
@@ -297,7 +318,8 @@ async def _execute_tool_call(self, name: str, inp: dict) -> str:
         if not result:
             return f"Error: Unknown skill: {skill_name}"
 
-        # 将解析后的提示词以 inline 内联文本形式传回大模型，供其在下一回合消费
+        # 内联模式：将解析后的提示词作为 tool_result 返回给模型
+        # 模型会在下一回合将其视作新的指导方针继续执行
         return f'[Skill "{skill_name}" activated. Follow these instructions:]\n\n{result["prompt"]}'
 
 
@@ -313,12 +335,14 @@ async def _execute_tool_call(self, name: str, inp: dict) -> str:
 # prompt.py 中的修改
 
 def build_skill_descriptions() -> str:
+    """构建技能描述段落，注入到 System Prompt 中供模型识别可用技能。"""
     from .skills import discover_skills
     skills = discover_skills()
     if not skills:
         return ""
 
     lines = ["# Available Skills", ""]
+    # 将技能分为两组：用户可手动调用的 vs 仅模型自动调用的
     invocable = [s for s in skills if s.user_invocable]
     auto_only = [s for s in skills if not s.user_invocable]
 

@@ -51,32 +51,34 @@ import re
 import json
 from pathlib import Path
 
-# 读工具永远不需要确认权限
+# 读工具永远不需要确认权限（低爆炸半径操作）
 READ_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
-# 写/编辑工具属于敏感操作
+# 写/编辑工具属于敏感操作（可能修改外部状态）
 EDIT_TOOLS = {"write_file", "edit_file"}
 
 # 16 个内置的危险 Shell 命令正则扫描模式（兼容 Unix & Windows）
+# 覆盖文件删除、系统操作、进程管理等高危操作
 DANGEROUS_PATTERNS = [
-    re.compile(r"\brm\s"),
-    re.compile(r"\bgit\s+(push|reset|clean|checkout\s+\.)"),
-    re.compile(r"\bsudo\b"),
-    re.compile(r"\bmkfs\b"),
-    re.compile(r"\bdd\s"),
-    re.compile(r">\s*/dev/"),
-    re.compile(r"\bkill\b"),
-    re.compile(r"\bpkill\b"),
-    re.compile(r"\breboot\b"),
-    re.compile(r"\bshutdown\b"),
-    re.compile(r"\bdel\s", re.IGNORECASE),
-    re.compile(r"\brmdir\s", re.IGNORECASE),
-    re.compile(r"\bformat\s", re.IGNORECASE),
-    re.compile(r"\btaskkill\s", re.IGNORECASE),
-    re.compile(r"\bRemove-Item\s", re.IGNORECASE),
-    re.compile(r"\bStop-Process\s", re.IGNORECASE),
+    re.compile(r"\brm\s"),  # Unix 删除文件
+    re.compile(r"\bgit\s+(push|reset|clean|checkout\s+\.)"),  # git 危险操作
+    re.compile(r"\bsudo\b"),  # 提权操作
+    re.compile(r"\bmkfs\b"),  # 格式化文件系统
+    re.compile(r"\bdd\s"),  # 磁盘复制（可覆写整个磁盘）
+    re.compile(r">\s*/dev/"),  # 向设备文件写入
+    re.compile(r"\bkill\b"),  # 终止进程
+    re.compile(r"\bpkill\b"),  # 按名称终止进程
+    re.compile(r"\breboot\b"),  # 重启系统
+    re.compile(r"\bshutdown\b"),  # 关机
+    re.compile(r"\bdel\s", re.IGNORECASE),  # Windows 删除文件
+    re.compile(r"\brmdir\s", re.IGNORECASE),  # Windows 删除目录
+    re.compile(r"\bformat\s", re.IGNORECASE),  # Windows 格式化磁盘
+    re.compile(r"\btaskkill\s", re.IGNORECASE),  # Windows 终止进程
+    re.compile(r"\bRemove-Item\s", re.IGNORECASE),  # PowerShell 删除
+    re.compile(r"\bStop-Process\s", re.IGNORECASE),  # PowerShell 终止进程
 ]
 
 
+# 静态扫描命令是否匹配危险模式（作为第一层防护）
 def is_dangerous(command: str) -> bool:
     # 只要命中任意正则，即标记为危险
     return any(p.search(command) for p in DANGEROUS_PATTERNS)
@@ -105,26 +107,31 @@ def is_dangerous(command: str) -> bool:
 # tools.py（续）
 
 
+# 加载 JSON 配置文件，文件不存在或解析失败时返回 None
 def _load_settings(path: Path) -> dict | None:
     if not path.exists():
         return None
     try:
+        # 指定 UTF-8 编码避免非 ASCII 路径/内容的乱码问题
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
 
 
+# 解析权限规则字符串，格式如 "run_shell(git status)" 或 "read_file"
 def _parse_rule(rule: str) -> dict:
     # 匹配类似于 run_shell(git status) 的格式
     m = re.match(r"^([a-z_]+)\((.+)\)$", rule)
     if m:
         return {"tool": m.group(1), "pattern": m.group(2)}
+    # 没有括号的规则只匹配工具名，不限制参数
     return {"tool": rule, "pattern": None}
 
 
-_cached_rules: dict | None = None
+_cached_rules: dict | None = None  # 缓存已加载的规则，避免重复读取文件
 
 
+# 加载并合并全局与项目级权限规则
 def load_permission_rules() -> dict:
     global _cached_rules
     if _cached_rules is not None:
@@ -133,10 +140,10 @@ def load_permission_rules() -> dict:
     allow = []
     deny = []
     
-    # 依次读取全局配置与当前目录项目级配置
+    # 按优先级顺序：全局配置先读，项目级配置后读（项目级覆盖全局）
     paths = [
-        Path.home() / ".claude" / "settings.json",
-        Path.cwd() / ".claude" / "settings.json",
+        Path.home() / ".claude" / "settings.json",  # 全局配置
+        Path.cwd() / ".claude" / "settings.json",   # 项目级配置
     ]
     for p in paths:
         settings = _load_settings(p)
@@ -152,12 +159,14 @@ def load_permission_rules() -> dict:
     return _cached_rules
 
 
+# 检查单条规则是否匹配当前工具调用（支持通配符和精确匹配）
 def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
     if rule["tool"] != tool_name:
         return False
     if rule["pattern"] is None:
-        return True
+        return True  # 无参数限制，工具名匹配即生效
 
+    # 根据工具类型提取用于匹配的值
     value = ""
     if tool_name == "run_shell":
         value = inp.get("command", "")
@@ -168,8 +177,10 @@ def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
         return True
 
     pattern = rule["pattern"]
+    # 支持 * 通配符前缀匹配（如 "npm test*" 匹配 "npm test --coverage"）
     if pattern.endswith("*"):
         return value.startswith(pattern[:-1])
+    # 精确匹配
     return value == pattern
 
 
@@ -199,42 +210,47 @@ def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
 # tools.py（续）
 
 
+# 评估配置文件中的 allow/deny 规则，返回 "deny"/"allow"/None
 def _check_permission_rules(tool_name: str, inp: dict) -> str | None:
     rules = load_permission_rules()
+    # deny 规则优先级更高，先遍历
     for rule in rules["deny"]:
         if _matches_rule(rule, tool_name, inp):
             return "deny"
+    # 再检查 allow 规则
     for rule in rules["allow"]:
         if _matches_rule(rule, tool_name, inp):
             return "allow"
-    return None
+    return None  # 无匹配规则，交给后续逻辑判断
 
 
+# 统一权限评判引擎：根据安全模式和规则库返回 allow/deny/confirm 三态决策
 def check_permission(
     tool_name: str,
     inp: dict,
     mode: str = "default",
     plan_file_path: str | None = None,
 ) -> dict:
-    # 0. 如果是 --yolo (bypassPermissions) 模式，无条件全部直接放行
+    # 0. bypassPermissions (--yolo) 模式：无条件直接放行，必须在最顶层
     if mode == "bypassPermissions":
         return {"action": "allow"}
 
-    # 1. 拦截配置文件中的规则（通过分层函数调用）
+    # 1. 检查配置文件中的 allow/deny 规则（deny 优先级更高）
     rule_result = _check_permission_rules(tool_name, inp)
     if rule_result == "deny":
         return {"action": "deny", "message": f"Denied by permission rule for {tool_name}"}
     if rule_result == "allow":
         return {"action": "allow"}
 
-    # 2. 只读工具永远安全
+    # 2. 只读工具永远安全（低爆炸半径操作）
     if tool_name in READ_TOOLS:
         return {"action": "allow"}
 
-    # 3. plan 模式下，禁止除写入 plan 文件外的任何编辑/执行操作
+    # 3. plan 模式：禁止除写入 plan 文件外的任何编辑/执行操作
     if mode == "plan":
         if tool_name in EDIT_TOOLS:
             file_path = inp.get("file_path") or inp.get("path")
+            # 仅允许写入计划文件本身
             if plan_file_path and file_path == plan_file_path:
                 return {"action": "allow"}
             return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
@@ -249,7 +265,7 @@ def check_permission(
     if mode == "acceptEdits" and tool_name in EDIT_TOOLS:
         return {"action": "allow"}
 
-    # 6. 内置危险检测（针对 run_shell 或是编辑/修改不存在的文件）
+    # 6. 内置危险检测（针对危险 shell 命令或写入/编辑不存在的文件）
     needs_confirm = False
     confirm_message = ""
 
@@ -257,19 +273,22 @@ def check_permission(
         needs_confirm = True
         confirm_message = inp.get("command", "")
     elif tool_name == "write_file" and not Path(inp.get("file_path", "")).exists():
+        # 新建文件需要确认（可能是误操作）
         needs_confirm = True
         confirm_message = f"write new file: {inp.get('file_path', '')}"
     elif tool_name == "edit_file" and not Path(inp.get("file_path", "")).exists():
+        # 编辑不存在的文件需要确认
         needs_confirm = True
         confirm_message = f"edit non-existent file: {inp.get('file_path', '')}"
 
     if needs_confirm:
-        # dontAsk (CI 环境) 模式下，需要确认的操作直接无情拒绝
+        # dontAsk (CI 环境) 模式下，需要确认的操作直接拒绝（无法交互）
         if mode == "dontAsk":
             return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {confirm_message}"}
+        # 默认行为：挂起并弹窗询问用户
         return {"action": "confirm", "message": confirm_message}
 
-    # 7. 默认默认全部放行
+    # 7. 未命中任何规则，默认放行
     return {"action": "allow"}
 
 
@@ -302,13 +321,16 @@ class Agent:
     # ... 已经在 AgentConfig 中增加了 permission_mode
     # ... 已经在 AgentState 中增加了 confirmed_paths: set[str] = field(default_factory=set)
 
+    # 弹窗询问用户是否允许危险操作，返回 True/False
     async def _confirm_dangerous(self, message: str) -> bool:
-        # 打印醒目的黄字警告
+        # 打印醒目的黄字警告，让用户明确感知风险
         print(f"\n  [yellow]⚠ Dangerous action request: {message}[/yellow]")
         try:
             answer = input("  Allow? (y/n): ")
+            # 用户输入以 y/Y 开头视为同意
             return answer.strip().lower().startswith("y")
         except EOFError:
+            # 非交互环境（如管道输入）默认拒绝
             return False
 
     # ... 在 _chat_anthropic 的工具执行循环中修改为：
@@ -321,10 +343,10 @@ class Agent:
                     tu.name, inp, self.config.permission_mode, self.state.plan_file_path
                 )
 
-                # 命中 Deny 拦截
+                # 命中 Deny 拦截：返回错误消息给模型，让其自适应调整策略
                 if perm["action"] == "deny":
                     print(f"  [red]✗ Action Denied: {perm.get('message')}[/red]")
-                    # 关键设计：将拒绝消息作为结果返回给模型，让模型自适应调整策略
+                    # 关键设计：将拒绝消息作为 tool_result 返回，而非抛异常终止会话
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tu.id,
@@ -332,21 +354,21 @@ class Agent:
                     })
                     continue
 
-                # 命中 Confirm，需弹窗二次确认
+                # 命中 Confirm：需弹窗二次确认
                 if perm["action"] == "confirm":
                     confirm_key = perm["message"]
-                    # 检查是否已包含在会话白名单中，防重复弹窗打扰
+                    # 检查会话级白名单，避免重复弹窗打扰用户
                     if confirm_key not in self.state.confirmed_paths:
                         confirmed = await self._confirm_dangerous(confirm_key)
                         if not confirmed:
-                            # 用户拒绝了确认
+                            # 用户拒绝：返回拒绝消息，让模型尝试其他方案
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": tu.id,
                                 "content": "User denied this action.",
                             })
                             continue
-                        # 用户授权成功，追加进当前会话的路径白名单中
+                        # 用户授权成功，加入会话白名单避免后续重复确认
                         self.state.confirmed_paths.add(confirm_key)
 
                 # 【2. 常规工具执行】

@@ -49,8 +49,10 @@
 # agent.py 中的修改
 
 
+# 判断模型是否支持 Extended Thinking（思考链）功能
 def _model_supports_thinking(model: str) -> bool:
     m = model.lower()
+    # Claude 3 系列不支持 thinking，只有更新的 4 系列才支持
     if "claude-3-" in m or "3-5-" in m or "3-7-" in m:
         return False
     if "claude" in m and any(x in m for x in ("opus", "sonnet", "haiku")):
@@ -58,20 +60,23 @@ def _model_supports_thinking(model: str) -> bool:
     return False
 
 
+# 判断模型是否支持自适应思考模式（可动态调整思考深度）
 def _model_supports_adaptive_thinking(model: str) -> bool:
     m = model.lower()
+    # 仅 opus-4-6 和 sonnet-4-6 支持自适应思考
     return "opus-4-6" in m or "sonnet-4-6" in m
 
 
+# 根据模型版本返回最大输出 Token 数，避免超出上下文窗口限制
 def _get_max_output_tokens(model: str) -> int:
     m = model.lower()
     if "opus-4-6" in m:
-        return 64000
+        return 64000  # 最新旗舰模型有更大输出空间
     if "sonnet-4-6" in m:
         return 32000
     if any(x in m for x in ("opus-4", "sonnet-4", "haiku-4")):
         return 32000
-    return 16384
+    return 16384  # 默认回退值
 
 
 #### 注意什么
@@ -103,11 +108,13 @@ from .ui import print_assistant_text, stop_spinner  # UI 库封装了 sys.stdout
 class Agent:
     # ... 在 __init__ 中定义 self._output_buffer: list[str] | None = None
 
+    # 流式文本输出：区分主代理直接打印 vs 子代理缓冲收集
     def _emit_text(self, text: str) -> None:
-        # 如果是子代理，只记录在缓冲区中，不打印至控制台
+        # 子代理运行时缓冲输出，避免干扰主终端显示
         if self._output_buffer is not None:
             self._output_buffer.append(text)
         else:
+            # 主代理直接调用 UI 层进行格式化输出
             print_assistant_text(text)
 
 
@@ -134,11 +141,13 @@ Anthropic API 的流式响应会混杂输出 `text` 块和 `thinking` 块。
 ```python
 # agent.py（续）
 
+    # Anthropic 后端流式调用：处理 SSE 事件流，实时渲染文本并过滤思考链
     async def _call_anthropic_stream(self, on_tool_block_complete=None) -> Any:
         async def _do():
             max_output = _get_max_output_tokens(self.config.model)
             create_params: dict[str, Any] = {
                 "model": self.config.model,
+                # thinking 模式下需要更大输出空间，禁用时回退到默认值
                 "max_tokens": max_output if self.state.thinking_mode != "disabled" else 16384,
                 "system": self._system_prompt,
                 "tools": get_active_tool_definitions(self.tools),
@@ -147,10 +156,11 @@ Anthropic API 的流式响应会混杂输出 `text` 块和 `thinking` 块。
 
             # 根据 thinking_mode 决定是否启用 Extended Thinking
             if self.state.thinking_mode in ("adaptive", "enabled"):
+                # 预留一个 token 差值给思考块，避免超出限制
                 create_params["thinking"] = {"type": "enabled", "budget_tokens": max_output - 1}
 
-            tool_blocks_by_index: dict[int, dict] = {}
-            first_text = True
+            tool_blocks_by_index: dict[int, dict] = {}  # 按索引跟踪工具块的累积状态
+            first_text = True  # 标记是否为首个有效文本，用于控制 spinner 停止时机
 
             # 启动 API 监听流
             async with self._anthropic_client.messages.stream(**create_params) as stream:
@@ -158,42 +168,46 @@ Anthropic API 的流式响应会混杂输出 `text` 块和 `thinking` 块。
                     if not hasattr(event, 'type'):
                         continue
 
+                    # 工具调用块开始：初始化该工具的参数累积器
                     if event.type == "content_block_start":
                         cb = getattr(event, 'content_block', None)
                         if cb and getattr(cb, 'type', None) == "tool_use":
                             tool_blocks_by_index[event.index] = {
                                 "id": cb.id,
                                 "name": cb.name,
-                                "input_json": "",
+                                "input_json": "",  # 逐步累积 JSON 参数片段
                             }
                     elif event.type == "content_block_delta":
                         delta = event.delta
                         # 捕获并清洗思考链（thinking）以及普通文本并实时流式渲染
                         if hasattr(delta, 'text'):
+                            # 首个文本到达时停止 spinner，切换到打字机模式
                             if first_text:
                                 stop_spinner()
                                 self._emit_text("\n")  # 首字输出前先换行
                                 first_text = False
                             self._emit_text(delta.text)
                         elif hasattr(delta, 'thinking'):
+                            # 思考链也实时显示，但标记为 [thinking]
                             if first_text:
                                 stop_spinner()
                                 self._emit_text("\n  [thinking] ")
                                 first_text = False
                             self._emit_text(delta.thinking)
                         elif hasattr(delta, 'partial_json'):
+                            # 累积工具调用的 JSON 参数片段
                             tb = tool_blocks_by_index.get(event.index)
                             if tb:
                                 tb["input_json"] += delta.partial_json
                                 
                     elif event.type == "content_block_stop":
-                        # 当一个完整的工具块结束时，解析其 JSON 参数并回调触发流式工具抢跑
+                        # 工具块结束：解析完整 JSON 并触发回调（用于流式工具抢跑执行）
                         tb = tool_blocks_by_index.pop(event.index, None)
                         if tb and on_tool_block_complete:
                             try:
                                 parsed = json.loads(tb["input_json"] or "{}")
                             except Exception:
-                                parsed = {}
+                                parsed = {}  # JSON 解析失败时回退到空字典
                             on_tool_block_complete({
                                 "type": "tool_use", "id": tb["id"],
                                 "name": tb["name"], "input": parsed,
@@ -201,11 +215,11 @@ Anthropic API 的流式响应会混杂输出 `text` 块和 `thinking` 块。
 
                 final_message = await stream.get_final_message()
 
-            # 【核心过滤】滤除思考块（thinking），不将它们保存到对话历史消息中
+            # 【核心过滤】移除 thinking 块，防止其占用上下文窗口空间
             final_message.content = [b for b in final_message.content if b.type != "thinking"]
             return final_message
 
-        # 使用步骤 4 实现遇到的重试方法进行包裹
+        # 使用步骤 4 实现的重试方法进行包裹，处理瞬时网络故障
         return await _with_retry(_do)
 
 
@@ -233,6 +247,7 @@ OpenAI 的流式格式和 Anthropic 大相径庭：
 # agent.py（续）
 
 
+# OpenAI 后端流式调用：处理增量分片并实时渲染文本
 async def _call_openai_stream(self) -> dict:
     async def _do():
         # 启动 OpenAI 兼容端流式生成（include_usage 让最后一个 chunk 携带 token 统计）
@@ -241,12 +256,12 @@ async def _call_openai_stream(self) -> dict:
             messages=self.history.openai_messages,
             tools=_to_openai_tools(get_active_tool_definitions(self.tools)),
             stream=True,
-            stream_options={"include_usage": True},
+            stream_options={"include_usage": True},  # 要求返回 token 用量统计
         )
 
-        content = ""
-        first_text = True
-        tool_calls: dict[int, dict] = {}
+        content = ""  # 累积完整的回复文本
+        first_text = True  # 标记首个文本到达，用于控制 spinner 停止
+        tool_calls: dict[int, dict] = {}  # 按索引累积工具调用参数
         finish_reason = ""
         usage = None  # 用于记录最后一个 chunk 返回的 token 用量
 
@@ -266,21 +281,22 @@ async def _call_openai_stream(self) -> dict:
             if delta and delta.content:
                 if first_text:
                     stop_spinner()
-                    self._emit_text("\n")
+                    self._emit_text("\n")  # 首字输出前先换行
                     first_text = False
                 self._emit_text(delta.content)
-                content += delta.content
+                content += delta.content  # 累积完整文本用于历史记录
 
             # 2. 收集与累加工具调用参数分片
+            # OpenAI 的 tool_calls 被打碎成极小的 delta 片段，需要手动拼装
             if delta and delta.tool_calls:
                 for tc in delta.tool_calls:
                     existing = tool_calls.get(tc.index)
                     if existing:
-                        # 累加参数字符串
+                        # 已有该工具块，累加参数字符串片段
                         if tc.function and tc.function.arguments:
                             existing["arguments"] += tc.function.arguments
                     else:
-                        # 初始化首个参数块
+                        # 初始化首个参数块（可能是 id/name/arguments 的任一片段先到）
                         tool_calls[tc.index] = {
                             "id": tc.id or "",
                             "name": (tc.function.name if tc.function else "") or "",
@@ -290,7 +306,8 @@ async def _call_openai_stream(self) -> dict:
             if chunk.choices[0].finish_reason:
                 finish_reason = chunk.choices[0].finish_reason
 
-        # 3. 拼装成符合标准的 OpenAI 格式工具对象结构
+        # 3. 按索引排序后拼装成标准 OpenAI 格式的工具对象结构
+        # 排序确保即使流式传输乱序，最终结构也严格对应
         assembled = (
             [
                 {
@@ -353,18 +370,21 @@ import time
 from .ui import print_retry  # 导入重试渲染函数
 
 
+# 判断错误是否可重试（瞬时网络故障 vs 永久性配置错误）
 def _is_retryable(error: Exception) -> bool:
-    # 提取错误状态码
+    # 提取错误状态码（兼容不同 SDK 的属性命名）
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
+    # 429: 限流, 503: 服务不可用, 529: Anthropic 过载
     if status in (429, 503, 529):
         return True
-    # 注意：不做 .lower()，源码直接匹配大写关键字
+    # 通过错误消息匹配网络层异常（不做 .lower()，源码直接匹配大写关键字）
     msg = str(error)
     if "overloaded" in msg or "ECONNRESET" in msg or "ETIMEDOUT" in msg:
         return True
     return False
 
 
+# 带指数退避和随机抖动的重试封装，防止重试风暴
 async def _with_retry(fn, max_retries: int = 3):
     for attempt in range(max_retries + 1):
         try:
@@ -375,6 +395,7 @@ async def _with_retry(fn, max_retries: int = 3):
                 raise
             
             # 指数退避计算：min(30s, 1s * 2^attempt) + 随机抖动时间
+            # 随机抖动能防止多客户端在同一时间点重试形成"重试风暴"
             delay = min(1.0 * (2 ** attempt), 30.0) + (hash(str(time.time())) % 1000) / 1000
             
             status = getattr(error, "status_code", None) or getattr(error, "status", None)
