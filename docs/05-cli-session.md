@@ -254,7 +254,7 @@ def print_info(msg: str) -> None:
 
 #### 做什么
 
-重写 `__main__.py` 中的 `main()` 函数，接入参数解析与会话恢复流程：
+重写 `__main__.py` 中的 `parse_args()`、`main()` 等函数，接入参数解析与会话恢复流程。注意此处的参数列表比初始版本更完整——新增了 `--yolo`、`--plan`、`--accept-edits`、`--dont-ask`、`--thinking`、`--max-cost`、`--max-turns` 等权限和预算控制参数，并通过 `_resolve_permission_mode()` 将它们映射为 Agent 内部的权限模式字符串：
 
 ```python
 # __main__.py
@@ -270,56 +270,163 @@ from .ui import print_welcome, print_user_prompt, print_error, print_info
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Mini Claude Code CLI")
-    parser.add_argument("prompt", nargs="*", help="Direct prompt to run")
-    parser.add_argument("--model", "-m", default=None, help="Model name")
-    parser.add_argument("--api-base", default=None, help="API base URL")
-    parser.add_argument("--resume", action="store_true", help="Resume latest session")
+    parser = argparse.ArgumentParser(
+        prog="mini-claude",
+        description="Mini Claude Code — a minimal coding agent",
+        add_help=False,
+    )
+    parser.add_argument("prompt", nargs="*", help="One-shot prompt")
+    parser.add_argument("--yolo", "-y", action="store_true",
+                        help="Skip all confirmation prompts")
+    parser.add_argument("--plan", action="store_true",
+                        help="Plan mode: read-only")
+    parser.add_argument("--accept-edits", action="store_true",
+                        help="Auto-approve file edits")
+    parser.add_argument("--dont-ask", action="store_true",
+                        help="Auto-deny confirmations (for CI)")
+    parser.add_argument("--thinking", action="store_true",
+                        help="Enable extended thinking")
+    parser.add_argument("--model", "-m", default=None, help="Model to use")
+    parser.add_argument("--api-base", default=None,
+                        help="OpenAI-compatible API base URL")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume last session")
+    parser.add_argument("--max-cost", type=float, default=None,
+                        help="Max USD spend")
+    parser.add_argument("--max-turns", type=int, default=None,
+                        help="Max agentic turns")
+    parser.add_argument("--help", "-h", action="store_true",
+                        help="Show help")
     return parser.parse_args()
 
 
-async def main_async():
+def _resolve_permission_mode(args: argparse.Namespace) -> str:
+    """将命令行权限参数映射为 Agent 内部权限模式字符串。"""
+    if args.yolo:
+        return "bypassPermissions"
+    if args.plan:
+        return "plan"
+    if args.accept_edits:
+        return "acceptEdits"
+    if args.dont_ask:
+        return "dontAsk"
+    return "default"
+
+
+def main() -> None:
     args = parse_args()
-    
-    # 确定 API 密钥
-    api_base = args.api_base or os.environ.get("OPENAI_BASE_URL")
-    api_key = os.environ.get("OPENAI_API_KEY") if api_base else os.environ.get("ANTHROPIC_API_KEY")
-    
-    if not api_key:
-        print_error("API Key not found. Please set ANTHROPIC_API_KEY or OPENAI_API_KEY.")
+
+    if args.help:
+        print("""
+Usage: mini-claude [options] [prompt]
+
+Options:
+  --yolo, -y          Skip all confirmation prompts (bypassPermissions mode)
+  --plan              Plan mode: read-only, describe changes without executing
+  --accept-edits      Auto-approve file edits, still confirm dangerous shell
+  --dont-ask          Auto-deny anything needing confirmation (for CI)
+  --thinking          Enable extended thinking (Anthropic only)
+  --model, -m         Model to use (default: claude-opus-4-6, or MINI_CLAUDE_MODEL env)
+  --api-base URL      Use OpenAI-compatible API endpoint (key via env var)
+  --resume            Resume the last session
+  --max-cost USD      Stop when estimated cost exceeds this amount
+  --max-turns N       Stop after N agentic turns
+  --help, -h          Show this help
+
+REPL commands:
+  /clear              Clear conversation history
+  /plan               Toggle plan mode (read-only <-> normal)
+  /cost               Show token usage and cost
+  /compact            Manually compact conversation
+  /memory             List saved memories
+  /skills             List available skills
+  /<skill-name>       Invoke a skill (e.g. /commit "fix types")
+
+Examples:
+  mini-claude "fix the bug in src/app.ts"
+  mini-claude --yolo "run all tests and fix failures"
+  mini-claude --plan "how would you refactor this?"
+  mini-claude --max-cost 0.50 --max-turns 20 "implement feature X"
+  OPENAI_API_KEY=sk-xxx mini-claude --api-base https://aihubmix.com/v1 --model gpt-4o "hello"
+  mini-claude --resume
+  mini-claude  # starts interactive REPL
+""")
+        sys.exit(0)
+
+    permission_mode = _resolve_permission_mode(args)
+    model = args.model or os.environ.get("MINI_CLAUDE_MODEL", "claude-opus-4-6")
+    api_base = args.api_base
+
+    # ── API 密钥与端点解析 ────────────────────────────────────
+    # 优先级：OPENAI_API_KEY+OPENAI_BASE_URL > ANTHROPIC_API_KEY > OPENAI_API_KEY
+    resolved_api_base = api_base
+    resolved_api_key: str | None = None
+    resolved_use_openai = bool(api_base)
+
+    if os.environ.get("OPENAI_API_KEY") and os.environ.get("OPENAI_BASE_URL"):
+        resolved_api_key = os.environ["OPENAI_API_KEY"]
+        resolved_api_base = resolved_api_base or os.environ.get("OPENAI_BASE_URL")
+        resolved_use_openai = True
+    elif os.environ.get("ANTHROPIC_API_KEY"):
+        resolved_api_key = os.environ["ANTHROPIC_API_KEY"]
+        resolved_api_base = resolved_api_base or os.environ.get("ANTHROPIC_BASE_URL")
+        resolved_use_openai = False
+    elif os.environ.get("OPENAI_API_KEY"):
+        resolved_api_key = os.environ["OPENAI_API_KEY"]
+        resolved_api_base = resolved_api_base or os.environ.get("OPENAI_BASE_URL")
+        resolved_use_openai = True
+
+    if not resolved_api_key and api_base:
+        resolved_api_key = (os.environ.get("OPENAI_API_KEY")
+                            or os.environ.get("ANTHROPIC_API_KEY"))
+        resolved_use_openai = True
+
+    if not resolved_api_key:
+        print_error(
+            "API key is required.\n"
+            "  Set ANTHROPIC_API_KEY (+ optional ANTHROPIC_BASE_URL) for Anthropic format,\n"
+            "  or OPENAI_API_KEY + OPENAI_BASE_URL for OpenAI-compatible format."
+        )
         sys.exit(1)
-        
-    model = args.model or os.environ.get("MODEL") or ("gpt-4o" if api_base else "claude-sonnet-4-6")
-    
-    agent = Agent(model=model, api_base=api_base, api_key=api_key)
-    
+
+    agent = Agent(
+        permission_mode=permission_mode,
+        model=model,
+        thinking=args.thinking,
+        max_cost_usd=args.max_cost,
+        max_turns=args.max_turns,
+        api_base=resolved_api_base if resolved_use_openai else None,
+        anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
+        api_key=resolved_api_key,
+    )
+
     # 恢复最新会话
     if args.resume:
-        latest_id = get_latest_session_id()
-        if latest_id:
-            session_data = load_session(latest_id)
-            if session_data:
-                # 只提取消息数据传给 restore_session，过滤掉 metadata 等无关字段
+        session_id = get_latest_session_id()
+        if session_id:
+            session = load_session(session_id)
+            if session:
                 agent.restore_session({
-                    "anthropicMessages": session_data.get("anthropicMessages"),
-                    "openaiMessages": session_data.get("openaiMessages"),
+                    "anthropicMessages": session.get("anthropicMessages"),
+                    "openaiMessages": session.get("openaiMessages"),
                 })
-                
+            else:
+                print_info("No session found to resume.")
+        else:
+            print_info("No previous sessions found.")
+
     prompt = " ".join(args.prompt) if args.prompt else None
+
     if prompt:
         # 单次执行模式
-        await agent.chat(prompt)
+        try:
+            asyncio.run(agent.chat(prompt))
+        except Exception as e:
+            print_error(str(e))
+            sys.exit(1)
     else:
-        # 进入交互式 REPL 模式
-        await run_repl(agent)
-
-
-def main():
-    try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        print("\nBye!")
-        sys.exit(0)
+        # 交互式 REPL
+        asyncio.run(run_repl(agent))
 
 
 if __name__ == "__main__":
@@ -336,16 +443,28 @@ if __name__ == "__main__":
 
 #### 做什么
 
-在 `__main__.py` 中实现 REPL 循环函数 `run_repl`，并向 Python 系统信号器注册 `SIGINT` (Ctrl+C) 的动态分发拦截：
+在 `__main__.py` 中实现 REPL 循环函数 `run_repl`。注意：`/plan` 和 `/cost` 命令直接调用 Agent 的真实方法（`toggle_plan_mode()`、`show_cost()`），而非打印占位符信息：
 
 ```python
 # __main__.py（续）
 
 
-async def run_repl(agent: Agent):
+async def run_repl(agent: Agent) -> None:
+    """Interactive REPL loop."""
+
+    # ── 确认回调：供 Agent 在需要用户授权时调用 ──
+    async def confirm_fn(message: str) -> bool:
+        try:
+            answer = input("  Allow? (y/n): ")
+            return answer.lower().startswith("y")
+        except EOFError:
+            return False
+
+    agent.set_confirm_fn(confirm_fn)
+
+    # ── SIGINT 信号处理器：区分"中断任务"与"退出程序" ──
     sigint_count = 0
 
-    # 信号处理器
     def handle_sigint(sig, frame):
         nonlocal sigint_count
         # 若 Agent 正在运行且未被标记中断，则终止运行并返回提示符
@@ -358,7 +477,7 @@ async def run_repl(agent: Agent):
             # 空闲时连续按下两次 Ctrl+C 则安全退出
             sigint_count += 1
             if sigint_count >= 2:
-                print("\nBye!")
+                print("\nBye!\n")
                 sys.exit(0)
             print("\n  Press Ctrl+C again to exit.")
             print_user_prompt()
@@ -373,34 +492,84 @@ async def run_repl(agent: Agent):
             line = input()
         except (EOFError, KeyboardInterrupt):
             # 捕获 EOF (Ctrl+D) 或输入时的 Ctrl+C 退出
-            print("\nBye!")
+            print("\nBye!\n")
             break
 
         inp = line.strip()
         sigint_count = 0  # 重置中断计数
-        
+
         if not inp:
             continue
         if inp in ("exit", "quit"):
-            print("Bye!")
+            print("\nBye!\n")
             break
 
-        # 处理 REPL 命令
+        # ── REPL 内置命令 ──
         if inp == "/clear":
             agent.clear_history()
             continue
         if inp == "/plan":
-            print("  [cyan]ℹ Plan mode toggled (Not fully implemented yet).[/cyan]")
+            agent.toggle_plan_mode()
             continue
         if inp == "/cost":
-            print("  [cyan]ℹ Cost tracking: $0.00 (Mocked for now).[/cyan]")
+            agent.show_cost()
+            continue
+        if inp == "/compact":
+            try:
+                await agent.compact()
+            except Exception as e:
+                print_error(str(e))
+            continue
+        if inp == "/memory":
+            from .memory import list_memories
+            memories = list_memories()
+            if not memories:
+                print_info("No memories saved yet.")
+            else:
+                print_info(f"{len(memories)} memories:")
+                for m in memories:
+                    print(f"    [{m.type}] {m.name} — {m.description}")
+            continue
+        if inp == "/skills":
+            from .skills import discover_skills
+            skills = discover_skills()
+            if not skills:
+                print_info("No skills found. Add skills to .claude/skills/<name>/SKILL.md")
+            else:
+                print_info(f"{len(skills)} skills:")
+                for s in skills:
+                    tag = f"/{s.name}" if s.user_invocable else s.name
+                    print(f"    {tag} ({s.source}) — {s.description}")
             continue
 
+        # ── Skill 调用：/<skill-name> [args] ──
+        if inp.startswith("/"):
+            from .skills import get_skill_by_name, resolve_skill_prompt, execute_skill
+            space_idx = inp.find(" ")
+            cmd_name = inp[1:space_idx] if space_idx > 0 else inp[1:]
+            cmd_args = inp[space_idx + 1:] if space_idx > 0 else ""
+            skill = get_skill_by_name(cmd_name)
+            if skill and skill.user_invocable:
+                print_info(f"Invoking skill: {skill.name}")
+                try:
+                    if skill.context == "fork":
+                        result = execute_skill(skill.name, cmd_args)
+                        if result:
+                            await agent.chat(
+                                f'Use the skill tool to invoke "{skill.name}" '
+                                f'with args: {cmd_args or "(none)"}'
+                            )
+                    else:
+                        resolved = resolve_skill_prompt(skill, cmd_args)
+                        await agent.chat(resolved)
+                except Exception as e:
+                    if "abort" not in str(e).lower():
+                        print_error(str(e))
+                continue
+
+        # ── 普通对话 ──
         try:
             await agent.chat(inp)
-        except asyncio.CancelledError:
-            # 捕获取消异常，防输出红字报错
-            pass
         except Exception as e:
             if "abort" not in str(e).lower():
                 print_error(str(e))
@@ -408,6 +577,8 @@ async def run_repl(agent: Agent):
 
 #### 注意什么
 
+- `/plan` 命令直接调用 `agent.toggle_plan_mode()`，这会在 Agent 内部切换权限模式并更新系统提示词。第一次调用进入 plan mode，第二次调用恢复正常模式。`/cost` 命令调用 `agent.show_cost()`，它会计算并打印当前会话的 token 用量和预估费用。
+- `confirm_fn` 回调在 REPL 启动时注入给 Agent，使得 Agent 在需要用户确认（如执行危险 shell 命令）时，能暂停执行并等待用户在终端中输入 `y/n`。
 - `signal.signal` 只在主线程有效。因为 `input()` 是阻塞性 IO，而在 Windows 和 Unix 下 Python 对 `input()` 中断的处理稍有不同，通过捕获 `KeyboardInterrupt` 异常和信号拦截双重机制可以保证在任意系统下都能优雅退回命令行提示符。
 
 ---

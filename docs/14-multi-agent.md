@@ -133,8 +133,41 @@ def get_sub_agent_config(agent_type: str) -> dict:
         return {"system_prompt": GENERAL_PROMPT, "tools": [t for t in tool_definitions if t["name"] != "agent"]}
 ```
 
+接下来，编写辅助函数用于生成可用代理类型的描述，并注入 System Prompt：
+
+```python
+# subagent.py
+
+def get_available_agent_types() -> list[dict[str, str]]:
+    """返回所有可用代理类型（内置 + 自定义）的名称与描述。"""
+    types = [
+        {"name": "explore", "description": "Fast, read-only codebase search and exploration"},
+        {"name": "plan", "description": "Read-only analysis with structured implementation plans"},
+        {"name": "general", "description": "Full tools for independent tasks"},
+    ]
+    for name, defn in _discover_custom_agents().items():
+        types.append({"name": name, "description": defn["description"]})
+    return types
+
+
+def build_agent_descriptions() -> str:
+    """将自定义代理类型描述注入 System Prompt（仅当存在自定义代理时）。"""
+    types = get_available_agent_types()
+    if len(types) <= 3:
+        return ""  # 仅有内置类型，已在 System Prompt 中硬编码
+
+    custom = types[3:]
+    lines = ["\n# Custom Agent Types", ""]
+    for t in custom:
+        lines.append(f"- **{t['name']}**: {t['description']}")
+    return "\n".join(lines)
+```
+
 #### 注意什么
-注意看 `GENERAL_PROMPT` 的工具分配：我们通过 `t["name"] != "agent"` 过滤掉了子代理创建自身的工具，这样能有效防止子代理无限制递归创建孙代理，从而避免 Token 的指数级消耗灾难。
+
+- **`get_available_agent_types` 的作用**：它将内置的三种代理类型与通过 `_discover_custom_agents()` 扫描到的用户自定义代理合并为统一列表，供外部查询。这使得 `agent` 工具的描述中可以动态展示当前可用的代理类型。
+- **`build_agent_descriptions` 的条件注入**：仅当存在自定义代理时才返回描述文本，避免在只有内置代理的情况下向 System Prompt 注入冗余信息。
+- **防止递归创建**：注意看 `GENERAL_PROMPT` 的工具分配：我们通过 `t["name"] != "agent"` 过滤掉了子代理创建自身的工具，这样能有效防止子代理无限制递归创建孙代理，从而避免 Token 的指数级消耗灾难。
 
 ---
 

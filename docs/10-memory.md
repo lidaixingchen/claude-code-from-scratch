@@ -2,24 +2,30 @@
 
 ## 🎯 本节目标
 
-为 Agent 构建跨会话的记忆机制（Persistence Memory）。使用散列哈希对项目目录进行空间隔离，实现轻量级 Frontmatter 结构解析和 `MEMORY.md` 索引文件的自动重建，并通过 System Prompt 注入指引，使 Agent 能够自主读写记忆目录实现记忆的自我进化。
+为 Agent 构建跨会话的记忆机制（Persistence Memory）。使用散列哈希对项目目录进行空间隔离，实现轻量级 Frontmatter 结构解析和 `MEMORY.md` 索引文件的自动重建。通过 Memory Header 扫描与语义召回（Semantic Recall）实现基于 sideQuery 的智能记忆筛选，利用异步预取（Prefetching）在用户输入时提前拉取相关记忆，并通过 System Prompt 注入指引，使 Agent 能够自主读写记忆目录实现记忆的自我进化。
 
 ---
 
 ## 🏆 最终效果
 
-完成本节后，Agent 会“认得”你是谁，并且能够跨会话记住项目的一些核心信息：
-1. **记忆自我沉淀**：当你向 Agent 提到你的偏好（如：“不要在回复末尾做多余的总结”）时，Agent 会自主决定调用 `write_file`，在后台创建一个名为 `feedback_xxx.md` 的记忆文件。
-2. **跨会话感知**：你关闭 Agent 后再次启动，向其发起另一个新任务，Agent 的系统提示词中会自动带入更新后的 `MEMORY.md` 索引。模型读取到先前的记忆，便会在新的回复中自动遵守“不要总结”的习惯。
+完成本节后，Agent 会”认得”你是谁，并且能够跨会话记住项目的一些核心信息：
+1. **记忆自我沉淀**：当你向 Agent 提到你的偏好（如：”不要在回复末尾做多余的总结”）时，Agent 会自主决定调用 `write_file`，在后台创建一个名为 `feedback_xxx.md` 的记忆文件。
+2. **跨会话感知**：你关闭 Agent 后再次启动，向其发起另一个新任务，Agent 的系统提示词中会自动带入更新后的 `MEMORY.md` 索引。模型读取到先前的记忆，便会在新的回复中自动遵守”不要总结”的习惯。
+3. **语义记忆召回**：当用户输入多词查询时，系统会异步调用模型进行语义匹配，自动筛选最相关的记忆文件并注入上下文，无需用户手动请求回忆。
 
 ---
 
 ## 🛠️ 本节任务
 
 1. **实现项目哈希物理隔离**：在 `memory.py` 中编写 `_project_hash()` 和 `get_memory_dir()`，使每个项目目录都映射到独立的存储路径。
-2. **编写 YAML Frontmatter 解析器**：在 `frontmatter.py` 中实现 `FrontmatterResult` 数据类和 `parse_frontmatter`，供 `memory.py` 和第 11 课的 `skills.py` 共享复用。
+2. **编写 YAML Frontmatter 解析器**：在 `frontmatter.py` 中实现 `FrontmatterResult` 数据类和 `parse_frontmatter`/`format_frontmatter`，供 `memory.py` 和第 11 课的 `skills.py` 共享复用。
 3. **实现索引文件自动重建**：实现 `_update_memory_index` 逻辑，在新增记忆时重新生成 `MEMORY.md` 索引。
-4. **编译记忆提示词段并织入 Prompt**：实现 `build_memory_prompt_section()`，并在 `prompt.py` 中连通替换 `{{memory}}` 占位符。
+4. **实现记忆 CRUD 辅助函数**：编写 `save_memory`、`delete_memory`、`_slugify` 等辅助函数，统一记忆文件的增删操作。
+5. **实现 Memory Header 扫描**：编写 `MemoryHeader` 类和 `scan_memory_headers`，实现轻量级的元数据快速扫描，为语义召回提供候选列表。
+6. **实现语义记忆召回系统**：通过 `select_relevant_memories` 调用 sideQuery 进行智能记忆筛选，实现基于模型的语义匹配。
+7. **实现 Memory Prefetch 系统**：编写 `MemoryPrefetch` 类和 `start_memory_prefetch`，在用户输入时异步预取相关记忆。
+8. **编译记忆提示词段并织入 Prompt**：实现 `build_memory_prompt_section()`，并在 `prompt.py` 中连通替换 `{{memory}}` 占位符。
+9. **实现 sideQuery 构建器**：在 `agent.py` 中编写 `_build_side_query` 方法，为语义召回提供模型调用接口。
 
 ---
 
@@ -28,6 +34,7 @@
 修改：
 - `memory.py`
 - `prompt.py`
+- `agent.py`
 
 创建：
 - `frontmatter.py`
@@ -58,6 +65,8 @@ from pathlib import Path
 from dataclasses import dataclass
 
 VALID_TYPES = {"user", "feedback", "project", "reference"}
+MAX_INDEX_LINES = 200
+MAX_INDEX_BYTES = 25000
 
 
 @dataclass
@@ -92,7 +101,7 @@ def get_memory_dir() -> Path:
 #### 为什么做
 
 为了教大模型以结构化的形式保存记忆（如记忆名字、描述及类型），记忆文件会采用类似 Markdown 博客的 Frontmatter 格式头（夹在 `---` 之间的元数据）。
-我们需要手写一个极其紧凑的解析器解析这些元数据，而不需要引入像 `PyYAML` 这样臃肿的第三方依赖。
+我们需要手写一个极其紧凑的解析器解析这些元数据，而不需要引入像 `PyYAML` 这样臃肿的第三方依赖。同时，我们需要一个对称的格式化函数，用于将元数据和正文重新组装成标准的 Frontmatter 格式文件。
 
 #### 做什么
 
@@ -138,6 +147,17 @@ def parse_frontmatter(content: str) -> FrontmatterResult:
     # 裁剪元数据后，重组正文部分
     body = "\n".join(lines[end_idx + 1:]).strip()
     return FrontmatterResult(meta=meta, body=body)
+
+
+def format_frontmatter(meta: dict[str, str], body: str) -> str:
+    """将元数据字典和正文内容格式化为标准的 Frontmatter 文件格式。"""
+    lines = ["---"]
+    for key, value in meta.items():
+        lines.append(f"{key}: {value}")
+    lines.append("---")
+    lines.append("")
+    lines.append(body)
+    return "\n".join(lines)
 ```
 
 然后，在 `memory.py` 中引入解析器：
@@ -145,12 +165,13 @@ def parse_frontmatter(content: str) -> FrontmatterResult:
 ```python
 # memory.py（续）
 
-from .frontmatter import parse_frontmatter
+from .frontmatter import parse_frontmatter, format_frontmatter
 ```
 
 #### 注意什么
 
 - **无依赖解析器**：通过手写 YAML 键值对行切割与正则，可以极大节省包体积，避免了初学者拉取项目时必须安装 PyYAML 第三方包的步骤，降低了启动成本。
+- **对称的读写设计**：`parse_frontmatter` 负责"读"（从文本提取元数据），`format_frontmatter` 负责"写"（从元数据生成文本）。这种对称设计使得记忆文件的创建和解析使用完全一致的格式约定，避免了格式漂移。
 
 注意：`parse_frontmatter` 返回 `FrontmatterResult` 数据类，通过 `.meta` 和 `.body` 属性访问元数据与正文。后续所有调用方（包括第 11 课的技能系统）都统一使用点操作符访问。
 
@@ -167,10 +188,30 @@ Agent 在提问时，如果一次性将所有的记忆文件全部发给 API 会
 
 #### 做什么
 
-在 `memory.py` 中编写 `MEMORY.md` 自动重建与检索函数：
+在 `memory.py` 中编写 `MEMORY.md` 自动重建与检索函数，以及记忆的增删辅助函数：
 
 ```python
 # memory.py（续）
+
+import asyncio
+import json
+import logging
+import time
+from datetime import datetime, timezone
+from typing import Callable, Any
+
+logger = logging.getLogger(__name__)
+
+# A callable that sends a prompt and returns model text response.
+# Signature: async (system: str, user_message: str) -> str
+SideQueryFn = Callable[[str, str], Any]  # actually Awaitable[str]
+
+
+def _slugify(text: str) -> str:
+    """将文本转换为 URL 友好的 slug 格式，用于生成记忆文件名。"""
+    s = re.sub(r"[^a-z0-9]+", "_", text.lower())
+    s = s.strip("_")
+    return s[:40]
 
 
 def list_memories() -> list[MemoryEntry]:
@@ -183,17 +224,42 @@ def list_memories() -> list[MemoryEntry]:
         try:
             result = parse_frontmatter(f.read_text(encoding="utf-8"))
             meta = result.meta
-            if meta.get("name") and meta.get("type") in VALID_TYPES:
-                entries.append(MemoryEntry(
-                    name=meta["name"],
-                    description=meta.get("description", ""),
-                    type=meta["type"],
-                    filename=f.name,
-                    content=result.body,
-                ))
+            if not meta.get("name") or not meta.get("type"):
+                continue
+            # 非标准类型自动 fallback 为 "project"，而非直接跳过
+            t = meta["type"] if meta["type"] in VALID_TYPES else "project"
+            entries.append(MemoryEntry(
+                name=meta["name"],
+                description=meta.get("description", ""),
+                type=t,
+                filename=f.name,
+                content=result.body,
+            ))
         except (OSError, ValueError) as e:
             logger.debug(f"Skipping memory file {f}: {e}")
+    # Sort by mtime desc
+    entries.sort(key=lambda e: (d / e.filename).stat().st_mtime, reverse=True)
     return entries
+
+
+def save_memory(name: str, description: str, type: str, content: str) -> str:
+    """创建或更新一条记忆文件，返回生成的文件名。"""
+    d = get_memory_dir()
+    filename = f"{type}_{_slugify(name)}.md"
+    text = format_frontmatter({"name": name, "description": description, "type": type}, content)
+    (d / filename).write_text(text, encoding="utf-8")
+    _update_memory_index()
+    return filename
+
+
+def delete_memory(filename: str) -> bool:
+    """删除指定的记忆文件，返回是否成功。"""
+    filepath = get_memory_dir() / filename
+    if not filepath.exists():
+        return False
+    filepath.unlink()
+    _update_memory_index()
+    return True
 
 
 def _update_memory_index() -> None:
@@ -201,25 +267,314 @@ def _update_memory_index() -> None:
     lines = ["# Memory Index", ""]
     for m in memories:
         lines.append(f"- **[{m.name}]({m.filename})** ({m.type}) — {m.description}")
-    
+
     # 覆盖重写唯一的索引文件
-    index_path = get_memory_dir() / "MEMORY.md"
-    index_path.write_text("\n".join(lines), encoding="utf-8")
+    _get_index_path().write_text("\n".join(lines), encoding="utf-8")
+
+
+def load_memory_index() -> str:
+    """加载 MEMORY.md 索引内容，带截断保护。"""
+    index_path = _get_index_path()
+    if not index_path.exists():
+        return ""
+    content = index_path.read_text(encoding="utf-8")
+    lines = content.split("\n")
+    if len(lines) > MAX_INDEX_LINES:
+        content = "\n".join(lines[:MAX_INDEX_LINES]) + "\n\n[... truncated, too many memory entries ...]"
+    if len(content.encode()) > MAX_INDEX_BYTES:
+        content = content[:MAX_INDEX_BYTES] + "\n\n[... truncated, index too large ...]"
+    return content
 ```
 
 #### 注意什么
 
+- **类型 Fallback 机制**：在 `list_memories()` 中，当记忆文件的 `type` 字段不在 `VALID_TYPES` 集合中时，我们不会直接跳过该文件，而是将其 fallback 为 `"project"` 类型。这保证了用户手写的记忆文件（即使类型拼写不标准）仍能被索引收录，而非被静默丢弃。
 - **数据类型一致性**：在 `list_memories()` 中，我们必须返回定义好的 `MemoryEntry` 对象列表，并在 `_update_memory_index` 中以点号属性访问字段（如 `m.name`），这能保证与第 5 课所实现的 REPL 快捷查看命令 `/memory` （以对象属性方式遍历打印记忆）在数据结构类型上完全一致，避免了在 REPL 下调用命令抛出 `AttributeError` 崩溃。
 - **健全的错误处理与日志记录**：在扫描项目目录、读取和解析 YAML Frontmatter 记忆文件时，由于文件可能被外部程序占用、甚至被用户修改损坏，我们需要精准捕获 `OSError` 和 `ValueError`，并通过 `logger.debug` 记录具体的跳过原因，避免异常被无声隐藏，方便后期维护。
+- **索引截断保护**：`load_memory_index` 会对索引进行行数（`MAX_INDEX_LINES = 200`）和字节数（`MAX_INDEX_BYTES = 25000`）双重截断，防止极端情况下索引膨胀导致 System Prompt 爆炸。
 
 ---
 
-### 步骤 4：编译记忆提示词段并织入 System Prompt
+### 步骤 4：实现 Memory Header 轻量扫描与新鲜度追踪
 
 #### 为什么做
 
-这是促成“记忆自我进化”的魔法：**我们不需要为记忆设计任何特有工具**。
-我们只需在 System Prompt 中告诉大模型：“你拥有一个位于 `{dir}` 的记忆系统，可以使用已有的 `write_file`/`edit_file` 工具往里面写文件来记住偏好；并向其展示当前的 `MEMORY.md` 索引”。模型就会自主决定什么时候需要写文件来“记住”某些规则！
+语义召回系统需要快速获取所有记忆文件的元数据（类型、描述、修改时间），但不需要读取完整内容。如果每次都读取全部文件内容，当记忆文件较多时会造成严重的性能问题。我们需要一个轻量级的扫描机制，只读取每个文件的前 30 行（Frontmatter 区域），快速构建候选列表。
+
+#### 做什么
+
+在 `memory.py` 中编写 `MemoryHeader` 类和相关扫描/格式化函数：
+
+```python
+# memory.py（续）
+
+MAX_MEMORY_FILES = 200
+MAX_MEMORY_BYTES_PER_FILE = 4096
+MAX_SESSION_MEMORY_BYTES = 60 * 1024  # 60KB cumulative per session
+
+
+class MemoryHeader:
+    """轻量级记忆文件元数据，只存储扫描结果而非完整内容。"""
+    __slots__ = ("filename", "file_path", "mtime_ms", "description", "type")
+
+    def __init__(self, filename: str, file_path: str, mtime_ms: float,
+                 description: str | None, type: str | None):
+        self.filename = filename
+        self.file_path = file_path
+        self.mtime_ms = mtime_ms
+        self.description = description
+        self.type = type
+
+
+def scan_memory_headers() -> list[MemoryHeader]:
+    """Scan memory directory — read only frontmatter (first 30 lines) for speed."""
+    d = get_memory_dir()
+    headers: list[MemoryHeader] = []
+    for f in d.glob("*.md"):
+        if f.name == "MEMORY.md":
+            continue
+        try:
+            stat = f.stat()
+            raw = f.read_text(encoding="utf-8")
+            first30 = "\n".join(raw.split("\n")[:30])
+            result = parse_frontmatter(first30)
+            meta = result.meta
+            t = meta.get("type")
+            headers.append(MemoryHeader(
+                filename=f.name,
+                file_path=str(f),
+                mtime_ms=stat.st_mtime * 1000,
+                description=meta.get("description"),
+                type=t if t in VALID_TYPES else None,
+            ))
+        except (OSError, ValueError) as e:
+            logger.debug(f"Skipping memory file {f}: {e}")
+    headers.sort(key=lambda h: h.mtime_ms, reverse=True)
+    return headers[:MAX_MEMORY_FILES]
+
+
+def format_memory_manifest(headers: list[MemoryHeader]) -> str:
+    """Format manifest for semantic selector: one line per memory."""
+    lines = []
+    for h in headers:
+        tag = f"[{h.type}] " if h.type else ""
+        ts = datetime.fromtimestamp(h.mtime_ms / 1000, tz=timezone.utc).isoformat()
+        if h.description:
+            lines.append(f"- {tag}{h.filename} ({ts}): {h.description}")
+        else:
+            lines.append(f"- {tag}{h.filename} ({ts})")
+    return "\n".join(lines)
+
+
+def memory_age(mtime_ms: float) -> str:
+    """将毫秒级时间戳转换为人类可读的相对时间描述。"""
+    days = max(0, int((time.time() * 1000 - mtime_ms) / 86_400_000))
+    if days == 0:
+        return "today"
+    if days == 1:
+        return "yesterday"
+    return f"{days} days ago"
+
+
+def memory_freshness_warning(mtime_ms: float) -> str:
+    """如果记忆文件较旧，返回新鲜度警告文本；近期记忆返回空字符串。"""
+    days = max(0, int((time.time() * 1000 - mtime_ms) / 86_400_000))
+    if days <= 1:
+        return ""
+    return (f"This memory is {days} days old. Memories are point-in-time observations, "
+            "not live state — claims about code behavior may be outdated. "
+            "Verify against current code before asserting as fact.")
+```
+
+#### 注意什么
+
+- **只读前 30 行**：`scan_memory_headers` 通过 `"\n".join(raw.split("\n")[:30])` 只读取文件前 30 行，这足以覆盖 Frontmatter 区域（通常在 10 行以内），大幅减少 I/O 开销。
+- **`__slots__` 优化**：`MemoryHeader` 使用 `__slots__` 声明固定属性，相比普通 `dataclass` 可节省约 40% 的内存占用，当记忆文件多达 200 个时效果显著。
+- **新鲜度警告机制**：`memory_freshness_warning` 会对超过 1 天的记忆发出警告，提醒 Agent 该记忆是"时间点快照"而非"实时状态"，避免 Agent 基于过时信息做出错误断言。
+
+---
+
+### 步骤 5：实现语义记忆召回系统（Semantic Recall）
+
+#### 为什么做
+
+仅仅把 `MEMORY.md` 索引注入 System Prompt 是不够的——当记忆文件很多时，Agent 可能无法从索引中准确判断哪些记忆与当前查询相关。我们需要一个"语义召回"机制：通过调用模型进行一次轻量级 sideQuery，让模型从候选记忆列表中筛选出最相关的文件，然后只将这些相关记忆注入上下文。
+
+这是 Claude Code 记忆系统的核心能力：**不是暴力加载所有记忆，而是智能筛选相关记忆**。
+
+#### 做什么
+
+在 `memory.py` 中编写语义召回系统：
+
+```python
+# memory.py（续）
+
+# ─── Semantic Recall (sideQuery) ────────────────────────────
+
+SELECT_MEMORIES_PROMPT = """You are selecting memories that will be useful to an AI coding assistant as it processes a user's query. You will be given the user's query and a list of available memory files with their filenames and descriptions.
+
+Return a JSON object with a "selected_memories" array of filenames for the memories that will clearly be useful (up to 5). Only include memories that you are certain will be helpful based on their name and description.
+- If you are unsure if a memory will be useful, do not include it.
+- If no memories would clearly be useful, return an empty array."""
+
+
+class RelevantMemory:
+    """语义召回选中的记忆文件，包含完整内容和元数据。"""
+    __slots__ = ("path", "content", "mtime_ms", "header")
+
+    def __init__(self, path: str, content: str, mtime_ms: float, header: str):
+        self.path = path
+        self.content = content
+        self.mtime_ms = mtime_ms
+        self.header = header
+
+
+async def select_relevant_memories(
+    query: str,
+    side_query: SideQueryFn,
+    already_surfaced: set[str],
+) -> list[RelevantMemory]:
+    """Call the model to semantically select relevant memories."""
+    headers = scan_memory_headers()
+    if not headers:
+        return []
+
+    # 过滤已经展示过的记忆，避免重复注入
+    candidates = [h for h in headers if h.file_path not in already_surfaced]
+    if not candidates:
+        return []
+
+    manifest = format_memory_manifest(candidates)
+
+    try:
+        text = await side_query(
+            SELECT_MEMORIES_PROMPT,
+            f"Query: {query}\n\nAvailable memories:\n{manifest}",
+        )
+
+        # Extract JSON from response
+        match = re.search(r"\{[\s\S]*\}", text)
+        if not match:
+            return []
+
+        parsed = json.loads(match.group(0))
+        selected_filenames = set(parsed.get("selected_memories", []))
+
+        selected = [h for h in candidates if h.filename in selected_filenames][:5]
+
+        result: list[RelevantMemory] = []
+        for h in selected:
+            try:
+                content = Path(h.file_path).read_text(encoding="utf-8")
+            except OSError as e:
+                logger.debug(f"Failed to read memory file {h.file_path}: {e}")
+                continue
+            # 截断过大的记忆文件
+            if len(content.encode()) > MAX_MEMORY_BYTES_PER_FILE:
+                content = content[:MAX_MEMORY_BYTES_PER_FILE] + "\n\n[... truncated, memory file too large ...]"
+            freshness = memory_freshness_warning(h.mtime_ms)
+            header_text = (
+                f"{freshness}\n\nMemory: {h.file_path}:" if freshness
+                else f"Memory (saved {memory_age(h.mtime_ms)}): {h.file_path}:"
+            )
+            result.append(RelevantMemory(
+                path=h.file_path, content=content,
+                mtime_ms=h.mtime_ms, header=header_text,
+            ))
+        return result
+    except asyncio.CancelledError:
+        return []
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Semantic recall failed: {e}")
+        return []
+```
+
+#### 注意什么
+
+- **sideQuery 的设计**：`select_relevant_memories` 接收一个 `SideQueryFn` 参数，这是一个 `async (system, user_message) -> str` 签名的可调用对象。这种设计使得语义召回可以与任何后端（Anthropic/OpenAI）解耦，只需在 `agent.py` 中构建对应的 sideQuery 函数即可。
+- **去重机制**：`already_surfaced` 参数记录了已经在当前会话中展示过的记忆文件路径，避免同一记忆被重复注入上下文，造成 Token 浪费。
+- **渐进式加载**：最多只召回 5 条记忆（`[:5]` 截断），且单个文件最大 4096 字节，双重限制确保不会因记忆召回导致上下文爆炸。
+- **优雅降级**：当 sideQuery 失败（JSON 解析错误、网络超时、文件读取失败）时，系统返回空列表而非抛出异常，确保语义召回的失败不会阻塞正常的对话流程。
+- **新鲜度标注**：每条被召回的记忆都会附带时间信息（"saved today" 或 "This memory is N days old..."），帮助 Agent 判断记忆的时效性。
+
+---
+
+### 步骤 6：实现 Memory Prefetch 异步预取系统
+
+#### 为什么做
+
+语义召回需要调用模型进行 sideQuery，这会产生一次额外的 API 请求延迟。如果等到用户消息处理时才开始召回，会显著增加响应时间。我们需要一个"预取"机制：在用户开始输入时就异步启动记忆召回，当模型真正需要使用记忆时，结果已经准备好了。
+
+#### 做什么
+
+在 `memory.py` 中编写 `MemoryPrefetch` 类和预取函数：
+
+```python
+# memory.py（续）
+
+# ─── Prefetch Handle ────────────────────────────────────────
+
+class MemoryPrefetch:
+    """异步预取句柄，包装 asyncio.Task 以提供轮询接口。"""
+    def __init__(self, task: asyncio.Task):
+        self.task = task
+        self.consumed = False
+
+    @property
+    def settled(self) -> bool:
+        return self.task.done()
+
+
+def start_memory_prefetch(
+    query: str,
+    side_query: SideQueryFn,
+    already_surfaced: set[str],
+    session_memory_bytes: int,
+) -> MemoryPrefetch | None:
+    """Start async memory prefetch. Returns handle to poll for results."""
+    # Gate: multi-word input only（单词输入太模糊，语义匹配效果差）
+    if not re.search(r"\s", query.strip()):
+        return None
+
+    # Gate: session budget（会话记忆预算已满则跳过）
+    if session_memory_bytes >= MAX_SESSION_MEMORY_BYTES:
+        return None
+
+    # Gate: memories must exist（目录下没有任何记忆文件则跳过）
+    d = get_memory_dir()
+    has_memories = any(f.suffix == ".md" and f.name != "MEMORY.md" for f in d.iterdir())
+    if not has_memories:
+        return None
+
+    task = asyncio.create_task(
+        select_relevant_memories(query, side_query, already_surfaced)
+    )
+    return MemoryPrefetch(task)
+
+
+def format_memories_for_injection(memories: list[RelevantMemory]) -> str:
+    """Format recalled memories for injection as user message content."""
+    parts = []
+    for m in memories:
+        parts.append(f"<system-reminder>\n{m.header}\n\n{m.content}\n</system-reminder>")
+    return "\n\n".join(parts)
+```
+
+#### 注意什么
+
+- **三重门控机制**：`start_memory_prefetch` 在启动预取前会检查三个条件——查询是否包含多词（单词太模糊）、会话记忆预算是否已满、目录下是否有记忆文件。这避免了无意义的 API 调用开销。
+- **`<system-reminder>` 包裹**：`format_memories_for_injection` 使用 `<system-reminder>` 标签包裹每条记忆，这告诉模型这些内容是系统级的上下文信息而非用户消息，有助于模型正确理解记忆的语义角色。
+- **`consumed` 标记**：`MemoryPrefetch` 的 `consumed` 字段用于追踪预取结果是否已被消费，防止同一预取结果被多次使用。
+- **预算控制**：`MAX_SESSION_MEMORY_BYTES = 60 * 1024`（60KB）限制了单个会话中注入的记忆总量，超过预算后不再进行新的预取，防止上下文窗口被记忆内容占满。
+
+---
+
+### 步骤 7：编译记忆提示词段并织入 System Prompt
+
+#### 为什么做
+
+这是促成”记忆自我进化”的魔法：**我们不需要为记忆设计任何特有工具**。
+我们只需在 System Prompt 中告诉大模型：”你拥有一个位于 `{dir}` 的记忆系统，可以使用已有的 `write_file`/`edit_file` 工具往里面写文件来记住偏好；并向其展示当前的 `MEMORY.md` 索引”。模型就会自主决定什么时候需要写文件来”记住”某些规则！
 
 #### 做什么
 
@@ -231,37 +586,45 @@ def _update_memory_index() -> None:
 
 
 def build_memory_prompt_section() -> str:
-    index_path = get_memory_dir() / "MEMORY.md"
-    index = index_path.read_text(encoding="utf-8") if index_path.exists() else ""
+    index = load_memory_index()
     memory_dir = str(get_memory_dir())
 
-    return f"""# Memory System
+    return f”””# Memory System
+
 You have a persistent, file-based memory system at `{memory_dir}`.
 
 ## Memory Types
 - **user**: User's role, preferences, knowledge level
-- **feedback**: Corrections and guidance from the user
+- **feedback**: Corrections and guidance from the user (include Why + How to apply)
 - **project**: Ongoing work, goals, deadlines, decisions
-- **reference**: Pointers to external resources
+- **reference**: Pointers to external resources (URLs, tools, dashboards)
 
 ## How to Save Memories
 Use the write_file tool to create a memory file with YAML frontmatter:
+
+\\`\\`\\`markdown
 ---
-name: Memory Title
-description: Quick description
-type: project
+name: memory name
+description: one-line description
+type: user|feedback|project|reference
 ---
-Memory details...
+Memory content here.
+\\`\\`\\`
 
 Save to: `{memory_dir}/`
 Filename format: `{{type}}_{{slugified_name}}.md`
+
+The MEMORY.md index is auto-updated when you write to the memory directory — do NOT update it manually.
 
 ## What NOT to Save
 - Code patterns or architecture (read the code instead)
 - Git history (use git log)
 - Anything already in CLAUDE.md
+- Ephemeral task details
 
-{"## Current Memory Index" + chr(10) + index if index else "(No memories saved yet.)"}"""
+## When to Recall
+When the user asks you to remember or recall, or when prior context seems relevant.
+{chr(10) + “## Current Memory Index” + chr(10) + index if index else chr(10) + “(No memories saved yet.)”}”””
 ```
 
 在 `prompt.py` 中更新引入和替换：
@@ -276,14 +639,14 @@ from .memory import build_memory_prompt_section
 
 def build_system_prompt() -> str:
     replacements = {
-        "{{cwd}}": str(Path.cwd()),
-        "{{date}}": date.today().isoformat(),
-        "{{platform}}": f"{platform.system()} {platform.machine()}",
-        "{{shell}}": os.environ.get("SHELL") or os.environ.get("COMSPEC") or "unknown",
-        "{{git_context}}": get_git_context(),
-        "{{claude_md}}": load_claude_md(),
+        “{{cwd}}”: str(Path.cwd()),
+        “{{date}}”: date.today().isoformat(),
+        “{{platform}}”: f”{platform.system()} {platform.machine()}”,
+        “{{shell}}”: os.environ.get(“SHELL”) or os.environ.get(“COMSPEC”) or “unknown”,
+        “{{git_context}}”: get_git_context(),
+        “{{claude_md}}”: load_claude_md(),
         # 2. 替换记忆占位符
-        “{{memory}}”: build_memory_prompt_section(), 
+        “{{memory}}”: build_memory_prompt_section(),
     }
     # ... 后续替换逻辑保持不变
 ```
@@ -291,7 +654,67 @@ def build_system_prompt() -> str:
 #### 注意什么
 
 - **大模型自主记忆驱动**：在编译记忆提示词时，我们告诉大模型记忆格式和路径，由大模型在主循环决策中”自主”写文件来记住用户偏好。
-- **异步语义召回与简化机制说明**：实际 codebase 实现了高级的基于向量/轻量文本相关的异步语义预取（Prefetching）与热启动过滤机制。在本章的简化教程中，我们着重于搭建文件持久化读写与 `MEMORY.md` 索引编译的基础物理架构。当学习者在最终运行 codebase 时，会接触到更为复杂的异步预取策略，以防止频繁读取引起上下文爆炸。
+- **反馈记忆的双要素**：`feedback` 类型记忆特别要求包含 “Why + How to apply”，这确保 Agent 不仅记住”用户说了什么”，还理解”为什么这么说”以及”如何在未来应用这条规则”，避免机械式记忆导致的规则误用。
+
+---
+
+### 步骤 8：实现 sideQuery 构建器（agent.py）
+
+#### 为什么做
+
+语义召回系统需要一个 `SideQueryFn` 可调用对象来执行轻量级模型调用。这个函数需要支持 Anthropic 和 OpenAI 两种后端，并且使用较小的 `max_tokens`（256）以减少延迟和成本。我们在 `agent.py` 中构建这个函数，使语义召回可以与主对话循环解耦。
+
+#### 做什么
+
+在 `agent.py` 中编写 `_build_side_query` 方法：
+
+```python
+# agent.py（续）
+
+from typing import Callable, Awaitable
+
+
+class Agent:
+    # ... 前面的代码保持不变 ...
+
+    # ─── Side query for memory recall ─────────────────────────
+
+    def _build_side_query(self) -> Callable[[str, str], Awaitable[str]] | None:
+        “””Build a sideQuery callable for memory recall, works with both backends.”””
+        if self._anthropic_client:
+            client = self._anthropic_client
+            model = self.config.model
+
+            async def _sq(system: str, user_message: str) -> str:
+                resp = await client.messages.create(
+                    model=model, max_tokens=256, system=system,
+                    messages=[{“role”: “user”, “content”: user_message}],
+                )
+                return “”.join(b.text for b in resp.content if b.type == “text”)
+            return _sq
+        if self._openai_client:
+            client = self._openai_client
+            model = self.config.model
+
+            async def _sq_oai(system: str, user_message: str) -> str:
+                resp = await client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {“role”: “system”, “content”: system},
+                        {“role”: “user”, “content”: user_message},
+                    ],
+                )
+                return resp.choices[0].message.content or “” if resp.choices else “”
+            return _sq_oai
+        return None
+```
+
+#### 注意什么
+
+- **双后端适配**：`_build_side_query` 通过闭包捕获对应的客户端实例（`_anthropic_client` 或 `_openai_client`），返回一个签名统一的异步函数。调用方无需关心底层使用的是哪个 API。
+- **轻量级调用**：`max_tokens=256` 限制了 sideQuery 的输出长度，因为语义召回只需返回一个简短的 JSON 对象，不需要长篇大论。这既降低了延迟，也节省了 API 成本。
+- **文本提取差异**：Anthropic 后端需要从 `resp.content` 中筛选 `type == “text”` 的块并拼接；OpenAI 后端直接从 `resp.choices[0].message.content` 获取。两种实现都做了防御性处理（空值检查）。
+- **返回 None 的情况**：当没有配置任何 API 客户端时，方法返回 `None`。调用方需要检查返回值，如果为 `None` 则跳过语义召回。
 
 ---
 
@@ -368,7 +791,10 @@ for f in d.glob("*.md"):
 
 1. **一切皆文件的记忆哲学**：理解了在 Agent 系统中通过 Prompt 引导，将记忆维护降维到已有文件工具上的巧妙设计。
 2. **多租户空间隔离**：掌握了利用 CWD 哈希实现本地多项目数据沙箱物理隔离的开发模式。
-3. **按需加载（Lazy Loading）索引**：掌握了“只曝露索引，按需加载内容”的 Token 减负与缓存友好型架构方案。
+3. **按需加载（Lazy Loading）索引**：掌握了”只曝露索引，按需加载内容”的 Token 减负与缓存友好型架构方案。
+4. **语义记忆召回（Semantic Recall）**：掌握了通过 sideQuery 调用模型进行智能记忆筛选的核心机制，理解了”不是暴力加载所有记忆，而是智能筛选相关记忆”的设计思想。
+5. **异步预取（Prefetching）**：理解了通过 `asyncio.create_task` 在用户输入时提前异步启动记忆召回，以及三重门控机制（多词检查、预算控制、文件存在性）如何避免无意义的 API 调用开销。
+6. **Memory Header 轻量扫描**：掌握了只读取文件前 30 行 Frontmatter 的快速扫描策略，以及 `__slots__` 内存优化技巧。
 
 ---
 

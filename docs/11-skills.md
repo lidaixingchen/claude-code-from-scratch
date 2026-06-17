@@ -71,13 +71,13 @@ from .frontmatter import parse_frontmatter
 class SkillDefinition:
     name: str
     description: str
-    when_to_use: str
-    prompt_template: str
-    user_invocable: bool = True
-    skill_dir: str = ""
-    source: str = ""
-    context: str = "inline"
+    when_to_use: str | None = None
     allowed_tools: list[str] | None = None
+    user_invocable: bool = True
+    context: str = "inline"  # "inline" or "fork"
+    prompt_template: str = ""
+    source: str = "project"  # "project" or "user"
+    skill_dir: str = ""
 
 
 _cached_skills: list[SkillDefinition] | None = None
@@ -173,9 +173,30 @@ def resolve_skill_prompt(skill: SkillDefinition, args: str) -> str:
     return prompt
 
 
+def get_skill_by_name(name: str) -> SkillDefinition | None:
+    for s in discover_skills():
+        if s.name == name:
+            return s
+    return None
+
+
+def execute_skill(
+    skill_name: str, args: str
+) -> dict | None:
+    skill = get_skill_by_name(skill_name)
+    if not skill:
+        return None
+    return {
+        "prompt": resolve_skill_prompt(skill, args),
+        "allowed_tools": skill.allowed_tools,
+        "context": skill.context,
+    }
+
+
 #### 注意什么
 
 - **正则替换的兼容**：替换 `$ARGUMENTS` 时，使用 `re.sub` 兼容大括号形式的 `${ARGUMENTS}` 可以提升模板编写的容错度。
+- **`execute_skill` 的封装意义**：`execute_skill` 将查找（`get_skill_by_name`）、解析、替换三个步骤封装为一个原子调用，返回的字典包含解析后的 Prompt、可选的工具限制（`allowed_tools`）以及执行模式（`context`）。这让上层调用者（如 `_execute_tool_call`）无需关心底层细节，直接根据返回的字典驱动执行。
 ```
 
 ---
@@ -268,18 +289,16 @@ tool_definitions: list[dict] = [
 async def _execute_tool_call(self, name: str, inp: dict) -> str:
     # ... 挂载对 skill 工具的调用分发
     if name == "skill":
-        from .skills import discover_skills, resolve_skill_prompt
+        from .skills import execute_skill
         skill_name = inp.get("skill_name", "")
         args = inp.get("args", "")
-        
-        skills = discover_skills()
-        skill = next((s for s in skills if s.name == skill_name), None)
-        if not skill:
+
+        result = execute_skill(skill_name, args)
+        if not result:
             return f"Error: Unknown skill: {skill_name}"
-            
-        resolved_prompt = resolve_skill_prompt(skill, args)
+
         # 将解析后的提示词以 inline 内联文本形式传回大模型，供其在下一回合消费
-        return f'[Skill "{skill_name}" activated. Follow these instructions:]\n\n{resolved_prompt}'
+        return f'[Skill "{skill_name}" activated. Follow these instructions:]\n\n{result["prompt"]}'
 
 
 #### 注意什么
@@ -298,16 +317,36 @@ def build_skill_descriptions() -> str:
     skills = discover_skills()
     if not skills:
         return ""
+
     lines = ["# Available Skills", ""]
-    for s in skills:
-        prefix = "/" if s.user_invocable else ""
-        lines.append(f"- **{prefix}{s.name}**: {s.description}")
-        if s.when_to_use:
-            lines.append(f"  When to use: {s.when_to_use}")
+    invocable = [s for s in skills if s.user_invocable]
+    auto_only = [s for s in skills if not s.user_invocable]
+
+    if invocable:
+        lines.append("User-invocable skills (user types /<name> to invoke):")
+        for s in invocable:
+            lines.append(f"- **/{s.name}**: {s.description}")
+            if s.when_to_use:
+                lines.append(f"  When to use: {s.when_to_use}")
+        lines.append("")
+
+    if auto_only:
+        lines.append("Auto-invocable skills (use the skill tool when appropriate):")
+        for s in auto_only:
+            lines.append(f"- **{s.name}**: {s.description}")
+            if s.when_to_use:
+                lines.append(f"  When to use: {s.when_to_use}")
+        lines.append("")
+
+    lines.append("To invoke a skill programmatically, use the `skill` tool with the skill name and optional arguments.")
     return "\n".join(lines)
 ```
 
 并确保该函数返回值在 `build_system_prompt()` 中替换了 `{{skills}}` 占位符。
+
+#### 注意什么
+
+- **用户可调用 vs 仅自动调用**：`build_skill_descriptions` 将技能分为两组呈现给大模型——`invocable`（用户可通过 `/name` 手动调用）和 `auto_only`（仅由模型在需要时通过 `skill` 工具自主调用）。这种区分让模型在 System Prompt 中就能清晰辨别哪些技能可以被用户直接触发、哪些只能由它自己主动发起。
 
 ---
 

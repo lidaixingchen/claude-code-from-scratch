@@ -33,6 +33,55 @@
 
 ## 🚀 开始实现
 
+### 步骤 0：实现 thinking 模式检测与输出 Token 限制
+
+#### 为什么做
+
+在实现流式输出之前，我们需要先确定两个关键的辅助函数：
+1. **thinking 模式检测**：判断当前模型是否支持 Extended Thinking（思考链）功能，以及是否支持自适应思考模式。这决定了我们在调用 API 时是否启用 thinking 参数。
+2. **输出 Token 限制**：根据不同的模型版本，设置合理的最大输出 Token 数，避免超出模型的上下文窗口限制。
+
+#### 做什么
+
+在 `agent.py` 中实现模型能力检测函数和 Token 限制函数：
+
+```python
+# agent.py 中的修改
+
+
+def _model_supports_thinking(model: str) -> bool:
+    m = model.lower()
+    if "claude-3-" in m or "3-5-" in m or "3-7-" in m:
+        return False
+    if "claude" in m and any(x in m for x in ("opus", "sonnet", "haiku")):
+        return True
+    return False
+
+
+def _model_supports_adaptive_thinking(model: str) -> bool:
+    m = model.lower()
+    return "opus-4-6" in m or "sonnet-4-6" in m
+
+
+def _get_max_output_tokens(model: str) -> int:
+    m = model.lower()
+    if "opus-4-6" in m:
+        return 64000
+    if "sonnet-4-6" in m:
+        return 32000
+    if any(x in m for x in ("opus-4", "sonnet-4", "haiku-4")):
+        return 32000
+    return 16384
+
+
+#### 注意什么
+
+- **模型版本识别**：`_model_supports_thinking` 函数通过字符串匹配来识别模型版本。Claude 3 系列（如 claude-3-opus、claude-3.5-sonnet）不支持 thinking，而更新的版本（如 claude-4-opus、claude-4-sonnet）则支持。
+- **自适应思考**：只有最新的 opus-4-6 和 sonnet-4-6 版本支持自适应思考模式，这种模式可以动态调整思考深度。
+- **Token 限制策略**：不同模型的上下文窗口大小不同，因此需要根据模型版本设置合理的输出 Token 上限，避免请求失败。
+
+---
+
 ### 步骤 1：实现流式字符渲染接口
 
 #### 为什么做
@@ -216,6 +265,7 @@ async def _call_openai_stream(self) -> dict:
             # 1. 处理正文输出文本，并进行流式刷新
             if delta and delta.content:
                 if first_text:
+                    stop_spinner()
                     self._emit_text("\n")
                     first_text = False
                 self._emit_text(delta.content)

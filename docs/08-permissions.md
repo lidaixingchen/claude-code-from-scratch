@@ -199,6 +199,17 @@ def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
 # tools.py（续）
 
 
+def _check_permission_rules(tool_name: str, inp: dict) -> str | None:
+    rules = load_permission_rules()
+    for rule in rules["deny"]:
+        if _matches_rule(rule, tool_name, inp):
+            return "deny"
+    for rule in rules["allow"]:
+        if _matches_rule(rule, tool_name, inp):
+            return "allow"
+    return None
+
+
 def check_permission(
     tool_name: str,
     inp: dict,
@@ -209,58 +220,54 @@ def check_permission(
     if mode == "bypassPermissions":
         return {"action": "allow"}
 
-    # 1. 拦截配置文件中的 deny 规则（优先级最高）
-    rules = load_permission_rules()
-    for rule in rules["deny"]:
-        if _matches_rule(rule, tool_name, inp):
-            return {"action": "deny", "message": f"Denied by rule: {rule['tool']}({rule['pattern']})"}
+    # 1. 拦截配置文件中的规则（通过分层函数调用）
+    rule_result = _check_permission_rules(tool_name, inp)
+    if rule_result == "deny":
+        return {"action": "deny", "message": f"Denied by permission rule for {tool_name}"}
+    if rule_result == "allow":
+        return {"action": "allow"}
 
-    # 2. 匹配配置文件中的 allow 规则
-    for rule in rules["allow"]:
-        if _matches_rule(rule, tool_name, inp):
-            return {"action": "allow"}
-
-    # 3. 只读工具永远安全
+    # 2. 只读工具永远安全
     if tool_name in READ_TOOLS:
         return {"action": "allow"}
 
-    # 4. plan 模式下，禁止除写入 plan 文件外的任何编辑/执行操作
+    # 3. plan 模式下，禁止除写入 plan 文件外的任何编辑/执行操作
     if mode == "plan":
         if tool_name in EDIT_TOOLS:
-            file_path = inp.get("file_path", "")
+            file_path = inp.get("file_path") or inp.get("path")
             if plan_file_path and file_path == plan_file_path:
                 return {"action": "allow"}
             return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
         if tool_name == "run_shell":
             return {"action": "deny", "message": "Shell commands blocked in plan mode"}
 
-    # 5. 豁免模式切换工具——否则用户将无法进入或退出规划模式
+    # 4. 豁免模式切换工具——否则用户将无法进入或退出规划模式
     if tool_name in ("enter_plan_mode", "exit_plan_mode"):
         return {"action": "allow"}
 
-    # 6. acceptEdits 模式下，编辑文件直接放行
+    # 5. acceptEdits 模式下，编辑文件直接放行
     if mode == "acceptEdits" and tool_name in EDIT_TOOLS:
         return {"action": "allow"}
 
     # 6. 内置危险检测（针对 run_shell 或是编辑/修改不存在的文件）
     needs_confirm = False
-    confirm_msg = ""
+    confirm_message = ""
 
     if tool_name == "run_shell" and is_dangerous(inp.get("command", "")):
         needs_confirm = True
-        confirm_msg = inp.get("command", "")
-    elif tool_name in EDIT_TOOLS:
-        file_path = inp.get("file_path", "")
-        # 编辑不存在的文件需要确认，防止模型盲目乱建文件
-        if file_path and not Path(file_path).exists():
-            needs_confirm = True
-            confirm_msg = f"Create new file: {file_path}"
+        confirm_message = inp.get("command", "")
+    elif tool_name == "write_file" and not Path(inp.get("file_path", "")).exists():
+        needs_confirm = True
+        confirm_message = f"write new file: {inp.get('file_path', '')}"
+    elif tool_name == "edit_file" and not Path(inp.get("file_path", "")).exists():
+        needs_confirm = True
+        confirm_message = f"edit non-existent file: {inp.get('file_path', '')}"
 
     if needs_confirm:
         # dontAsk (CI 环境) 模式下，需要确认的操作直接无情拒绝
         if mode == "dontAsk":
-            return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {confirm_msg}"}
-        return {"action": "confirm", "message": confirm_msg}
+            return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {confirm_message}"}
+        return {"action": "confirm", "message": confirm_message}
 
     # 7. 默认默认全部放行
     return {"action": "allow"}
@@ -321,7 +328,7 @@ class Agent:
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tu.id,
-                        "content": f"Error: Action denied: {perm.get('message')}",
+                        "content": f"Action denied: {perm.get('message')}",
                     })
                     continue
 
@@ -336,7 +343,7 @@ class Agent:
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": tu.id,
-                                "content": "Error: User denied this action.",
+                                "content": "User denied this action.",
                             })
                             continue
                         # 用户授权成功，追加进当前会话的路径白名单中
@@ -358,8 +365,8 @@ class Agent:
 ### 拦截报错作为异常终止 vs 拦截报错作为 Tool Result 返回给模型
 
 - **方案 A**：**作为 Tool Result 返回给模型**（我们所用）
-  - 拦截后，不掐断会话。构造一个假的工具运行结果，告诉大模型该项动作已被系统拦截（例如返回 `Error: Action denied: ...`）。
-  - **优点**：Agent 仍然能够正常运转，并且可以通过大模型极强的语义理解力“自我纠正”——例如被拦截了危险的 `rm -rf`，大模型会道歉并改用安全的 `run_shell("git clean")`，不需要人类二次干预。
+  - 拦截后，不掐断会话。构造一个假的工具运行结果，告诉大模型该项动作已被系统拦截（例如返回 `Action denied: ...`）。
+  - **优点**：Agent 仍然能够正常运转，并且可以通过大模型极强的语义理解力”自我纠正”——例如被拦截了危险的 `rm -rf`，大模型会道歉并改用安全的 `run_shell(“git clean”)`，不需要人类二次干预。
   - **缺点**：如果大模型很倔强，可能会反复尝试被拒绝的操作（后续可以通过引入总步数限制来防爆）。
 - **方案 B**：**直接抛出 Exception 终止会话**
   - 一旦触发 deny 或用户输入 `n`，抛出运行时异常直接令程序退出。
@@ -412,7 +419,7 @@ if perm["action"] == "deny":
    python -m mini_claude "将代码强推上库"
    ```
 3. 验证安全模式拦截：
-   - 观察终端是否出现 `✗ Action Denied: Denied by rule: run_shell(git push*)` 的拦截字样，且没有发生程序报错退出。
+   - 观察终端是否出现 `✗ Action Denied: Denied by permission rule for run_shell` 的拦截字样，且没有发生程序报错退出。
 
 *测试完成后，请记得删除 `.claude/settings.json` 以免干扰后边开发。*
 

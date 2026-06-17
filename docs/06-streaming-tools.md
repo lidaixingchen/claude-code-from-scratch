@@ -18,8 +18,9 @@
 
 1. **确定并发安全工具集**：明确哪些工具（如只读文件操作）可以安全地异步并行执行。
 2. **实现流式 API 监听与回调**：实现 `_call_anthropic_stream`，在流式生成期间解析 `tool_use` 并在块结束时触发 `_on_tool_block_complete`。
-3. **构建后台抢跑任务注册表**：在 `_chat_anthropic` 核心循环中引入 `early_executions` 字典，启动后台异步任务。
-4. **重构工具处理循环接收结果**：在获取回复后，对已抢跑的工具任务直接进行 `await`，未抢跑的工具则走常规同步调用。
+3. **实现大结果持久化**：添加 `_persist_large_result` 方法，当工具返回超过 30KB 的结果时自动保存到磁盘并只保留预览摘要。
+4. **构建后台抢跑任务注册表**：在 `_chat_anthropic` 核心循环中引入 `early_executions` 字典，启动后台异步任务。
+5. **重构工具处理循环接收结果**：在获取回复后，对已抢跑的工具任务直接进行 `await`，未抢跑的工具则走常规同步调用。
 
 ---
 
@@ -76,29 +77,38 @@ from .tools import (
 
 #### 做什么
 
-在 `agent.py` 中编写 `_call_anthropic_stream` 方法：
+在 `agent.py` 中编写 `_call_anthropic_stream` 方法。注意 `max_tokens` 并非硬编码的 4096，而是通过 `_get_max_output_tokens()` 根据模型动态计算；工具列表使用 `get_active_tool_definitions(self.tools)` 而非无参的 `get_tool_definitions()`，后者会过滤掉尚未激活的延迟工具（deferred tools）：
 
 ```python
 # agent.py（续）
 
     async def _call_anthropic_stream(self, on_tool_block_complete=None) -> Any:
+        max_output = _get_max_output_tokens(self.config.model)
         create_params = {
             "model": self.config.model,
-            "max_tokens": 4096,
+            "max_tokens": max_output if self.state.thinking_mode != "disabled" else 16384,
             "system": self._system_prompt,
-            "tools": get_tool_definitions(),
+            "tools": get_active_tool_definitions(self.tools),
             "messages": self.history.anthropic_messages,
         }
+
+        if self.state.thinking_mode in ("adaptive", "enabled"):
+            create_params["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": max_output - 1,
+            }
 
         tool_blocks_by_index = {}
 
         # 开启流式 API 监听
         async with self._anthropic_client.messages.stream(**create_params) as stream:
             async for event in stream:
+                if not hasattr(event, 'type'):
+                    continue
                 # 1. 监测到工具块开始
                 if event.type == "content_block_start":
-                    cb = event.content_block
-                    if cb.type == "tool_use":
+                    cb = getattr(event, 'content_block', None)
+                    if cb and getattr(cb, 'type', None) == "tool_use":
                         tool_blocks_by_index[event.index] = {
                             "id": cb.id,
                             "name": cb.name,
@@ -107,7 +117,7 @@ from .tools import (
                 # 2. 收集参数的 JSON 增量片段
                 elif event.type == "content_block_delta":
                     delta = event.delta
-                    if delta.type == "input_json_delta":
+                    if hasattr(delta, 'partial_json'):
                         tb = tool_blocks_by_index.get(event.index)
                         if tb:
                             tb["input_json"] += delta.partial_json
@@ -115,12 +125,11 @@ from .tools import (
                 elif event.type == "content_block_stop":
                     tb = tool_blocks_by_index.pop(event.index, None)
                     if tb and on_tool_block_complete:
-                        import json
                         try:
                             parsed = json.loads(tb["input_json"] or "{}")
                         except Exception:
                             parsed = {}
-                        
+
                         # 执行回调，暴露已生成的完整工具调用信息
                         on_tool_block_complete({
                             "type": "tool_use",
@@ -133,9 +142,73 @@ from .tools import (
         return final_message
 ```
 
+#### `_get_max_output_tokens` — 动态输出上限
+
+此函数根据模型名称返回对应的最大输出 token 数，而非使用固定的 4096。不同模型的输出能力差异很大，opus-4-6 可达 64000，而较小的模型则为 16384：
+
+```python
+# agent.py 顶部的辅助函数
+
+def _get_max_output_tokens(model: str) -> int:
+    m = model.lower()
+    if "opus-4-6" in m:
+        return 64000
+    if "sonnet-4-6" in m:
+        return 32000
+    if any(x in m for x in ("opus-4", "sonnet-4", "haiku-4")):
+        return 32000
+    return 16384
+```
+
 ---
 
-### 步骤 3：构建后台抢跑任务注册表 `early_executions`
+### 步骤 3（插曲）：大结果持久化 `_persist_large_result`
+
+#### 为什么做
+
+当 Agent 执行工具（如 `run_shell` 运行了一条产生大量输出的命令，或 `read_file` 读取了一个巨大的文件），返回的结果可能高达几十甚至上百 KB。如果将这些原始文本直接塞入 API 请求的消息历史，会迅速撑爆上下文窗口，触发昂贵的压缩甚至导致请求失败。我们需要一个"溢出阀"：当结果超过阈值时，将完整内容保存到磁盘，只在消息历史中保留一个预览摘要。
+
+#### 做什么
+
+在 `agent.py` 的 `Agent` 类中添加 `_persist_large_result` 方法：
+
+```python
+# agent.py — 大结果持久化
+
+LARGE_RESULT_THRESHOLD = 30 * 1024      # 30 KB
+LARGE_RESULT_PREVIEW_LINES = 200
+
+
+    def _persist_large_result(self, tool_name: str, result: str) -> str:
+        if len(result.encode()) <= LARGE_RESULT_THRESHOLD:
+            return result
+        d = Path.home() / ".mini-claude" / "tool-results"
+        d.mkdir(parents=True, exist_ok=True)
+        filename = f"{int(time.time() * 1000)}-{tool_name}.txt"
+        filepath = d / filename
+        filepath.write_text(result, encoding="utf-8")
+
+        lines = result.split("\n")
+        preview = "\n".join(lines[:LARGE_RESULT_PREVIEW_LINES])
+        size_kb = len(result.encode()) / 1024
+
+        return (
+            f"[Result too large ({size_kb:.1f} KB, {len(lines)} lines). "
+            f"Full output saved to {filepath}. "
+            f"You can use read_file to see the full result.]\n\n"
+            f"Preview (first {LARGE_RESULT_PREVIEW_LINES} lines):\n{preview}"
+        )
+```
+
+#### 注意什么
+
+- 阈值以**字节数**（`len(result.encode())`）而非字符数衡量，因为中文字符占 3 字节，确保对多语言内容一视同仁。
+- 持久化目录 `~/.mini-claude/tool-results` 会在首次调用时自动创建，文件名包含毫秒时间戳和工具名，便于事后追溯。
+- 返回给 Agent 的预览摘要仍然包含足够信息让模型理解输出内容，同时大幅降低了 token 消耗。
+
+---
+
+### 步骤 4：构建后台抢跑任务注册表 `early_executions`
 
 #### 为什么做
 
@@ -182,7 +255,7 @@ from .tools import (
 
 ---
 
-### 步骤 4：重构工具处理循环接收结果
+### 步骤 5：重构工具处理循环接收结果
 
 #### 为什么做
 
@@ -213,25 +286,27 @@ from .tools import (
                     # 此时才把工具日志渲染到 UI
                     print_tool_call(tu.name, inp)
                     # 直接等待后台已在运行（甚至可能已经运行完）的任务返回
-                    result = await early_task
-                    print_tool_result(tu.name, result)
-                    
+                    raw = await early_task
+                    res = self._persist_large_result(tu.name, raw)
+                    print_tool_result(tu.name, res)
+
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tu.id,
-                        "content": result,
+                        "content": res,
                     })
                     continue
 
-                # 2. 未能抢跑的非安全工具（如 write_file/run_shell），走常规常规同步处理
+                # 2. 未能抢跑的非安全工具（如 write_file/run_shell），走常规同步处理
                 print_tool_call(tu.name, inp)
-                result = await self._execute_tool_call(tu.name, inp)
-                print_tool_result(tu.name, result)
-                
+                raw = await self._execute_tool_call(tu.name, inp)
+                res = self._persist_large_result(tu.name, raw)
+                print_tool_result(tu.name, res)
+
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tu.id,
-                    "content": result,
+                    "content": res,
                 })
 
             self.history.append_tool_results(tool_results)

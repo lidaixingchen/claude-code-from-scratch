@@ -336,7 +336,7 @@ class McpManager:
         if not path.exists():
             return
         try:
-            raw = json.loads(path.read_text())
+            raw = json.loads(path.read_text(encoding="utf-8"))
             # 兼容 settings.json 的 mcpServers 结构和 .mcp.json 的扁平结构
             servers = raw.get("mcpServers", raw)
             for name, config in servers.items():
