@@ -31,8 +31,8 @@
 ## 📦 涉及文件
 
 修改：
-- `python/mini_claude/agent.py`
-- `python/mini_claude/__main__.py`
+- `agent.py`
+- `__main__.py`
 
 ---
 

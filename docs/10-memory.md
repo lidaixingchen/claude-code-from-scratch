@@ -26,11 +26,11 @@
 ## 📦 涉及文件
 
 修改：
-- `python/mini_claude/memory.py`
-- `python/mini_claude/prompt.py`
+- `memory.py`
+- `prompt.py`
 
 创建：
-- `python/mini_claude/frontmatter.py`
+- `frontmatter.py`
 
 ---
 

@@ -44,10 +44,10 @@ Agent 自动调用了 `list_files` 工具，拿到结果后组织语言回复你
 ## 📦 涉及文件
 
 创建：
-- `python/mini_claude/agent.py`
-- `python/mini_claude/tools.py`
-- `python/mini_claude/__main__.py`
-- `python/mini_claude/__init__.py`
+- `agent.py`
+- `tools.py`
+- `__main__.py`
+- `__init__.py`
 
 ---
 

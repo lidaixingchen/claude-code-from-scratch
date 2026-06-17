@@ -57,8 +57,8 @@ python -m mini_claude "列出当前目录下所有 .py 文件"
 ## 📦 涉及文件
 
 修改：
-- `python/mini_claude/agent.py`
-- `python/mini_claude/__main__.py`
+- `agent.py`
+- `__main__.py`
 
 ---
 

@@ -29,8 +29,8 @@
 ## 📦 涉及文件
 
 修改：
-- `python/mini_claude/prompt.py`
-- `python/mini_claude/agent.py`
+- `prompt.py`
+- `agent.py`
 
 ---
 

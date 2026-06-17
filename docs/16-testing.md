@@ -41,9 +41,9 @@ graph LR
 ## 📦 涉及文件
 
 测试与配置：
-- [test/setup.sh](file:///e:/project/claude-code-from-scratch/test/setup.sh)（环境初始化）
-- [test/cleanup.sh](file:///e:/project/claude-code-from-scratch/test/cleanup.sh)（环境清理）
-- [python/mini_claude/](file:///e:/project/claude-code-from-scratch/python/mini_claude/)（整个被测 Python 代码库）
+- [test/setup.sh]（环境初始化）
+- [test/cleanup.sh]（环境清理）
+- [python/mini_claude/]（整个被测 Python 代码库）
 
 ---
 

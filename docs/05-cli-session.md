@@ -44,12 +44,12 @@ python -m mini_claude
 ## 📦 涉及文件
 
 修改：
-- `python/mini_claude/session.py`
-- `python/mini_claude/agent.py`
-- `python/mini_claude/__main__.py`
+- `session.py`
+- `agent.py`
+- `__main__.py`
 
 创建：
-- `python/mini_claude/ui.py`
+- `ui.py`
 
 ---
 

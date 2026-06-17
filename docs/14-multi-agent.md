@@ -57,9 +57,9 @@ graph TB
 ## 📦 涉及文件
 
 修改或创建：
-- [python/mini_claude/subagent.py](file:///e:/project/claude-code-from-scratch/python/mini_claude/subagent.py)
-- [python/mini_claude/tools.py](file:///e:/project/claude-code-from-scratch/python/mini_claude/tools.py)
-- [python/mini_claude/agent.py](file:///e:/project/claude-code-from-scratch/python/mini_claude/agent.py)
+- [subagent.py](file:///e:/project/claude-code-from-scratch/subagent.py)
+- [tools.py](file:///e:/project/claude-code-from-scratch/tools.py)
+- [agent.py](file:///e:/project/claude-code-from-scratch/agent.py)
 
 ---
 
@@ -71,10 +71,10 @@ graph TB
 不同的子代理有不同的职责和安全约束。例如：`explore`（代码探索）和 `plan`（方案设计）代理绝对不允许修改任何代码文件，必须被剥夺所有的写操作权限；而 `general` 代理则可以拥有完整的写权限。此外，为了保证扩展性，我们还需要支持用户通过在 `.claude/agents/` 目录下放置 Markdown 配置文件来定义特定的自定义代理。
 
 #### 做什么
-创建或修改 `python/mini_claude/subagent.py`，实现内置 Prompt 模板定义、YAML Frontmatter 自定义代理加载逻辑，以及子代理工具集分配：
+创建或修改 `subagent.py`，实现内置 Prompt 模板定义、YAML Frontmatter 自定义代理加载逻辑，以及子代理工具集分配：
 
 ```python
-# python/mini_claude/subagent.py
+# subagent.py
 
 # 定义只读工具的白名单
 READ_ONLY_TOOLS = {"read_file", "list_files", "grep_search"}
@@ -110,7 +110,7 @@ def _discover_custom_agents() -> dict[str, dict]:
 随后，编写 `get_sub_agent_config` 函数，为不同的代理分配其对应的系统提示词和经过过滤的工具列表：
 
 ```python
-# python/mini_claude/subagent.py
+# subagent.py
 
 def get_sub_agent_config(agent_type: str) -> dict:
     """为指定类型的子代理分配 {system_prompt, tools}。"""
@@ -144,10 +144,10 @@ def get_sub_agent_config(agent_type: str) -> dict:
 我们需要让主 Agent 知道它可以调用一个名为 `agent` 的工具。当大模型面对较繁重或需要独立探索的任务时，它会输出结构化的 `agent` 工具调用入参。
 
 #### 做什么
-打开 `python/mini_claude/tools.py`。在 `DEFINED_TOOLS` 列表中注册 `agent` 工具 Schema：
+打开 `tools.py`。在 `DEFINED_TOOLS` 列表中注册 `agent` 工具 Schema：
 
 ```python
-# python/mini_claude/tools.py
+# tools.py
 
     {
         "name": "agent",
@@ -175,10 +175,10 @@ def get_sub_agent_config(agent_type: str) -> dict:
 子代理本质上就是主 `Agent` 类的一个新实例，但它使用了定制的 System Prompt 和经过裁剪的工具集。我们需要让 `Agent` 的初始化构造函数能够无缝容纳这些外部覆盖变量。
 
 #### 做什么
-打开 `python/mini_claude/agent.py`。修改 `Agent` 类的 `__init__` 函数，添加并处理子代理所需变量：
+打开 `agent.py`。修改 `Agent` 类的 `__init__` 函数，添加并处理子代理所需变量：
 
 ```python
-# python/mini_claude/agent.py
+# agent.py
 
     def __init__(
         self,
@@ -222,7 +222,7 @@ def get_sub_agent_config(agent_type: str) -> dict:
 并在 `Agent` 类中声明 `is_sub_agent` 只读属性：
 
 ```python
-# python/mini_claude/agent.py
+# agent.py
 
     @property
     def is_sub_agent(self) -> bool:
@@ -240,10 +240,10 @@ def get_sub_agent_config(agent_type: str) -> dict:
 主 Agent 需要获取子 Agent 所有的文字分析总结。因此，子 Agent 运行时产生的流式文本不能像主 Agent 那样直接打到控制台，而是需要拦截并拼接收集到一个字符串缓冲区（`output_buffer`）中，在运行结束后打包带回给主 Agent。
 
 #### 做什么
-1. **修改输出拦截器**：修改 `python/mini_claude/agent.py` 的 `_emit_text` 输出管道函数。当检测到 `output_buffer` 激活时，将文本追加至缓冲区，否则直接打印：
+1. **修改输出拦截器**：修改 `agent.py` 的 `_emit_text` 输出管道函数。当检测到 `output_buffer` 激活时，将文本追加至缓冲区，否则直接打印：
 
 ```python
-# python/mini_claude/agent.py
+# agent.py
 
     def _emit_text(self, text: str) -> None:
         if self.state.output_buffer is not None:
@@ -255,7 +255,7 @@ def get_sub_agent_config(agent_type: str) -> dict:
 2. **实现 `run_once` 执行入口**：在 `Agent` 中编写子代理单次生命周期内的执行控制逻辑，运行结束后计算消耗的 Token 并返回缓冲区文本：
 
 ```python
-# python/mini_claude/agent.py
+# agent.py
 
     async def run_once(self, prompt: str) -> dict:
         self.state.output_buffer = []  # 激活文本捕获缓冲区
@@ -288,10 +288,10 @@ Token 消耗要使用增量计算（`self.state.total_input_tokens - prev_in`）
 当主大模型选择调用 `agent` 工具时，我们需要根据大模型传入的 `agent_type` 获取对应的 Prompt 和工具集、实例化子代理，并驱动其运行。为了防止安全越权，子代理必须精准继承父代理的特定权限（尤其是 Plan Mode 状态下的只读约束）。
 
 #### 做什么
-1. **编写 `_execute_agent_tool` 方法**：在 `python/mini_claude/agent.py` 中，实现子代理的实例化、API 继承、执行驱动以及 Token 统计结算：
+1. **编写 `_execute_agent_tool` 方法**：在 `agent.py` 中，实现子代理的实例化、API 继承、执行驱动以及 Token 统计结算：
 
 ```python
-# python/mini_claude/agent.py
+# agent.py
 
     async def _execute_agent_tool(self, inp: dict) -> str:
         agent_type = inp.get("type", "general")
@@ -329,7 +329,7 @@ Token 消耗要使用增量计算（`self.state.total_input_tokens - prev_in`）
 2. **在工具分发器中注册该工具处理流程**：
 
 ```python
-# python/mini_claude/agent.py -> _execute_tool_call()
+# agent.py -> _execute_tool_call()
 
         if name == "agent":
             return await self._execute_agent_tool(inp)

@@ -34,10 +34,10 @@
 ## 📦 涉及文件
 
 修改：
-- `python/mini_claude/skills.py`
-- `python/mini_claude/tools.py`
-- `python/mini_claude/__main__.py`
-- `python/mini_claude/prompt.py`
+- `skills.py`
+- `tools.py`
+- `__main__.py`
+- `prompt.py`
 
 ---
 

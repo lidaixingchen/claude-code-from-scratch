@@ -27,8 +27,8 @@
 ## 📦 涉及文件
 
 修改：
-- `python/mini_claude/tools.py`
-- `python/mini_claude/agent.py`
+- `tools.py`
+- `agent.py`
 
 ---
 
