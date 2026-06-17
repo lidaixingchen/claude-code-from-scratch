@@ -89,7 +89,7 @@ async def run_repl(agent: Agent) -> None:
 
     def handle_sigint(sig, frame):
         nonlocal sigint_count
-        if agent._aborted is False and agent._output_buffer is not None:
+        if agent._aborted is False and agent.is_processing:
             # Agent is processing
             agent.abort()
             print("\n  (interrupted)")

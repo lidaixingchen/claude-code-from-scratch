@@ -80,6 +80,11 @@ DANGEROUS_PATTERNS = [
 def is_dangerous(command: str) -> bool:
     # 只要命中任意正则，即标记为危险
     return any(p.search(command) for p in DANGEROUS_PATTERNS)
+
+
+#### 注意什么
+
+- **正则局限性**：静态扫描危险命令仅是辅助第一层防护，大模型或用户可能有各种方式绕过正则，真正的防线在后续的白名单规则匹配和交互确认。
 ```
 
 ---
@@ -117,7 +122,14 @@ def _parse_rule(rule: str) -> dict:
     return {"tool": rule, "pattern": None}
 
 
+_cached_rules: dict | None = None
+
+
 def load_permission_rules() -> dict:
+    global _cached_rules
+    if _cached_rules is not None:
+        return _cached_rules
+
     allow = []
     deny = []
     
@@ -128,13 +140,15 @@ def load_permission_rules() -> dict:
     ]
     for p in paths:
         settings = _load_settings(p)
-        perms = settings.get("permissions", {})
-        for r in perms.get("allow", []):
-            allow.append(_parse_rule(r))
-        for r in perms.get("deny", []):
-            deny.append(_parse_rule(r))
+        if settings:
+            perms = settings.get("permissions", {})
+            for r in perms.get("allow", []):
+                allow.append(_parse_rule(r))
+            for r in perms.get("deny", []):
+                deny.append(_parse_rule(r))
             
-    return {"allow": allow, "deny": deny}
+    _cached_rules = {"allow": allow, "deny": deny}
+    return _cached_rules
 
 
 def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
@@ -143,13 +157,18 @@ def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
     if rule["pattern"] is None:
         return True
 
-    # 提取实际被测试的值（Shell 命令或文件路径）
-    value = inp.get("command", "") if tool_name == "run_shell" else inp.get("file_path", "")
+    # 提取实际被测试的值（Shell 命令或文件路径，支持 file_path 或 path）
+    value = inp.get("command", "") if tool_name == "run_shell" else (inp.get("file_path") or inp.get("path") or "")
     pattern = rule["pattern"]
     
     if pattern.endswith("*"):
         return value.startswith(pattern[:-1])
     return value == pattern
+
+
+#### 注意什么
+
+- **配置文件的编码**：读取 JSON 配置文件时，必须指定 `encoding="utf-8"`，这能保证在非 ASCII 文件路径和非英语环境下规则文件正常解析而不产生 Unicode 乱码崩溃。
 ```
 
 ---
@@ -234,6 +253,11 @@ def check_permission(
 
     # 7. 默认默认全部放行
     return {"action": "allow"}
+
+
+#### 注意什么
+
+- **只读模式豁免**：在规划模式（Plan Mode）下，应特别豁免状态转换命令（如 `enter_plan_mode` 和 `exit_plan_mode`），否则用户将无法启动或退出该模式。
 ```
 
 ---
@@ -309,26 +333,12 @@ class Agent:
 
                 # 【2. 常规工具执行】
                 # 此处省略原有执行工具与 early_task 判断，直接调用 execute_tool ...
-```
 
----
 
-## 使用 Literal 强化类型约束
+#### 注意什么
 
-在定义权限安全模式时，我们有 5 种预设的选项：`default`（默认模式）、`plan`（规划模式）、`acceptEdits`（自动接受修改）、`bypassPermissions`（YOLO 模式）、`dontAsk`（CI 模式）。
-
-如果我们将这个权限模式定义为普通的字符串类型（`str`），在代码调用和参数传递中容易因为拼写错误而引入隐蔽的 Bug。为此，我们使用了 Python typing 模块中的 `Literal` 类型：
-
-```python
-from typing import Literal
-
-PermissionMode = Literal["default", "plan", "acceptEdits", "bypassPermissions", "dontAsk"]
-```
-
-使用 `Literal` 类型的工程优势包括：
-1. **静态类型检查**：IDE 和 `mypy` 等类型检查工具能实时发现参数拼写错误（例如将 `"dontAsk"` 写错为 `"dont_ask"`）。
-2. **代码可读性**：清晰界定了该变量的取值范围，开发者无需查阅文档就能明白支持哪些模式。
-3. **安全卫士**：从类型层面保证了核心安全控制参数的取值严格可信。
+- **使用 Literal 强化类型约束**：在定义权限安全模式时，我们有 5 种预设的选项：`default`（默认模式）、`plan`（规划模式）、`acceptEdits`（自动接受修改）、`bypassPermissions`（YOLO 模式）、`dontAsk`（CI 模式）。如果我们将这个权限模式定义为普通的字符串类型（`str`），在代码调用和参数传递中容易因为拼写错误而引入隐蔽的 Bug。因此，建议使用 Python typing 模块中的 `Literal` 类型：`PermissionMode = Literal["default", "plan", "acceptEdits", "bypassPermissions", "dontAsk"]` 并在匹配时做静态分析。
+- **避免高频频繁询问**：通过会话级白名单 `confirmed_paths` 缓存已授权的路径，能够保证在同一个会话中 Agent 修改同一个文件时，用户只需确认一次，有效减少了弹窗对开发流程的心智干扰。
 
 ---
 
@@ -400,7 +410,7 @@ if perm["action"] == "deny":
 ## 🧠 思考题
 
 1. **为什么在 `load_permission_rules` 中，我们将“全局设置”和“项目本地设置”读取出的规则，是用全局先追加、项目后追加的形式加入同一个数组，并且匹配时 deny 规则的匹配先于 allow 规则遍历？**
-   *(提示：这代表项目本地的配置优先级更高，且由于 `deny 优先判定`，用户可以使用 allow 规则放开大部分命令，再专门编写 deny 规则进行细节上的高危排除，是系统安全设计的行业标准。)*
+    *(提示：这代表项目本地的配置优先级更高，且由于 `deny 优先判定`，用户可以使用 allow 规则放开大部分命令，再专门编写 deny 规则进行细节上的高危排除，是符合优先级覆盖与最小特权原则的安全设计思想。)*
 2. **在 `check_permission` 中，为什么 `read_file` 等工具被判定为“永远放行”？读取文件难道不会泄露隐私或密钥吗？**
    *(提示：只读工具不具备写盘或破坏外部世界物理状态的能力，属于“低爆炸半径”操作。如果读取了密钥，在本地沙箱内仍然是安全的；对它的防护通常应放在外层的环境隔离和网络防泄露上，而不是在工具执行阶段频繁弹框干扰开发心智。)*
 

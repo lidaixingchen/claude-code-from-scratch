@@ -349,7 +349,7 @@ async def run_repl(agent: Agent):
     def handle_sigint(sig, frame):
         nonlocal sigint_count
         # 若 Agent 正在运行且未被标记中断，则终止运行并返回提示符
-        if agent._aborted is False:
+        if agent._aborted is False and agent.is_processing:
             agent.abort()
             print("\n  (interrupted)")
             sigint_count = 0

@@ -55,6 +55,7 @@ import os
 import platform
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 # 嵌入的 System Prompt 模板，包含核心行为限制与环境占位符

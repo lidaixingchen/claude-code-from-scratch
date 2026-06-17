@@ -75,6 +75,9 @@ class SkillDefinition:
     prompt_template: str
     user_invocable: bool = True
     skill_dir: str = ""
+    source: str = ""
+    context: str = "inline"
+    allowed_tools: list[str] | None = None
 
 
 _cached_skills: list[SkillDefinition] | None = None
@@ -115,6 +118,15 @@ def _load_skills_from_dir(directory: Path, source: str, skills: dict[str, SkillD
             name = meta.get("name") or entry.name
             user_invocable = meta.get("user-invocable", "true").lower() != "false"
 
+            context = meta.get("context") or "inline"
+            allowed_tools = None
+            if "allowed-tools" in meta:
+                try:
+                    import json
+                    allowed_tools = json.loads(meta["allowed-tools"])
+                except Exception:
+                    allowed_tools = [t.strip() for t in meta["allowed-tools"].split(",")]
+
             skills[name] = SkillDefinition(
                 name=name,
                 description=meta.get("description", ""),
@@ -122,9 +134,18 @@ def _load_skills_from_dir(directory: Path, source: str, skills: dict[str, SkillD
                 prompt_template=result.body,
                 user_invocable=user_invocable,
                 skill_dir=str(entry),
+                source=source,
+                context=context,
+                allowed_tools=allowed_tools,
             )
         except Exception:
             pass
+
+
+#### 注意什么
+
+- **数据字段的完整性**：在 `SkillDefinition` 中我们补充了 `source`, `context`, `allowed_tools` 属性，它们对于 REPL 渲染指令和后续的高级沙箱（Fork Mode）工具集必不可少。
+- **配置文件的编码**：读取技能文件夹下的 `SKILL.md` 时，必须显式指定 `encoding="utf-8"`。
 ```
 
 ---
@@ -150,6 +171,11 @@ def resolve_skill_prompt(skill: SkillDefinition, args: str) -> str:
     # 替换路径占位符
     prompt = prompt.replace("${CLAUDE_SKILL_DIR}", skill.skill_dir)
     return prompt
+
+
+#### 注意什么
+
+- **正则替换的兼容**：替换 `$ARGUMENTS` 时，使用 `re.sub` 兼容大括号形式的 `${ARGUMENTS}` 可以提升模板编写的容错度。
 ```
 
 ---
@@ -193,6 +219,11 @@ def resolve_skill_prompt(skill: SkillDefinition, args: str) -> str:
             if cmd_name not in ("clear", "plan", "cost", "compact"):
                 print_error(f"Unknown skill command: /{cmd_name}")
                 continue
+
+
+#### 注意什么
+
+- **技能拦截逻辑**：注意在 REPL 的命令拦截中，必须优先匹配已注册的技能，若没有命中，再检查系统内置的 REPL 命令。如果是用户禁用的技能（`user_invocable` 为 False），则不允许用户在终端手动通过 `/` 指令调起。
 ```
 
 ---
@@ -233,9 +264,9 @@ tool_definitions: list[dict] = [
 
 # ...
 
-# 2. 在 execute_tool 中分配分发路由
-async def execute_tool(name: str, inp: dict) -> str:
-    # ... handlers 字典中加入对 skill 的分配
+# 2. 在 agent.py 的 _execute_tool_call 中挂载 skill 工具的分发路由
+async def _execute_tool_call(self, name: str, inp: dict) -> str:
+    # ... 挂载对 skill 工具的调用分发
     if name == "skill":
         from .skills import discover_skills, resolve_skill_prompt
         skill_name = inp.get("skill_name", "")
@@ -249,8 +280,12 @@ async def execute_tool(name: str, inp: dict) -> str:
         resolved_prompt = resolve_skill_prompt(skill, args)
         # 将解析后的提示词以 inline 内联文本形式传回大模型，供其在下一回合消费
         return f'[Skill "{skill_name}" activated. Follow these instructions:]\n\n{resolved_prompt}'
-        
-    # ...
+
+
+#### 注意什么
+
+- **避免循环导入与路由正确性**：为什么必须在 `agent.py` 的 `_execute_tool_call()` 内部去拦截并路由 `skill` 工具，而不是在 `tools.py` 的全局 `execute_tool` 中执行？因为技能如果被配置为沙箱分支模式（Fork Mode），需要就地重新实例化一个新的 `Agent`（子会话代理）来执行。这需要访问高层的 `Agent` 类，如果将其写在底层 `tools.py` 模块中，会触发 `tools.py` 与 `agent.py` 的严重循环导入错误。
+- **内联文本的作用机制**：Inline 模式下，工具返回解析后的提示词文本，大模型会在收到该 Tool Result 后，将其视作全新的指导方针在下一回合继续执行，从而优雅地改变了模型的指令上下文。
 ```
 
 在 `prompt.py` 中引入 `build_skill_descriptions` 汇总并注入 `{{skills}}`：

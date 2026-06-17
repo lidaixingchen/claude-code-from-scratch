@@ -18,7 +18,7 @@ def _ensure_dir() -> None:
 
 def save_session(session_id: str, data: dict[str, Any]) -> None:
     _ensure_dir()
-    (SESSION_DIR / f"{session_id}.json").write_text(json.dumps(data, indent=2, default=str))
+    (SESSION_DIR / f"{session_id}.json").write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
 
 
 def load_session(session_id: str) -> dict[str, Any] | None:
@@ -26,7 +26,7 @@ def load_session(session_id: str) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         logger.warning(f"Corrupted session file {path}: {e}")
         return None
@@ -40,7 +40,7 @@ def list_sessions() -> list[dict[str, Any]]:
     results = []
     for f in SESSION_DIR.glob("*.json"):
         try:
-            data = json.loads(f.read_text())
+            data = json.loads(f.read_text(encoding="utf-8"))
             if "metadata" in data:
                 results.append(data["metadata"])
         except json.JSONDecodeError as e:

@@ -59,6 +59,12 @@ class Agent:
             self._output_buffer.append(text)
         else:
             print_assistant_text(text)
+
+
+#### 注意什么
+
+- **状态存储区分**：在本节的教学简化版中我们直接将 `self._output_buffer` 定义在实例上。但在实际完整 codebase 的架构中，为了统一管理运行状态，我们将其保存在状态容器 `self.state.output_buffer` 中。
+- **UI 模块结合**：这里调用的 `print_assistant_text()` 是第 5 课所创建的 `ui.py` 中定义的函数，它可以确保流式字符的输出格式整齐。
 ```
 
 ---
@@ -84,7 +90,7 @@ Anthropic API 的流式响应会混杂输出 `text` 块和 `thinking` 块。
                 "model": self.config.model,
                 "max_tokens": 4096,
                 "system": self._system_prompt,
-                "tools": get_tool_definitions(),
+                "tools": get_active_tool_definitions(self.tools),
                 "messages": self.history.anthropic_messages,
             }
 
@@ -94,9 +100,12 @@ Anthropic API 的流式响应会混杂输出 `text` 块和 `thinking` 块。
             # 启动 API 监听流
             async with self._anthropic_client.messages.stream(**create_params) as stream:
                 async for event in stream:
+                    if not hasattr(event, 'type'):
+                        continue
+
                     if event.type == "content_block_start":
-                        cb = event.content_block
-                        if cb.type == "tool_use":
+                        cb = getattr(event, 'content_block', None)
+                        if cb and getattr(cb, 'type', None) == "tool_use":
                             tool_blocks_by_index[event.index] = {
                                 "id": cb.id,
                                 "name": cb.name,
@@ -104,15 +113,20 @@ Anthropic API 的流式响应会混杂输出 `text` 块和 `thinking` 块。
                             }
                     elif event.type == "content_block_delta":
                         delta = event.delta
-                        # 捕获普通文本流并实时渲染到终端
-                        if delta.type == "text_delta":
+                        # 捕获并清洗思考链（thinking）以及普通文本并实时流式渲染
+                        if hasattr(delta, 'text'):
                             if first_text:
+                                stop_spinner()
                                 self._emit_text("\n")  # 首字输出前先换行
                                 first_text = False
                             self._emit_text(delta.text)
-                        
-                        # 收集工具调用 JSON 增量
-                        elif delta.type == "input_json_delta":
+                        elif hasattr(delta, 'thinking'):
+                            if first_text:
+                                stop_spinner()
+                                self._emit_text("\n  [thinking] ")
+                                first_text = False
+                            self._emit_text(delta.thinking)
+                        elif hasattr(delta, 'partial_json'):
                             tb = tool_blocks_by_index.get(event.index)
                             if tb:
                                 tb["input_json"] += delta.partial_json
@@ -124,13 +138,16 @@ Anthropic API 的流式响应会混杂输出 `text` 块和 `thinking` 块。
                 final_message = await stream.get_final_message()
             
             # 【核心过滤】滤除思考块（thinking），不将它们保存到对话历史消息中
-            final_message.content = [
-                b for b in final_message.content if getattr(b, "type", None) != "thinking"
-            ]
             return final_message
 
-        # 使用步骤 4 实现的重试方法进行包裹
+        # 使用步骤 4 实现遇到的重试方法进行包裹
         return await _with_retry(_do)
+
+
+#### 注意什么
+
+- **思考链与打字机 Spinner**：在 Anthropic 流式读取时，模型可能会先返回 `thinking` 类型的数据块进行思考。为了保证用户体验，我们必须在收到首个有效字符（无论是普通文本还是思考文本）时立即调用 `stop_spinner()` 来停止加载动画。
+- **工具定义获取**：在实际 codebase 中，请使用 `get_active_tool_definitions(self.tools)` 动态获取当前激活的工具，以支持后续多 Agent 沙箱的限制工具列表。
 ```
 
 ---
@@ -157,7 +174,7 @@ async def _call_openai_stream(self) -> dict:
         stream = await self._openai_client.chat.completions.create(
             model=self.config.model,
             messages=self.history.openai_messages,
-            tools=self._to_openai_tools(get_tool_definitions()),
+            tools=_to_openai_tools(get_active_tool_definitions(self.tools)),
             stream=True,
             stream_options={"include_usage": True},
         )
@@ -237,6 +254,14 @@ async def _call_openai_stream(self) -> dict:
         }
 
     return await _with_retry(_do)
+
+
+#### 注意什么
+
+- **消息历史与 OpenAI 格式规范**：在流式输出结束后，我们需要使用 `MessageHistory` 来统一更新历史记录。
+  1. 对于 **Anthropic 后端**：在 `_call_anthropic_stream` 结束后，通过 `self.history.append_assistant_message()` 添加。
+  2. 对于 **OpenAI 后端**：在 `_call_openai_stream` 收集完文本和 `tool_calls` 后，通过 `self.history.append_assistant_message()` 添加带有 `tool_calls` 的回复。如果是字典格式，抽象层会直接推入，防止将其包装在多余的 `assistant` 属性中导致 OpenAI API 抛出 400 Bad Request。
+- **模块级函数调用**：注意 `_to_openai_tools` 是一个模块级工具函数，调用时不需要加上 `self.` 前缀。
 ```
 
 ---
@@ -291,32 +316,11 @@ async def _with_retry(fn, max_retries: int = 3):
             print_retry(attempt + 1, max_retries, reason)
             
             await asyncio.sleep(delay)
-```
 
----
 
-## 结合 MessageHistory 进行消息管理
+#### 注意什么
 
-在前面的章节中，我们引入了 `MessageHistory` 来统一双后端的历史管理。在流式输出结束后，我们需要更新历史记录：
-1. **Anthropic 后端**：在 `_call_anthropic_stream` 结束后，剔除 `thinking` 块后的完整 `assistant` 消息通过 `self.history.append_assistant_message()` 添加。
-2. **OpenAI 后端**：在 `_call_openai_stream` 收集完文本和 `tool_calls` 后，通过 `self.history.append_assistant_message()` 添加带有 `tool_calls` 的回复。
-3. **工具执行结果**：流式结束后，工具被执行，其返回的结果统一通过 `self.history.append_tool_results()` 回填。
-
-使用 `MessageHistory` 的好处在于，流式逻辑不需要再直接操作底层的私有列表（如 `self._messages` 或 `self._openai_messages`），而是通过高层的方法统一追加，从而大大降低了双后端流式逻辑的耦合度，避免了重复的历史管理代码。
-
----
-
-## 指数退避重试中的随机抖动（Jitter）
-
-在步骤 4 的重试机制中，**随机抖动（Jitter）** 是极其关键的设计：
-- **Thundering Herd 效应**：当大批客户端因网络瞬断或 API 服务抖动（如 429 限制）同时失败时，如果它们都采用纯粹的指数退避（例如都在 1s、2s、4s 等整秒处重试），会在相同的时间点对网关产生巨大的爆发请求。
-- **加入抖动**：通过在指数退避的基础延迟 `base_delay` 上加上一个 0 到 1 秒之间的随机抖动值 `jitter`，使得各个客户端的实际重试时间错开，平滑了流量波峰。
-
-```python
-# 推荐的实现方式
-base_delay = min(1000 * (2 ** attempt), MAX_RETRY_DELAY_MS) / 1000
-jitter = (hash(str(time.time())) % 1000) / 1000  # 0-1 秒随机抖动
-delay = base_delay + jitter
+- **避免惊群效应（Thundering Herd）**：在重试机制中加入随机抖动（Jitter）至关重要。当大批客户端同时因云端 API 限流（如 429）或网络瞬断而请求失败时，如果它们都采用整秒指数退避（例如 1s, 2s, 4s），它们会在相同的秒数切片处再次并发轰炸网关。加上 0 到 1 秒之间的随机抖动值 `jitter`，可以有效错开各客户端的实际重试时点，平滑流量波峰。
 ```
 
 ---
@@ -367,9 +371,15 @@ delay = 1.0 * (2 ** attempt)
    ```bash
    python -m mini_claude
    ```
-2. 输入一个需要较长文本回复的复杂查询（例如让模型写一段 100 行的算法）。
+2. 输入一个需要较长文本回复的复杂查询（例如让模型写一段 100 行 of 算法）。
 3. **观察流式效果**：仔细核对字词是否是一个一个跳出来，在输出过程中，能否通过 `Ctrl+C` 中断输出流并成功返回 `> ` 提示符。
 4. **模拟重试测试**：可以通过暂时掐断网线或提供一个极低重载限流的模拟接口 base_url，验证终端是否能正确捕获网络异常并成功打印出 `↻ Retry 1/3: ...` 的提示。
+
+### 失败时如何排查
+
+1. **终端加载动画（Spinner）无法停止**：检查在解析 `content_block_delta` 事件时，是否遗漏了在首个 `text` 或 `thinking` 块到达时调用 `stop_spinner()`。
+2. **OpenAI 模式下提示 `400 Bad Request`**：检查在流式结束后向 `MessageHistory` 回填 assistant 消息时，是否错误地将已经拼接包装好的 `choice.message` 字典又做了一次冗余的 `role` 和 `content` 包装。
+3. **未定义的函数报错**：确保 `tools.py` 导出的方法名称在 `agent.py` 顶部的 import 列表中拼写正确（使用 `get_active_tool_definitions` 而不是 `get_tool_definitions`）。
 
 ---
 

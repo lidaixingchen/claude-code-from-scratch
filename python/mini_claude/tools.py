@@ -214,7 +214,7 @@ def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]
 
 def _read_file(inp: dict) -> str:
     try:
-        content = Path(inp["file_path"]).read_text()
+        content = Path(inp["file_path"]).read_text(encoding="utf-8")
         lines = content.split("\n")
         numbered = "\n".join(f"{i+1:4d} | {line}" for i, line in enumerate(lines))
         return numbered
@@ -231,7 +231,7 @@ def _write_file(inp: dict) -> str:
     try:
         path = Path(inp["file_path"])
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(inp["content"])
+        path.write_text(inp["content"], encoding="utf-8")
         lines = inp["content"].split("\n")
         line_count = len(lines)
         preview = "\n".join(f"{i+1:4d} | {l}" for i, l in enumerate(lines[:30]))
@@ -251,7 +251,7 @@ def _auto_update_memory_index(file_path: str) -> None:
                 if f.name == "MEMORY.md":
                     continue
                 try:
-                    raw = f.read_text()
+                    raw = f.read_text(encoding="utf-8")
                     name_match = re.search(r"^name:\s*(.+)$", raw, re.MULTILINE)
                     type_match = re.search(r"^type:\s*(.+)$", raw, re.MULTILINE)
                     desc_match = re.search(r"^description:\s*(.+)$", raw, re.MULTILINE)
@@ -262,7 +262,7 @@ def _auto_update_memory_index(file_path: str) -> None:
                         lines.append(f"- **[{n}]({f.name})** ({t}) — {d}")
                 except (OSError, ValueError) as e:
                     logger.debug(f"Skipping memory file {f}: {e}")
-            (mem_path / "MEMORY.md").write_text("\n".join(lines))
+            (mem_path / "MEMORY.md").write_text("\n".join(lines), encoding="utf-8")
     except OSError as e:
         logger.debug(f"Failed to update memory index: {e}")
 
@@ -304,7 +304,7 @@ def _generate_diff(old_content: str, old_string: str, new_string: str) -> str:
 def _edit_file(inp: dict) -> str:
     try:
         path = Path(inp["file_path"])
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
 
         actual = _find_actual_string(content, inp["old_string"])
         if not actual:
@@ -315,7 +315,7 @@ def _edit_file(inp: dict) -> str:
             return f"Error: old_string found {count} times in {inp['file_path']}. Must be unique."
 
         new_content = content.replace(actual, inp["new_string"], 1)
-        path.write_text(new_content)
+        path.write_text(new_content, encoding="utf-8")
 
         diff = _generate_diff(content, actual, inp["new_string"])
         quote_note = " (matched via quote normalization)" if actual != inp["old_string"] else ""
@@ -401,7 +401,7 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
             if include_pattern and not fnmatch.fnmatch(name, include_pattern):
                 continue
             try:
-                text = Path(full).read_text(errors="replace")
+                text = Path(full).read_text(encoding="utf-8", errors="replace")
                 for i, line in enumerate(text.split("\n")):
                     if regex.search(line):
                         matches.append(f"{full}:{i+1}:{line}")
@@ -432,10 +432,10 @@ def _run_shell(inp: dict) -> str:
         )
         output = result.stdout or ""
         if result.returncode != 0:
-            stderr = f"\nStderr: {result.stderr}" if result.stderr else ""
-            stdout = f"\nStdout: {result.stdout}" if result.stdout else ""
+            stderr = f"\nStderr:\n{result.stderr}" if result.stderr else ""
+            stdout = f"\nStdout:\n{result.stdout}" if result.stdout else ""
             return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
-        return output or "(no output)"
+        return output or "(command succeeded with no output)"
     except subprocess.TimeoutExpired:
         return f"Command timed out after {inp.get('timeout', 30000)}ms"
     except Exception as e:
@@ -516,7 +516,7 @@ def _load_settings(file_path: Path) -> dict | None:
     if not file_path.exists():
         return None
     try:
-        return json.loads(file_path.read_text())
+        return json.loads(file_path.read_text(encoding="utf-8"))
     except Exception:
         return None
 

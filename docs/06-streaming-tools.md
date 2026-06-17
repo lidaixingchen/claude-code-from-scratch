@@ -27,6 +27,7 @@
 
 修改：
 - `python/mini_claude/agent.py`
+- `python/mini_claude/tools.py`
 
 ---
 
@@ -165,9 +166,9 @@ from .tools import (
                         self.config.permission_mode, self.state.plan_file_path,
                     )
                     if perm["action"] == "allow":
-                        # 创建后台异步任务，使其开始抢跑
-                        task = asyncio.create_task(execute_tool(block["name"], block["input"]))
-                        early_executions[block["id"]] = task
+                         # 创建后台异步任务，使其开始抢跑
+                         task = asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
+                         early_executions[block["id"]] = task
 
             # 传入回调函数调用流式连接
             response = await self._call_anthropic_stream(
@@ -224,7 +225,7 @@ from .tools import (
 
                 # 2. 未能抢跑的非安全工具（如 write_file/run_shell），走常规常规同步处理
                 print_tool_call(tu.name, inp)
-                result = await execute_tool(tu.name, inp)
+                result = await self._execute_tool_call(tu.name, inp)
                 print_tool_result(tu.name, result)
                 
                 tool_results.append({
@@ -247,7 +248,7 @@ from .tools import (
 - **原理**：`create_task` 会将协程包装为 `Task` 并提交给 `asyncio` 事件循环，使其在后台非阻塞地开始运行。大模型在继续生成字符的同时，磁盘/网络 I/O 已经在悄悄进行。
 - **关键代码**：
   ```python
-  task = asyncio.create_task(execute_tool(block["name"], block["input"]))
+  task = asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
   early_executions[block["id"]] = task
   ```
 
@@ -259,7 +260,7 @@ from .tools import (
   # 等待后台早已抢跑的异步任务
   result = await early_task
   # 或直接顺序调用常规工具
-  result = await execute_tool(tu.name, inp)
+  result = await self._execute_tool_call(tu.name, inp)
   ```
 
 ### 3. `asyncio.gather` — 并行工具执行（批量并发）
@@ -267,7 +268,7 @@ from .tools import (
 - **原理**：`asyncio.gather` 会同时启动多个协程，并等待它们全部执行完毕。相较于 `create_task` 的“发后不管/稍后回收”，`gather` 用于在当前步骤中阻塞等待这组并行任务的全部结果。
 - **关键代码**：
   ```python
-  results = await asyncio.gather(*(execute_tool(tc.name, tc.args) for tc in tool_calls))
+  results = await asyncio.gather(*(self._execute_tool_call(tc.name, tc.args) for tc in tool_calls))
   ```
 
 ### 总结：

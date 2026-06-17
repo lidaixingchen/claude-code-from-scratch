@@ -73,10 +73,12 @@ class Agent:
             await self._compact_conversation()
 ```
 
-#### 常量说明
-1. **`CONTEXT_WINDOW_SAFETY_MARGIN` (20000)**: 保留 20,000 tokens 作为安全缓冲区。大模型的系统提示词、用户最新提问以及回复都需要占用空间，不能等窗口 100% 满时才处理。
-2. **`AUTOCOMPACT_THRESHOLD` (0.85)**: 触发自动压缩的水位线阈值。如果已用空间达到有效窗口（有效窗口为总容量减去安全边界）的 85%，即刻开始压缩。
-3. **`LARGE_RESULT_THRESHOLD` (30 KB)**: 用以检查单次工具结果（如极长的 shell 输出）是否过长，若过长则通过持久化文件保存并自动截断，避免单个巨大结果瞬间爆表。
+#### 注意什么
+
+- **缓冲水位线设计**：
+  1. **`CONTEXT_WINDOW_SAFETY_MARGIN` (20000)**: 保留 20,000 tokens 作为安全缓冲区。大模型的系统提示词、用户最新提问以及回复都需要占用空间，不能等窗口 100% 满时才处理。
+  2. **`AUTOCOMPACT_THRESHOLD` (0.85)**: 触发自动压缩的水位线阈值。如果已用空间达到有效窗口（总容量减去安全边界）的 85%，即刻开始压缩。
+  3. **`LARGE_RESULT_THRESHOLD` (30 KB)**: 用以检查单次工具结果（如极长的 shell 输出）是否过长，若过长则通过持久化文件保存并自动截断，避免单个巨大结果瞬间爆表。
 
 ---
 
@@ -188,6 +190,11 @@ class Agent:
         # ✅ 使用 MessageHistory 公共方法进行安全替换
         self.history.replace_openai_messages(new_messages)
         self.state.last_input_token_count = 0
+
+
+#### 注意什么
+
+- **摘要指令生成**：摘要生成请求属于高爆炸半径操作。如果我们在请求中允许大模型随意发散，可能会遗漏关键的文件编辑或运行结果。因此，摘要提示词应极力强调整理“发生了什么”、“编辑了哪些文件”以及“命令运行的最终产出”，保证压缩后的极简上下文没有信息丢失。
 ```
 
 ---
@@ -232,11 +239,16 @@ class Agent:
         # ... 后续 while 循环及其他逻辑
 ```
 
-另外，在 `_call_anthropic_stream` 与 `_call_openai_stream` 请求成功后，务必更新最近一次的 Token 消耗：
+另外，在 `_chat_anthropic` 与 `_chat_openai` 循环中请求成功后，务必更新最近一次的 Token 消耗：
 ```python
-# 例如在 _call_anthropic_stream 内部：
+# 例如在 _chat_anthropic 内部：
 self.state.last_input_token_count = response.usage.input_tokens
 ```
+
+
+#### 注意什么
+
+- **Token 更新的生命周期**：为什么必须在 `_chat_anthropic`/`_chat_openai` 外层循环中更新 `last_input_token_count`？因为在 streaming 流式通信中，大模型的 chunk 包被多路并发异步接收，而在流结束时进行一次性更新，可以保证计算的水位线永远最新，避免频繁在流的每一个 chunk 里去做冗余的重复赋值动作。
 
 ---
 
@@ -265,6 +277,11 @@ self.state.last_input_token_count = response.usage.input_tokens
             except Exception as e:
                 print(f"  [red]Error: {e}[/red]")
             continue
+
+
+#### 注意什么
+
+- **异常拦截**：手动压缩指令 `/compact` 在 REPL 中以独立控制台命令执行。必须加 `try...except` 拦截异常，避免因为云端限流等网络偶发失败导致交互终端闪退。
 ```
 
 ---

@@ -241,7 +241,7 @@ class McpManager:
         if not path.exists():
             return
         try:
-            raw = json.loads(path.read_text())
+            raw = json.loads(path.read_text(encoding="utf-8"))
             servers = raw.get("mcpServers", raw)
             for name, config in servers.items():
                 if isinstance(config, dict) and "command" in config:

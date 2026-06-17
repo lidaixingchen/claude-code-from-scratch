@@ -93,6 +93,11 @@ class AgentConfig:
     api_key: str | None = None
 
 
+@dataclass
+class AgentState:
+    pass
+
+
 class MessageHistory:
     """统一 Anthropic/OpenAI 消息格式的抽象层"""
 
@@ -120,7 +125,10 @@ class MessageHistory:
         self.messages.append({"role": "user", "content": content})
 
     def append_assistant_message(self, content: Any) -> None:
-        self.messages.append({"role": "assistant", "content": content})
+        if self.use_openai and isinstance(content, dict) and "role" in content:
+            self.messages.append(content)
+        else:
+            self.messages.append({"role": "assistant", "content": content})
 
     def append_tool_results(self, results: list[dict]) -> None:
         if self.use_openai:

@@ -241,7 +241,10 @@ class MessageHistory:
         self.messages.append({"role": "user", "content": content})
 
     def append_assistant_message(self, content: Any) -> None:
-        self.messages.append({"role": "assistant", "content": content})
+        if self.use_openai and isinstance(content, dict) and "role" in content:
+            self.messages.append(content)
+        else:
+            self.messages.append({"role": "assistant", "content": content})
 
     def append_tool_results(self, results: list[dict]) -> None:
         if self.use_openai:
@@ -388,6 +391,16 @@ class Agent:
                 kwargs["base_url"] = anthropic_base_url
             self._anthropic_client = anthropic.AsyncAnthropic(**kwargs)
             self._openai_client = None
+
+    def _update_system_prompt(self) -> None:
+        self._base_system_prompt = self.config.custom_system_prompt or build_system_prompt()
+        if self.config.permission_mode == "plan":
+            if not self.state.plan_file_path:
+                self.state.plan_file_path = self._generate_plan_file_path()
+            self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
+        else:
+            self._system_prompt = self._base_system_prompt
+        self.history.update_system_prompt(self._system_prompt)
 
     # ─── Properties for backward compatibility ────────────────
 
@@ -938,7 +951,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 return "Not in plan mode."
             plan_content = "(No plan file found)"
             if self.state.plan_file_path and Path(self.state.plan_file_path).exists():
-                plan_content = Path(self.state.plan_file_path).read_text()
+                plan_content = Path(self.state.plan_file_path).read_text(encoding="utf-8")
 
             # Interactive approval flow
             if self._plan_approval_fn:
@@ -1039,6 +1052,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if self.state.aborted:
                 break
 
+            self._update_system_prompt()
             self._run_compression_pipeline()
             self._consume_memory_prefetch(memory_prefetch)
 
@@ -1227,6 +1241,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if self.state.aborted:
                 break
 
+            self._update_system_prompt()
             self._run_compression_pipeline()
             self._consume_memory_prefetch(memory_prefetch)
 

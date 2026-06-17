@@ -55,7 +55,18 @@ import hashlib
 import re
 from pathlib import Path
 
+from dataclasses import dataclass
+
 VALID_TYPES = {"user", "feedback", "project", "reference"}
+
+
+@dataclass
+class MemoryEntry:
+    name: str
+    description: str
+    type: str
+    filename: str
+    content: str = ""
 
 
 def _project_hash() -> str:
@@ -68,6 +79,11 @@ def get_memory_dir() -> Path:
     d = Path.home() / ".mini-claude" / "projects" / _project_hash() / "memory"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+#### 注意什么
+
+- **物理隔离的重要性**：利用哈希值做项目目录隔离，可以避免 A 项目的开发上下文或规则泄露到 B 项目中，保护了数据安全，也让 Agent 的记忆具有了精准的范围上下文。
 ```
 
 ---
@@ -131,6 +147,11 @@ def parse_frontmatter(content: str) -> FrontmatterResult:
 # memory.py（续）
 
 from .frontmatter import parse_frontmatter
+
+
+#### 注意什么
+
+- **无依赖解析器**：通过手写 YAML 键值对行切割与正则，可以极大节省包体积，避免了初学者拉取项目时必须安装 PyYAML 第三方包的步骤，降低了启动成本。
 ```
 
 注意：`parse_frontmatter` 返回 `FrontmatterResult` 数据类，通过 `.meta` 和 `.body` 属性访问元数据与正文。后续所有调用方（包括第 11 课的技能系统）都统一使用点操作符访问。
@@ -154,9 +175,9 @@ Agent 在提问时，如果一次性将所有的记忆文件全部发给 API 会
 # memory.py（续）
 
 
-def list_memories() -> list[dict]:
+def list_memories() -> list[MemoryEntry]:
     d = get_memory_dir()
-    entries = []
+    entries: list[MemoryEntry] = []
     # 扫描所有 .md 文件并解析
     for f in sorted(d.glob("*.md")):
         if f.name == "MEMORY.md":
@@ -165,12 +186,13 @@ def list_memories() -> list[dict]:
             result = parse_frontmatter(f.read_text(encoding="utf-8"))
             meta = result.meta
             if meta.get("name") and meta.get("type") in VALID_TYPES:
-                entries.append({
-                    "name": meta["name"],
-                    "description": meta.get("description", ""),
-                    "type": meta["type"],
-                    "filename": f.name,
-                })
+                entries.append(MemoryEntry(
+                    name=meta["name"],
+                    description=meta.get("description", ""),
+                    type=meta["type"],
+                    filename=f.name,
+                    content=result.body,
+                ))
         except (OSError, ValueError) as e:
             logger.debug(f"Skipping memory file {f}: {e}")
     return entries
@@ -180,18 +202,17 @@ def _update_memory_index() -> None:
     memories = list_memories()
     lines = ["# Memory Index", ""]
     for m in memories:
-        lines.append(f"- **[{m['name']}]({m['filename']})** ({m['type']}) — {m['description']}")
+        lines.append(f"- **[{m.name}]({m.filename})** ({m.type}) — {m.description}")
     
     # 覆盖重写唯一的索引文件
     index_path = get_memory_dir() / "MEMORY.md"
     index_path.write_text("\n".join(lines), encoding="utf-8")
 ```
 
-#### 健全的错误处理与日志记录
+#### 注意什么
 
-在扫描项目目录、读取和解析 YAML Frontmatter 记忆文件时，由于文件可能被外部程序占用、甚至被用户修改损坏，我们需要格外注意：
-1. **精准捕获**：使用 `except (OSError, ValueError) as e` 代替宽泛的 `except Exception`。
-2. **输出调试日志**：通过 `logger.debug(f"Skipping memory file {f}: {e}")` 记录具体的跳过原因，避免异常被无声隐藏，方便后期维护。
+- **数据类型一致性**：在 `list_memories()` 中，我们必须返回定义好的 `MemoryEntry` 对象列表，并在 `_update_memory_index` 中以点号属性访问字段（如 `m.name`），这能保证与第 5 课所实现的 REPL 快捷查看命令 `/memory` （以对象属性方式遍历打印记忆）在数据结构类型上完全一致，避免了在 REPL 下调用命令抛出 `AttributeError` 崩溃。
+- **健全的错误处理与日志记录**：在扫描项目目录、读取和解析 YAML Frontmatter 记忆文件时，由于文件可能被外部程序占用、甚至被用户修改损坏，我们需要精准捕获 `OSError` 和 `ValueError`，并通过 `logger.debug` 记录具体的跳过原因，避免异常被无声隐藏，方便后期维护。
 
 ---
 
@@ -267,6 +288,12 @@ def build_system_prompt() -> str:
         "{{memory}}": build_memory_prompt_section(), 
     }
     # ... 后续替换逻辑保持不变
+
+
+#### 注意什么
+
+- **大模型自主记忆驱动**：在编译记忆提示词时，我们告诉大模型记忆格式和路径，由大模型在主循环决策中“自主”写文件来记住用户偏好。
+- **异步语义召回与简化机制说明**：实际 codebase 实现了高级的基于向量/轻量文本相关的异步语义预取（Prefetching）与热启动过滤机制。在本章的简化教程中，我们着重于搭建文件持久化读写与 `MEMORY.md` 索引编译的基础物理架构。当学习者在最终运行 codebase 时，会接触到更为复杂的异步预取策略，以防止频繁读取引起上下文爆炸。
 ```
 
 ---
