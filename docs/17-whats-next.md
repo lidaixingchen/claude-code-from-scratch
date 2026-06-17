@@ -1,12 +1,12 @@
 # 附录 A：与真实 Claude Code 的架构对比
 
-我们将把从零构建的 `mini-claude`（~3400 行 Python 代码）与 Anthropic 官方的 `Claude Code`（~50万行 TypeScript 代码）进行全方位的架构和工程细节对比。这将帮助你理解从一个“最小必要核心”走向一个“工业级、日活百万级”的 Agent，需要越过哪些关键性的技术鸿沟，以及当你准备进一步改进和增强你自己的 Agent 时，有哪些可以探索的方向。
+我们将把从零构建的 `mini-claude`（~4000 行 Python 代码）与 Anthropic 官方的 `Claude Code`（~50万行 TypeScript 代码）进行全方位的架构和工程细节对比。这将帮助你理解从一个“最小必要核心”走向一个“工业级、日活百万级”的 Agent，需要越过哪些关键性的技术鸿沟，以及当你准备进一步改进和增强你自己的 Agent 时，有哪些可以探索的方向。
 
 ## 一、系统全景：代码规模与后端选型
 
 | 维度 | mini-claude (Python 版) | Claude Code (TypeScript 版) |
 |---|---|---|
-| **核心代码规模** | ~3400 行 Python | ~500,000 行 TypeScript |
+| **核心代码规模** | ~4000 行 Python | ~500,000 行 TypeScript |
 | **运行时环境** | Python 3.10+ | Bun (高性能 JS/TS 运行时) |
 | **主要技术选型** | Standard Library, Anthropic SDK, OpenAI SDK | React + Ink TUI, Yoga 布局引擎, Zod 验证, Tree-sitter |
 | **外部协议集成** | Model Context Protocol (MCP) | Model Context Protocol (MCP) |
@@ -107,4 +107,4 @@
 * **深刻领会工业级 Agent 与玩具的边界**：理解了安全防护、静默容错、流式优化和阶梯式压缩才是将一个 Agent 推向生产环境日活百万所需要克服的真实物理壁垒。
 * **洞察未来的技术趋势**：明晰了 Speculative Exec、WASM 解析和基于 Git 等外围基础设施的隔离方案在构建高信任度 Agent 时的前沿作用。
 
-> **写在最后**：恭喜你成功完成了本课程的全部学习和构建！你现在已经拥有了一套由你亲手从零写出来、包含 13 个完整工具和 Plan/Memory/Skills/Sub-agent/MCP 特性的完整 Python Coding Agent。你可以使用这套系统在你的日常开发任务中进行实测，也欢迎根据本附录提供的架构方向，开启你属于你自己的全新 Agent 探索与优化之路！
+> **写在最后**：恭喜你成功完成了本课程的全部学习和构建！你现在已经拥有了一套由你亲手从零写出来、包含 12 个完整工具和 Plan/Memory/Skills/Sub-agent/MCP 特性的完整 Python Coding Agent。你可以使用这套系统在你的日常开发任务中进行实测，也欢迎根据本附录提供的架构方向，开启你属于你自己的全新 Agent 探索与优化之路！

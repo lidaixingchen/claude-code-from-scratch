@@ -257,8 +257,8 @@ from .tools import check_permission  # 导入权限检查引擎
 
 
 class Agent:
-    # ... 在 __init__ 中增加 self.permission_mode = permission_mode
-    # ... 在 __init__ 中增加 self._confirmed_paths: set[str] = set()
+    # ... 已经在 AgentConfig 中增加了 permission_mode
+    # ... 已经在 AgentState 中增加了 confirmed_paths: set[str] = field(default_factory=set)
 
     async def _confirm_dangerous(self, message: str) -> bool:
         # 打印醒目的黄字警告
@@ -276,7 +276,7 @@ class Agent:
 
                 # 【1. 执行统一权限评估】
                 perm = check_permission(
-                    tu.name, inp, self.permission_mode, self._plan_file_path
+                    tu.name, inp, self.config.permission_mode, self.state.plan_file_path
                 )
 
                 # 命中 Deny 拦截
@@ -294,7 +294,7 @@ class Agent:
                 if perm["action"] == "confirm":
                     confirm_key = perm["message"]
                     # 检查是否已包含在会话白名单中，防重复弹窗打扰
-                    if confirm_key not in self._confirmed_paths:
+                    if confirm_key not in self.state.confirmed_paths:
                         confirmed = await self._confirm_dangerous(confirm_key)
                         if not confirmed:
                             # 用户拒绝了确认
@@ -305,7 +305,7 @@ class Agent:
                             })
                             continue
                         # 用户授权成功，追加进当前会话的路径白名单中
-                        self._confirmed_paths.add(confirm_key)
+                        self.state.confirmed_paths.add(confirm_key)
 
                 # 【2. 常规工具执行】
                 # 此处省略原有执行工具与 early_task 判断，直接调用 execute_tool ...

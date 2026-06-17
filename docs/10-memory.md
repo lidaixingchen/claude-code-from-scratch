@@ -17,7 +17,7 @@
 ## 🛠️ 本节任务
 
 1. **实现项目哈希物理隔离**：在 `memory.py` 中编写 `_project_hash()` 和 `get_memory_dir()`，使每个项目目录都映射到独立的存储路径。
-2. **编写 YAML Frontmatter 解析器**：实现 `parse_frontmatter` 提取记忆文件中的元数据及正文。
+2. **编写 YAML Frontmatter 解析器**：在 `frontmatter.py` 中实现 `FrontmatterResult` 数据类和 `parse_frontmatter`，供 `memory.py` 和第 11 课的 `skills.py` 共享复用。
 3. **实现索引文件自动重建**：实现 `_update_memory_index` 逻辑，在新增记忆时重新生成 `MEMORY.md` 索引。
 4. **编译记忆提示词段并织入 Prompt**：实现 `build_memory_prompt_section()`，并在 `prompt.py` 中连通替换 `{{memory}}` 占位符。
 
@@ -28,6 +28,9 @@
 修改：
 - `python/mini_claude/memory.py`
 - `python/mini_claude/prompt.py`
+
+创建：
+- `python/mini_claude/frontmatter.py`
 
 ---
 
@@ -78,17 +81,25 @@ def get_memory_dir() -> Path:
 
 #### 做什么
 
-在 `memory.py` 中编写 YAML 头信息切片读取算法：
+首先，创建 `frontmatter.py` 作为独立的共享解析模块（后续第 11 课的技能系统也将复用此模块）：
 
 ```python
-# memory.py（续）
+# frontmatter.py
+
+from dataclasses import dataclass, field
 
 
-def parse_frontmatter(content: str) -> dict:
+@dataclass
+class FrontmatterResult:
+    meta: dict[str, str] = field(default_factory=dict)
+    body: str = ""
+
+
+def parse_frontmatter(content: str) -> FrontmatterResult:
     lines = content.split("\n")
     # 如果第一行不是 --- 则证明没有 Frontmatter 元数据
     if not lines or lines[0].strip() != "---":
-        return {"meta": {}, "body": content}
+        return FrontmatterResult(body=content)
 
     end_idx = -1
     for i in range(1, len(lines)):
@@ -97,20 +108,32 @@ def parse_frontmatter(content: str) -> dict:
             break
 
     if end_idx == -1:
-        return {"meta": {}, "body": content}
+        return FrontmatterResult(body=content)
 
-    meta = {}
+    meta: dict[str, str] = {}
     for i in range(1, end_idx):
         colon = lines[i].find(":")
-        if colon != -1:
-            key = lines[i][:colon].strip()
-            val = lines[i][colon + 1 :].strip()
-            meta[key] = val
+        if colon == -1:
+            continue
+        key = lines[i][:colon].strip()
+        value = lines[i][colon + 1:].strip()
+        if key:
+            meta[key] = value
 
     # 裁剪元数据后，重组正文部分
-    body = "\n".join(lines[end_idx + 1 :]).strip()
-    return {"meta": meta, "body": body}
+    body = "\n".join(lines[end_idx + 1:]).strip()
+    return FrontmatterResult(meta=meta, body=body)
 ```
+
+然后，在 `memory.py` 中引入解析器：
+
+```python
+# memory.py（续）
+
+from .frontmatter import parse_frontmatter
+```
+
+注意：`parse_frontmatter` 返回 `FrontmatterResult` 数据类，通过 `.meta` 和 `.body` 属性访问元数据与正文。后续所有调用方（包括第 11 课的技能系统）都统一使用点操作符访问。
 
 ---
 
@@ -139,8 +162,8 @@ def list_memories() -> list[dict]:
         if f.name == "MEMORY.md":
             continue
         try:
-            parsed = parse_frontmatter(f.read_text(encoding="utf-8"))
-            meta = parsed["meta"]
+            result = parse_frontmatter(f.read_text(encoding="utf-8"))
+            meta = result.meta
             if meta.get("name") and meta.get("type") in VALID_TYPES:
                 entries.append({
                     "name": meta["name"],

@@ -63,20 +63,32 @@ LLM API 是无状态的——每次调用不会记住上一次说了什么。要
 
 #### 做什么
 
-创建 `agent.py`，定义 `Agent` 类的骨架，并从 `tools.py` 导入工具定义与执行函数：
+创建 `agent.py`，定义 `AgentConfig` 和 `AgentState`，以及 `Agent` 类的骨架，并从 `tools.py` 导入工具定义与执行函数：
 
 ```python
 # agent.py
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import anthropic
 from .tools import execute_tool, get_tool_definitions
 
 
+@dataclass
+class AgentConfig:
+    model: str = "claude-sonnet-4-6"
+
+
+@dataclass
+class AgentState:
+    pass
+
+
 class Agent:
     def __init__(self, model: str = "claude-sonnet-4-6"):
-        self.model = model
+        self.config = AgentConfig(model=model)
+        self.state = AgentState()
         self._client = anthropic.AsyncAnthropic()
         self._messages: list[dict] = []
 ```
@@ -137,7 +149,7 @@ Agent：用户问 → LLM 决定调用工具 → 执行工具 → 结果喂回 L
         while True:
             # 2. 调用 LLM
             response = await self._client.messages.create(
-                model=self.model,
+                model=self.config.model,
                 max_tokens=4096,
                 system="You are a helpful coding assistant with access to tools.",
                 tools=get_tool_definitions(),  # 从 tools.py 导入
@@ -243,6 +255,10 @@ def get_tool_definitions() -> list[dict]:
     return tool_definitions
 
 
+# 单次列文件的最大条目数
+MAX_LIST_FILES = 200
+
+
 # 工具执行：根据名称分发到具体实现
 async def execute_tool(name: str, inp: dict) -> str:
     if name == "list_files":
@@ -260,11 +276,11 @@ def _list_files(inp: dict) -> str:
             if "node_modules" in rel or ".git" in rel.split(os.sep):
                 continue
             files.append(rel)
-            if len(files) >= 200:
+            if len(files) >= MAX_LIST_FILES:
                 break
     if not files:
         return "No files found matching the pattern."
-    return "\n".join(files[:200])
+    return "\n".join(files[:MAX_LIST_FILES])
 ```
 
 工具定义的结构是 **Anthropic Tool Use 协议**要求的格式：
@@ -277,7 +293,7 @@ def _list_files(inp: dict) -> str:
 
 - `description` 的质量直接影响 LLM 是否正确使用工具——写得太模糊它会乱调，写得太窄它会漏调
 - `glob()` 会自动跳过 `node_modules` 和 `.git`，避免返回垃圾结果
-- 结果限制 200 个文件，防止超长输出撑爆上下文
+- 结果限制 `MAX_LIST_FILES`（200）个文件，防止超长输出撑爆上下文
 
 ---
 

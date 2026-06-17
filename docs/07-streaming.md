@@ -81,11 +81,11 @@ Anthropic API 的流式响应会混杂输出 `text` 块和 `thinking` 块。
     async def _call_anthropic_stream(self, on_tool_block_complete=None) -> Any:
         async def _do():
             create_params = {
-                "model": self.model,
+                "model": self.config.model,
                 "max_tokens": 4096,
                 "system": self._system_prompt,
                 "tools": get_tool_definitions(),
-                "messages": self._messages,
+                "messages": self.history.anthropic_messages,
             }
 
             tool_blocks_by_index = {}
@@ -153,20 +153,29 @@ OpenAI 的流式格式和 Anthropic 大相径庭：
 
 async def _call_openai_stream(self) -> dict:
     async def _do():
-        # 启动 OpenAI 兼容端流式生成
+        # 启动 OpenAI 兼容端流式生成（include_usage 让最后一个 chunk 携带 token 统计）
         stream = await self._openai_client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "system", "content": self._system_prompt}] + self._messages,
+            model=self.config.model,
+            messages=self.history.openai_messages,
             tools=self._to_openai_tools(get_tool_definitions()),
             stream=True,
+            stream_options={"include_usage": True},
         )
 
         content = ""
         first_text = True
         tool_calls: dict[int, dict] = {}
         finish_reason = ""
+        usage = None  # 用于记录最后一个 chunk 返回的 token 用量
 
         async for chunk in stream:
+            # 捕获 usage 信息（通常在最后一个 chunk 中出现）
+            if chunk.usage:
+                usage = {
+                    "prompt_tokens": chunk.usage.prompt_tokens,
+                    "completion_tokens": chunk.usage.completion_tokens,
+                }
+
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
@@ -223,7 +232,8 @@ async def _call_openai_stream(self) -> dict:
                     },
                     "finish_reason": finish_reason or "stop",
                 }
-            ]
+            ],
+            "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0},
         }
 
     return await _with_retry(_do)
@@ -257,8 +267,9 @@ def _is_retryable(error: Exception) -> bool:
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
     if status in (429, 503, 529):
         return True
-    msg = str(error).lower()
-    if "overloaded" in msg or "econnreset" in msg or "etimedout" in msg:
+    # 注意：不做 .lower()，源码直接匹配大写关键字
+    msg = str(error)
+    if "overloaded" in msg or "ECONNRESET" in msg or "ETIMEDOUT" in msg:
         return True
     return False
 

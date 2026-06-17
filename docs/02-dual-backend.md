@@ -79,9 +79,55 @@ python -m mini_claude "列出当前目录下所有 .py 文件"
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
 import anthropic
-import openai  # 新增导入
+import openai
 from .tools import execute_tool, get_tool_definitions
+
+
+@dataclass
+class AgentConfig:
+    model: str = "claude-sonnet-4-6"
+    api_base: str | None = None
+    api_key: str | None = None
+
+
+class MessageHistory:
+    """统一 Anthropic/OpenAI 消息格式的抽象层"""
+
+    def __init__(self, use_openai: bool, system_prompt: str):
+        self.use_openai = use_openai
+        self.system_prompt = system_prompt
+        self._anthropic_messages: list[dict] = []
+        self._openai_messages: list[dict] = []
+        if use_openai:
+            self._openai_messages.append({"role": "system", "content": system_prompt})
+
+    @property
+    def messages(self) -> list[dict]:
+        return self._openai_messages if self.use_openai else self._anthropic_messages
+
+    @property
+    def anthropic_messages(self) -> list[dict]:
+        return self._anthropic_messages
+
+    @property
+    def openai_messages(self) -> list[dict]:
+        return self._openai_messages
+
+    def append_user_message(self, content: str | list) -> None:
+        self.messages.append({"role": "user", "content": content})
+
+    def append_assistant_message(self, content: Any) -> None:
+        self.messages.append({"role": "assistant", "content": content})
+
+    def append_tool_results(self, results: list[dict]) -> None:
+        if self.use_openai:
+            for r in results:
+                self.messages.append(r)
+        else:
+            self.messages.append({"role": "user", "content": results})
 
 
 class Agent:
@@ -91,9 +137,13 @@ class Agent:
         api_base: str | None = None,
         api_key: str | None = None,
     ):
-        self.model = model
+        self.config = AgentConfig(model=model, api_base=api_base, api_key=api_key)
+        self.state = AgentState()
         self.use_openai = bool(api_base)
-        self._messages: list[dict] = []
+
+        # 实例化统一消息历史管理
+        system_prompt = "You are a helpful coding assistant with access to tools."
+        self.history = MessageHistory(use_openai=self.use_openai, system_prompt=system_prompt)
 
         if self.use_openai:
             # 初始化 OpenAI 兼容客户端
@@ -162,14 +212,13 @@ OpenAI API 的消息流与 Anthropic 存在两个关键协议差异：
 
     async def _chat_openai(self, user_message: str) -> None:
         # 1. 用户消息推入历史
-        self._messages.append({"role": "user", "content": user_message})
-        system_prompt = {"role": "system", "content": "You are a helpful coding assistant with access to tools."}
+        self.history.append_user_message(user_message)
 
         while True:
-            # 2. 调用 OpenAI 兼容 API（将 system 消息拼装在历史最前面）
+            # 2. 调用 OpenAI 兼容 API
             response = await self._openai_client.chat.completions.create(
-                model=self.model,
-                messages=[system_prompt] + self._messages,
+                model=self.config.model,
+                messages=self.history.openai_messages,
                 tools=self._to_openai_tools(get_tool_definitions()),
             )
             message = response.choices[0].message
@@ -188,7 +237,7 @@ OpenAI API 的消息流与 Anthropic 存在两个关键协议差异：
                     }
                     for tc in message.tool_calls
                 ]
-            self._messages.append(msg_dict)
+            self.history.append_assistant_message(msg_dict)
 
             # 4. 检查是否有工具调用
             if not message.tool_calls:
@@ -196,6 +245,7 @@ OpenAI API 的消息流与 Anthropic 存在两个关键协议差异：
 
             # 5. 执行工具并将结果（role: "tool"）推入历史
             import json
+            tool_results = []
             for tc in message.tool_calls:
                 try:
                     args = json.loads(tc.function.arguments)
@@ -203,12 +253,13 @@ OpenAI API 的消息流与 Anthropic 存在两个关键协议差异：
                     args = {}
                 
                 result = await execute_tool(tc.function.name, args)
-                self._messages.append({
+                tool_results.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "name": tc.function.name,
                     "content": result,
                 })
+            self.history.append_tool_results(tool_results)
 ```
 
 #### 注意什么
@@ -238,22 +289,21 @@ OpenAI API 的消息流与 Anthropic 存在两个关键协议差异：
             await self._chat_anthropic(user_message)
 
     async def _chat_anthropic(self, user_message: str) -> None:
-        # 原 Lesson 01 中的实现
-        self._messages.append({"role": "user", "content": user_message})
+        # 原 Lesson 01 中的实现并适配 history
+        self.history.append_user_message(user_message)
 
         while True:
             response = await self._anthropic_client.messages.create(
-                model=self.model,
+                model=self.config.model,
                 max_tokens=4096,
                 system="You are a helpful coding assistant with access to tools.",
                 tools=get_tool_definitions(),
-                messages=self._messages,
+                messages=self.history.anthropic_messages,
             )
 
-            self._messages.append({
-                "role": "assistant",
-                "content": [self._block_to_dict(b) for b in response.content],
-            })
+            self.history.append_assistant_message(
+                [self._block_to_dict(b) for b in response.content]
+            )
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
             if not tool_uses:
@@ -267,7 +317,7 @@ OpenAI API 的消息流与 Anthropic 存在两个关键协议差异：
                     "tool_use_id": tu.id,
                     "content": result,
                 })
-            self._messages.append({"role": "user", "content": tool_results})
+            self.history.append_tool_results(tool_results)
 
     @staticmethod
     def _block_to_dict(block) -> dict:

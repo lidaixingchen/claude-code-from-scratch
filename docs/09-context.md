@@ -61,11 +61,10 @@ LARGE_RESULT_THRESHOLD = 30 * 1024     # 大结果文件持久化阈值 (30 KB)
 LARGE_RESULT_PREVIEW_LINES = 200       # 大结果文件预览行数
 
 class Agent:
-    def __init__(self, config: AgentConfig):
-        # 1. 声明有效窗口边界和状态
-        self.effective_window = _get_context_window(config.model) - CONTEXT_WINDOW_SAFETY_MARGIN
-        self.state = AgentState()
-        # ... 其余初始化代码保持不变
+    # ... 在 __init__ 中计算并保存有效窗口边界：
+    # self.effective_window = _get_context_window(model) - CONTEXT_WINDOW_SAFETY_MARGIN
+    # self.state = AgentState()
+    # ... 其余初始化代码保持不变
 
     async def _check_and_compact(self) -> None:
         # 当最近一次模型返回的输入 Token 超过有效窗口的 85% 时，触发压缩
@@ -98,6 +97,9 @@ class Agent:
 ```python
 # agent.py（续）
 
+    async def compact(self) -> None:
+        await self._compact_conversation()
+
     async def _compact_conversation(self) -> None:
         if self.use_openai:
             await self._compact_openai()
@@ -116,7 +118,7 @@ class Agent:
         # 2. 向上游 API 请求对除最后一条外的历史进行总结
         response = await self._anthropic_client.messages.create(
             model=self.config.model,
-            max_tokens=1024,
+            max_tokens=2048,
             system="You are a conversation summarizer. Be concise but preserve important decisions, file paths, and context.",
             messages=[
                 *messages[:-1],
@@ -161,7 +163,6 @@ class Agent:
         # 2. 向上游 OpenAI API 发送总结请求
         response = await self._openai_client.chat.completions.create(
             model=self.config.model,
-            max_tokens=1024,
             messages=[
                 {"role": "system", "content": "You are a conversation summarizer. Be concise but preserve important decisions, file paths, and context."},
                 *messages[1:-1],  # 排除首位的 system 和末位的最新 user 消息
@@ -202,34 +203,39 @@ class Agent:
 
 #### 做什么
 
-修改 `agent.py` 的公共 `chat` 对外接口，在进入对话循环前，率先调用压缩审查：
+修改 `agent.py` 的 `_chat_anthropic` 和 `_chat_openai` 核心入口，在将用户消息推入历史后，率先调用压缩审查：
 
 ```python
 # agent.py 中的修改
 
 
-    async def chat(self, user_message: str) -> None:
-        self._aborted = False
+    async def _chat_anthropic(self, user_message: str) -> None:
+        # 1. 用户消息推入历史
+        self.history.append_user_message(user_message)
         
-        # 【触发位置】：在当前用户输入被处理之后，但在任何工具循环 API 发起之前
-        # 此时历史最末尾是纯文本 user 消息，最安全
-        self._messages.append({"role": "user", "content": user_message})
+        # 2. 审查并决定是否在此处自动压缩历史
+        await self._check_and_compact()
         
-        try:
-            # 审查并决定是否在此处自动压缩历史
-            await self._check_and_compact()
-            
-            # 进入核心 while 循环（由于用户输入已经 append，需调整核心循环中不要再重复 append 用户消息）
-            await self._chat_no_append() 
-        finally:
-            self._auto_save()
+        # ... 后续 while 循环及其他逻辑
 ```
 
-*(注：此处修改时，需注意确保 `_chat` 内部不再重复执行 `self._messages.append(...)` 操作)*。
+同样地，在 `_chat_openai` 内部也做相同修改：
+
+```python
+    async def _chat_openai(self, user_message: str) -> None:
+        # 1. 用户消息推入历史
+        self.history.append_user_message(user_message)
+        
+        # 2. 审查并决定是否在此处自动压缩历史
+        await self._check_and_compact()
+        
+        # ... 后续 while 循环及其他逻辑
+```
+
 另外，在 `_call_anthropic_stream` 与 `_call_openai_stream` 请求成功后，务必更新最近一次的 Token 消耗：
 ```python
 # 例如在 _call_anthropic_stream 内部：
-self.last_input_token_count = response.usage.input_tokens
+self.state.last_input_token_count = response.usage.input_tokens
 ```
 
 ---
@@ -254,13 +260,10 @@ self.last_input_token_count = response.usage.input_tokens
             
         # 连通手动压缩命令
         if inp == "/compact":
-            # 构造一条虚拟的用户命令，以便将当前的输入作为一个 turn boundary，触发安全压缩
-            agent._messages.append({"role": "user", "content": "Please summarize our conversation."})
-            await agent._compact_conversation()
-            # 移除我们刚刚压入的虚拟消息，防止干扰
-            agent._messages.pop()
-            
-            print("  [cyan]ℹ Conversation compacted successfully.[/cyan]")
+            try:
+                await agent.compact()
+            except Exception as e:
+                print(f"  [red]Error: {e}[/red]")
             continue
 ```
 
@@ -289,7 +292,7 @@ self.last_input_token_count = response.usage.input_tokens
 
 ```python
 # ❌ 错误：在工具执行的 while 循环中途执行了 compact
-# 此时 _messages = [..., tool_use, tool_result]
+# 此时 history.messages = [..., tool_use, tool_result]
 # 切片 messages[:-1] 丢弃了最后一条 tool_result，但保留了前一条 assistant 的 tool_use 块
 response = await client.messages.create(...)
 ```
@@ -318,14 +321,14 @@ response = await client.messages.create(...)
 2. 进行 2-3 轮常规问答。
 3. 输入手动压缩命令 `/compact`。
 4. **验证压缩历史**：
-   - 终端应该打印 `ℹ Conversation compacted successfully.`。
+   - 终端应该打印 `ℹ Conversation compacted.`。
    - 接着向 Agent 提问：`“我们刚才聊了什么？”`，确认大模型是否能准确复述出压缩前的前情概要。
 
 ---
 
 ## 🧠 思考题
 
-1. **在 `_compact_openai` 中，我们读取首位 system 消息并最终把它重新塞回到新历史 `self._messages[0]` 的首位，为什么？**
+1. **在 `_compact_openai` 中，我们读取首位 system 消息并最终把它重新塞回到新历史 `self.history.openai_messages[0]` 的首位，为什么？**
    *(提示：OpenAI 协议中，系统提示词必须一直处于整个消息历史队列的最开头。如果压缩时把 `system` 消息丢弃了，模型会失去对自身身份和工具规范的认知，直接退化为普通的无工具聊天助手。)*
 2. **自动摘要压缩虽然释放了 Token 空间，但它需要我们专门调用一次大模型 API。频繁自动压缩会产生什么副作用？**
    *(提示：频繁压缩会增加额外的 API 费用和响应等待时间。因此，我们设定了高达 85% 的“高水位线”触发阈值，尽量减少总结 API 的调用频次。)*

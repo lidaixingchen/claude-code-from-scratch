@@ -224,13 +224,14 @@ Agent 常运行测试或构建任务。我们需要：
 
 def _run_shell(inp: dict) -> str:
     try:
-        timeout = inp.get("timeout") or 30
+        timeout_ms = inp.get("timeout", 30000)
+        timeout_s = timeout_ms / 1000
         result = subprocess.run(
             inp["command"],
             shell=True,
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=timeout_s,
         )
         stdout = f"\nStdout:\n{result.stdout}" if result.stdout else ""
         stderr = f"\nStderr:\n{result.stderr}" if result.stderr else ""
@@ -238,7 +239,7 @@ def _run_shell(inp: dict) -> str:
             return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
         return result.stdout or "(command succeeded with no output)"
     except subprocess.TimeoutExpired:
-        return f"Error: Command timed out after {timeout} seconds"
+        return f"Command timed out after {inp.get('timeout', 30000)}ms"
     except Exception as e:
         return f"Error: {e}"
 ```
@@ -320,7 +321,7 @@ tool_definitions: list[dict] = [
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The shell command to execute"},
-                "timeout": {"type": "number", "description": "Timeout in seconds (default: 30)"},
+                "timeout": {"type": "number", "description": "Timeout in milliseconds (default: 30000)"},
             },
             "required": ["command"],
         },

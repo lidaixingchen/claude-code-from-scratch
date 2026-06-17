@@ -35,8 +35,9 @@ python -m mini_claude
 
 1. **实现会话存储读写库**：在 `session.py` 中编写会话保存、读取与检索逻辑。
 2. **封装 Agent 公共接口与自动保存**：在 `agent.py` 中实现 `chat()` 封装，并在对话结束时自动持久化。
-3. **编写命令行参数解析**：在 `__main__.py` 中解析运行参数，支持命令行 prompt 直发与 `--resume` 恢复。
-4. **构建交互式 REPL 循环与信号拦截**：在 `__main__.py` 中实现 REPL 循环，注入 `Ctrl+C` 信号处理器。
+3. **创建最简终端 UI 辅助库**：在 `ui.py` 中定义欢迎横幅、提示符、错误输出等基础函数。
+4. **编写命令行参数解析**：在 `__main__.py` 中解析运行参数，支持命令行 prompt 直发与 `--resume` 恢复。
+5. **构建交互式 REPL 循环与信号拦截**：在 `__main__.py` 中实现 REPL 循环，注入 `Ctrl+C` 信号处理器。
 
 ---
 
@@ -46,6 +47,9 @@ python -m mini_claude
 - `python/mini_claude/session.py`
 - `python/mini_claude/agent.py`
 - `python/mini_claude/__main__.py`
+
+创建：
+- `python/mini_claude/ui.py`
 
 ---
 
@@ -143,11 +147,13 @@ class Agent:
         api_base: str | None = None,
         api_key: str | None = None,
     ):
-        self.model = model
+        self.config = AgentConfig(model=model, api_base=api_base, api_key=api_key)
+        self.state = AgentState()
         self.use_openai = bool(api_base)
-        self._messages: list[dict] = []
         
-        # 实例化唯一的会话参数
+        # 实例化唯一的会话参数和统一消息历史管理
+        system_prompt = "You are a helpful coding assistant with access to tools."
+        self.history = MessageHistory(use_openai=self.use_openai, system_prompt=system_prompt)
         self.session_id = uuid.uuid4().hex[:8]
         self.session_start_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self._aborted = False  # 中断标志位
@@ -173,27 +179,27 @@ class Agent:
 
     def _auto_save(self) -> None:
         try:
-            # 保存元数据与消息历史
+            # 保存元数据与消息历史（直接展开 history.to_dict()，保持键名与源码一致）
             save_session(self.session_id, {
                 "metadata": {
                     "id": self.session_id,
-                    "model": self.model,
+                    "model": self.config.model,
                     "cwd": str(Path.cwd()),
                     "startTime": self.session_start_time,
-                    "messageCount": len(self._messages),
+                    "messageCount": self.history.message_count(),
                 },
-                "messages": self._messages,
+                **self.history.to_dict(),
             })
         except Exception:
             pass
 
     def restore_session(self, data: dict) -> None:
-        if "messages" in data:
-            self._messages = data["messages"]
-            print(f"  [cyan]ℹ Session restored ({len(self._messages)} messages).[/cyan]")
+        # data 中包含 anthropicMessages / openaiMessages，直接传给 history.restore()
+        self.history.restore(data)
+        print(f"  [cyan]ℹ Session restored ({self.history.message_count()} messages).[/cyan]")
 
     def clear_history(self) -> None:
-        self._messages.clear()
+        self.history.clear(keep_system=True)
         print("  [cyan]ℹ Conversation history cleared.[/cyan]")
 ```
 
@@ -203,7 +209,44 @@ class Agent:
 
 ---
 
-### 步骤 3：编写参数解析与会话恢复逻辑
+### 步骤 3：创建最简终端 UI 辅助库 `ui.py`
+
+#### 为什么做
+
+接下来的 `__main__.py` 需要打印欢迎横幅、输入提示符、错误信息等格式化输出。我们将这些重复的终端打印逻辑抽取到独立的 `ui.py` 中，保持 `__main__.py` 的整洁。后续章节会逐步丰富这个模块的渲染能力（如颜色、Spinner 动画），但本课只需要最基础的 `print` 封装。
+
+#### 做什么
+
+创建 `ui.py`，定义四个基础输出函数：
+
+```python
+# ui.py
+
+def print_welcome() -> None:
+    print("  Mini Claude Code — A minimal coding agent\n")
+    print("  Type your request, or 'exit' to quit.")
+    print("  Commands: /clear /plan /cost\n")
+
+
+def print_user_prompt() -> None:
+    print("\n> ", end="")
+
+
+def print_error(msg: str) -> None:
+    print(f"  [red]Error: {msg}[/red]")
+
+
+def print_info(msg: str) -> None:
+    print(f"  [cyan]ℹ {msg}[/cyan]")
+```
+
+#### 注意什么
+
+- 此刻的 `print_info` 和 `print_error` 只是简单的字符串打印，`[red]`/`[cyan]` 标签不会渲染颜色（需要后续引入 `rich` 库）。这不影响功能正确性，先让代码跑起来。
+
+---
+
+### 步骤 4：编写参数解析与会话恢复逻辑
 
 #### 为什么做
 
@@ -256,7 +299,11 @@ async def main_async():
         if latest_id:
             session_data = load_session(latest_id)
             if session_data:
-                agent.restore_session(session_data)
+                # 只提取消息数据传给 restore_session，过滤掉 metadata 等无关字段
+                agent.restore_session({
+                    "anthropicMessages": session_data.get("anthropicMessages"),
+                    "openaiMessages": session_data.get("openaiMessages"),
+                })
                 
     prompt = " ".join(args.prompt) if args.prompt else None
     if prompt:
@@ -281,7 +328,7 @@ if __name__ == "__main__":
 
 ---
 
-### 步骤 4：构建交互式 REPL 循环与信号拦截
+### 步骤 5：构建交互式 REPL 循环与信号拦截
 
 #### 为什么做
 

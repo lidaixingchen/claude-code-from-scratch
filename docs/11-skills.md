@@ -24,7 +24,7 @@
 
 ## 🛠️ 本节任务
 
-1. **实现技能扫描与去重加载**：在 `skills.py` 中编写 `discover_skills()`，实现全局和项目本地技能的加载，同名技能项目级覆盖用户级。
+1. **实现技能扫描与去重加载**：在 `skills.py` 中编写 `discover_skills()`，扫描 `.claude/skills/{名称}/SKILL.md` 子目录结构，实现全局和项目本地技能的加载，同名技能项目级覆盖用户级。
 2. **实现模板参数替换解析**：在 `skills.py` 中实现 `resolve_skill_prompt()`，支持对 `$ARGUMENTS` 及路径进行动态替换。
 3. **在 REPL 中拦截手动指令**：在 `__main__.py` 中拦截以 `/` 开头的输入命令，由用户手动激活技能。
 4. **注册 skill 元工具并分发**：在 `tools.py` 中注册 `skill` 工具，允许大模型在需要时内联调用。
@@ -47,9 +47,9 @@
 
 #### 为什么做
 
-技能是存放在目录 `.claude/skills/` 下的 Markdown 文件。我们应当支持两个加载源：
-1. 全局配置源：`~/.claude/skills/`，用于存放用户通用的脚本（如通用的 commit 规范）。
-2. 本地项目源：`./.claude/skills/`，用于存放当前项目特有的流程（如特定项目的部署指南）。
+技能是存放在目录 `.claude/skills/` 下的子目录中，每个技能是一个独立文件夹，包含一个 `SKILL.md` 主文件。我们应当支持两个加载源：
+1. 全局配置源：`~/.claude/skills/{技能名}/SKILL.md`，用于存放用户通用的脚本（如通用的 commit 规范）。
+2. 本地项目源：`./.claude/skills/{技能名}/SKILL.md`，用于存放当前项目特有的流程（如特定项目的部署指南）。
 项目本地的技能具有更高优先级，同名时必须去重并覆盖全局的同名技能。
 
 #### 做什么
@@ -99,14 +99,20 @@ def discover_skills() -> list[SkillDefinition]:
 def _load_skills_from_dir(directory: Path, source: str, skills: dict[str, SkillDefinition]) -> None:
     if not directory.is_dir():
         return
-    for f in directory.glob("*.md"):
+    # 遍历子目录，每个子目录是一个独立技能，内含 SKILL.md 主文件
+    for entry in directory.iterdir():
+        if not entry.is_dir():
+            continue
+        skill_file = entry / "SKILL.md"
+        if not skill_file.exists():
+            continue
         try:
-            raw = f.read_text(encoding="utf-8")
+            raw = skill_file.read_text(encoding="utf-8")
             result = parse_frontmatter(raw)
             meta = result.meta
 
-            # 默认提取 YAML 头中的 name，缺省则以文件名作为技能名
-            name = meta.get("name") or f.stem
+            # 默认提取 YAML 头中的 name，缺省则以子目录名作为技能名
+            name = meta.get("name") or entry.name
             user_invocable = meta.get("user-invocable", "true").lower() != "false"
 
             skills[name] = SkillDefinition(
@@ -115,7 +121,7 @@ def _load_skills_from_dir(directory: Path, source: str, skills: dict[str, SkillD
                 when_to_use=meta.get("when_to_use") or meta.get("when-to-use", ""),
                 prompt_template=result.body,
                 user_invocable=user_invocable,
-                skill_dir=str(directory),
+                skill_dir=str(entry),
             )
         except Exception:
             pass
@@ -305,7 +311,7 @@ prompt = prompt.replace("$ARGUMENTS", args)
 
 ### 输入与验证
 
-1. 在当前项目下建立 `.claude/skills/` 目录，并在里面创建一个 `commit.md` 文件：
+1. 在当前项目下建立 `.claude/skills/commit/` 子目录，并在里面创建一个 `SKILL.md` 文件：
    ```markdown
    ---
    name: commit
@@ -323,7 +329,7 @@ prompt = prompt.replace("$ARGUMENTS", args)
 3. 在终端中键入：`/commit 修复拼写错误` 并按下回车。
 4. **观察输出**：验证 Agent 是否输出了 `ℹ Invoking skill: commit` 并开始读取 git 状态。
 
-*测试完成后，请记得删除 `.claude/skills/` 目录。*
+*测试完成后，请记得删除 `.claude/skills/commit/` 目录。*
 
 ---
 

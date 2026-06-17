@@ -40,13 +40,26 @@
 
 #### 做什么
 
-修改 `agent.py`，导入（或直接定义）并发安全工具集，用来筛选可以抢跑的工具名：
+修改 `tools.py`，在文件顶部定义并发安全工具集常量（后续由 `agent.py` 导入使用）：
 
 ```python
-# agent.py 中的修改
+# tools.py 中的新增常量
 
 # 哪些工具是只读、无副作用且可以并行抢跑的？
-CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files"}
+CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
+```
+
+然后在 `agent.py` 中导入该常量：
+
+```python
+# agent.py 中的导入修改
+
+from .tools import (
+    tool_definitions,
+    execute_tool,
+    CONCURRENCY_SAFE_TOOLS,  # 导入并发安全工具集
+    # ... 其他导入保持不变
+)
 ```
 
 ---
@@ -69,11 +82,11 @@ CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files"}
 
     async def _call_anthropic_stream(self, on_tool_block_complete=None) -> Any:
         create_params = {
-            "model": self.model,
+            "model": self.config.model,
             "max_tokens": 4096,
             "system": self._system_prompt,
             "tools": get_tool_definitions(),
-            "messages": self._messages,
+            "messages": self.history.anthropic_messages,
         }
 
         tool_blocks_by_index = {}
@@ -135,7 +148,7 @@ CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files"}
 # agent.py（续）
 
     async def _chat_anthropic(self, user_message: str) -> None:
-        self._messages.append({"role": "user", "content": user_message})
+        self.history.append_user_message(user_message)
 
         while True:
             current_system_prompt = build_system_prompt()
@@ -143,12 +156,18 @@ CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files"}
             # 创建抢跑任务字典，保存 { tool_use_id -> asyncio.Task }
             early_executions: dict[str, asyncio.Task] = {}
 
-            # 回调函数：当安全工具生成完，立即在后台异步跑起来
+            # 回调函数：当安全工具生成完，先检查权限，通过后立即在后台异步跑起来
             def _on_tool_block_complete(block: dict):
                 if block["name"] in CONCURRENCY_SAFE_TOOLS:
-                    # 创建后台异步任务，使其开始抢跑
-                    task = asyncio.create_task(execute_tool(block["name"], block["input"]))
-                    early_executions[block["id"]] = task
+                    # 权限检查：只有被允许的操作才能抢跑，避免绕过安全防线
+                    perm = check_permission(
+                        block["name"], block["input"],
+                        self.config.permission_mode, self.state.plan_file_path,
+                    )
+                    if perm["action"] == "allow":
+                        # 创建后台异步任务，使其开始抢跑
+                        task = asyncio.create_task(execute_tool(block["name"], block["input"]))
+                        early_executions[block["id"]] = task
 
             # 传入回调函数调用流式连接
             response = await self._call_anthropic_stream(
@@ -175,10 +194,9 @@ CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files"}
 ```python
 # agent.py（续）
 
-            self._messages.append({
-                "role": "assistant",
-                "content": [self._block_to_dict(b) for b in response.content],
-            })
+            self.history.append_assistant_message(
+                [self._block_to_dict(b) for b in response.content]
+            )
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
             if not tool_uses:
@@ -215,7 +233,7 @@ CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files"}
                     "content": result,
                 })
 
-            self._messages.append({"role": "user", "content": tool_results})
+            self.history.append_tool_results(tool_results)
 ```
 
 ---
