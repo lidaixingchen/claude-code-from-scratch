@@ -79,12 +79,11 @@ def get_memory_dir() -> Path:
     d = Path.home() / ".mini-claude" / "projects" / _project_hash() / "memory"
     d.mkdir(parents=True, exist_ok=True)
     return d
-
+```
 
 #### 注意什么
 
 - **物理隔离的重要性**：利用哈希值做项目目录隔离，可以避免 A 项目的开发上下文或规则泄露到 B 项目中，保护了数据安全，也让 Agent 的记忆具有了精准的范围上下文。
-```
 
 ---
 
@@ -147,12 +146,11 @@ def parse_frontmatter(content: str) -> FrontmatterResult:
 # memory.py（续）
 
 from .frontmatter import parse_frontmatter
-
+```
 
 #### 注意什么
 
 - **无依赖解析器**：通过手写 YAML 键值对行切割与正则，可以极大节省包体积，避免了初学者拉取项目时必须安装 PyYAML 第三方包的步骤，降低了启动成本。
-```
 
 注意：`parse_frontmatter` 返回 `FrontmatterResult` 数据类，通过 `.meta` 和 `.body` 属性访问元数据与正文。后续所有调用方（包括第 11 课的技能系统）都统一使用点操作符访问。
 
@@ -285,16 +283,15 @@ def build_system_prompt() -> str:
         "{{git_context}}": get_git_context(),
         "{{claude_md}}": load_claude_md(),
         # 2. 替换记忆占位符
-        "{{memory}}": build_memory_prompt_section(), 
+        “{{memory}}”: build_memory_prompt_section(), 
     }
     # ... 后续替换逻辑保持不变
-
+```
 
 #### 注意什么
 
-- **大模型自主记忆驱动**：在编译记忆提示词时，我们告诉大模型记忆格式和路径，由大模型在主循环决策中“自主”写文件来记住用户偏好。
+- **大模型自主记忆驱动**：在编译记忆提示词时，我们告诉大模型记忆格式和路径，由大模型在主循环决策中”自主”写文件来记住用户偏好。
 - **异步语义召回与简化机制说明**：实际 codebase 实现了高级的基于向量/轻量文本相关的异步语义预取（Prefetching）与热启动过滤机制。在本章的简化教程中，我们着重于搭建文件持久化读写与 `MEMORY.md` 索引编译的基础物理架构。当学习者在最终运行 codebase 时，会接触到更为复杂的异步预取策略，以防止频繁读取引起上下文爆炸。
-```
 
 ---
 

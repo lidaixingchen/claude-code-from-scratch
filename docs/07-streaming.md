@@ -46,8 +46,9 @@
 ```python
 # agent.py 中的修改
 
+import json
 import sys
-from .ui import print_assistant_text  # UI 库封装了 sys.stdout.write/flush
+from .ui import print_assistant_text, stop_spinner  # UI 库封装了 sys.stdout.write/flush
 
 
 class Agent:
@@ -86,15 +87,20 @@ Anthropic API 的流式响应会混杂输出 `text` 块和 `thinking` 块。
 
     async def _call_anthropic_stream(self, on_tool_block_complete=None) -> Any:
         async def _do():
-            create_params = {
+            max_output = _get_max_output_tokens(self.config.model)
+            create_params: dict[str, Any] = {
                 "model": self.config.model,
-                "max_tokens": 4096,
+                "max_tokens": max_output if self.state.thinking_mode != "disabled" else 16384,
                 "system": self._system_prompt,
                 "tools": get_active_tool_definitions(self.tools),
                 "messages": self.history.anthropic_messages,
             }
 
-            tool_blocks_by_index = {}
+            # 根据 thinking_mode 决定是否启用 Extended Thinking
+            if self.state.thinking_mode in ("adaptive", "enabled"):
+                create_params["thinking"] = {"type": "enabled", "budget_tokens": max_output - 1}
+
+            tool_blocks_by_index: dict[int, dict] = {}
             first_text = True
 
             # 启动 API 监听流
@@ -132,12 +138,22 @@ Anthropic API 的流式响应会混杂输出 `text` 块和 `thinking` 块。
                                 tb["input_json"] += delta.partial_json
                                 
                     elif event.type == "content_block_stop":
-                        # 触发上一章的流式工具抢跑（省略）
-                        pass
+                        # 当一个完整的工具块结束时，解析其 JSON 参数并回调触发流式工具抢跑
+                        tb = tool_blocks_by_index.pop(event.index, None)
+                        if tb and on_tool_block_complete:
+                            try:
+                                parsed = json.loads(tb["input_json"] or "{}")
+                            except Exception:
+                                parsed = {}
+                            on_tool_block_complete({
+                                "type": "tool_use", "id": tb["id"],
+                                "name": tb["name"], "input": parsed,
+                            })
 
                 final_message = await stream.get_final_message()
-            
+
             # 【核心过滤】滤除思考块（thinking），不将它们保存到对话历史消息中
+            final_message.content = [b for b in final_message.content if b.type != "thinking"]
             return final_message
 
         # 使用步骤 4 实现遇到的重试方法进行包裹

@@ -105,13 +105,13 @@ def is_dangerous(command: str) -> bool:
 # tools.py（续）
 
 
-def _load_settings(path: Path) -> dict:
+def _load_settings(path: Path) -> dict | None:
     if not path.exists():
-        return {}
+        return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {}
+        return None
 
 
 def _parse_rule(rule: str) -> dict:
@@ -140,12 +140,13 @@ def load_permission_rules() -> dict:
     ]
     for p in paths:
         settings = _load_settings(p)
-        if settings:
-            perms = settings.get("permissions", {})
-            for r in perms.get("allow", []):
-                allow.append(_parse_rule(r))
-            for r in perms.get("deny", []):
-                deny.append(_parse_rule(r))
+        if settings is None:
+            continue
+        perms = settings.get("permissions", {})
+        for r in perms.get("allow", []):
+            allow.append(_parse_rule(r))
+        for r in perms.get("deny", []):
+            deny.append(_parse_rule(r))
             
     _cached_rules = {"allow": allow, "deny": deny}
     return _cached_rules
@@ -157,10 +158,16 @@ def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
     if rule["pattern"] is None:
         return True
 
-    # 提取实际被测试的值（Shell 命令或文件路径，支持 file_path 或 path）
-    value = inp.get("command", "") if tool_name == "run_shell" else (inp.get("file_path") or inp.get("path") or "")
+    value = ""
+    if tool_name == "run_shell":
+        value = inp.get("command", "")
+    elif "file_path" in inp:
+        value = inp["file_path"]
+    else:
+        # 没有 file_path 的工具调用（如 list_files 只有 pattern），匹配所有规则
+        return True
+
     pattern = rule["pattern"]
-    
     if pattern.endswith("*"):
         return value.startswith(pattern[:-1])
     return value == pattern
@@ -221,13 +228,17 @@ def check_permission(
     if mode == "plan":
         if tool_name in EDIT_TOOLS:
             file_path = inp.get("file_path", "")
-            if plan_file_path and Path(file_path).resolve() == Path(plan_file_path).resolve():
+            if plan_file_path and file_path == plan_file_path:
                 return {"action": "allow"}
-            return {"action": "deny", "message": f"Writing blocked in plan mode: {file_path}"}
+            return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
         if tool_name == "run_shell":
             return {"action": "deny", "message": "Shell commands blocked in plan mode"}
 
-    # 5. acceptEdits 模式下，编辑文件直接放行
+    # 5. 豁免模式切换工具——否则用户将无法进入或退出规划模式
+    if tool_name in ("enter_plan_mode", "exit_plan_mode"):
+        return {"action": "allow"}
+
+    # 6. acceptEdits 模式下，编辑文件直接放行
     if mode == "acceptEdits" and tool_name in EDIT_TOOLS:
         return {"action": "allow"}
 
@@ -349,7 +360,7 @@ class Agent:
 - **方案 A**：**作为 Tool Result 返回给模型**（我们所用）
   - 拦截后，不掐断会话。构造一个假的工具运行结果，告诉大模型该项动作已被系统拦截（例如返回 `Error: Action denied: ...`）。
   - **优点**：Agent 仍然能够正常运转，并且可以通过大模型极强的语义理解力“自我纠正”——例如被拦截了危险的 `rm -rf`，大模型会道歉并改用安全的 `run_shell("git clean")`，不需要人类二次干预。
-  - **缺点**：如果大模型很倔强，可能会反复尝试被拒绝的操作（我们可以通过在第 13 章引入总步数限制来防爆）。
+  - **缺点**：如果大模型很倔强，可能会反复尝试被拒绝的操作（后续可以通过引入总步数限制来防爆）。
 - **方案 B**：**直接抛出 Exception 终止会话**
   - 一旦触发 deny 或用户输入 `n`，抛出运行时异常直接令程序退出。
   - **优点**：绝对安全。
